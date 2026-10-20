@@ -17,11 +17,11 @@ const esbuildPlugins = [
 
 export default defineConfig([
   {
-    entry: { index: "src/index.ts", server: "src/server/index.ts", react: "src/react.ts", vue: "src/vue.ts" },
+    entry: { index: "src/index.ts", server: "src/server/index.ts", "server-identity": "src/server/identity.ts", react: "src/react.ts", vue: "src/vue.ts" },
     format: ["esm"],
     dts: true,
     target: "es2022",
-    external: ["react", "vue"],
+    external: ["react", "vue", "@dewee/identity"],
     esbuildPlugins,
   },
   {

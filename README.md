@@ -28,6 +28,15 @@ npm i dewee-webchat
 
 Full options, framework snippets and the security model: [packages/dewee-webchat/README.md](packages/dewee-webchat/README.md).
 
+## Signed-in users
+
+If your site knows who the visitor is, pass one server-side callback (`identity.authenticate`) to the
+handler. It exchanges your user for a short-lived Dewee identity session, and the agent then chats as
+that verified user, with private tools scoped to them. You no longer mint visitor tokens, push
+per-visitor credentials or build your own account linking: a signed-in user links Telegram or Discord
+from the widget with a one-time code. Anonymous visitors work exactly as before. Setup and the
+fail-closed rules: [Signed-in users](packages/dewee-webchat/README.md#signed-in-users).
+
 ## Live examples
 
 All of them run on Cloudflare and share the same scoped demo key.
@@ -51,6 +60,7 @@ All of them run on Cloudflare and share the same scoped demo key.
 | [`cdn/`](cdn) | Worker that serves versioned bundles at `webchat-cdn.dewee.sh` |
 | [`docs/http-contract.md`](docs/http-contract.md) | Wire format between the widget and any backend |
 | [`examples/`](examples) | Runnable integrations |
+| [`vendor/`](vendor) | Temporary: the packed `@dewee/identity` SDK used by the tests (see below) |
 
 ## Development
 
@@ -60,6 +70,12 @@ pnpm test        # vitest
 pnpm typecheck
 pnpm build       # packages/dewee-webchat/dist
 ```
+
+`@dewee/identity` (the Dewee identity server SDK) is not published to npm yet. Until it is, the tests use a
+tarball packed from the dewee repository (`packages/dewee-identity`, `pnpm --filter @dewee/identity pack`) and
+committed as `vendor/dewee-identity-<version>.tgz`; `packages/dewee-webchat` depends on it as a dev dependency
+through `file:`. This is temporary: once the SDK is published, the dev dependency switches to the npm version and
+`vendor/` is deleted. For users the SDK is an optional peer dependency, needed only with the `identity` option.
 
 Run the playground locally: copy `examples/cloudflare/.dev.vars.example` to `.dev.vars`, fill it in, then
 `pnpm -C examples/cloudflare dev`.

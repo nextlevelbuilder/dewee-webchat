@@ -6,6 +6,7 @@
   "scripts": {
     "build": "pnpm --filter dewee-webchat build",
     "test": "pnpm --filter dewee-webchat test",
+    "test:bundlers": "pnpm --filter dewee-webchat test:bundlers",
     "typecheck": "pnpm --filter dewee-webchat typecheck"
   },
   "pnpm": {

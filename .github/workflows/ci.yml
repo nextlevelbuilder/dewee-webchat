@@ -19,6 +19,8 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      # dewee-webchat/server must bundle (webpack, esbuild) without the optional @dewee/identity SDK.
+      - run: pnpm test:bundlers
 
   php:
     runs-on: ubuntu-latest

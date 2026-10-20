@@ -129,8 +129,9 @@ Attributes use kebab-case (`show-reasoning="false"`), `data-*` on the script tag
 | `actionTimeoutMs` | `30000` | Per-handler timeout |
 
 Methods: `open()`, `close()`, `toggle()`, `send(text)`, `stop()`, `newConversation()`, `configure(partial)`,
-`registerActions(actions)`, `unregisterAction(name)`.
-Events: `dewee:ready`, `dewee:open`, `dewee:close`, `dewee:send`, `dewee:reply`, `dewee:error`, `dewee:action`.
+`registerActions(actions)`, `unregisterAction(name)`, and for [signed-in users](#signed-in-users)
+`renewSession()` and `startLink()`.
+Events: `dewee:ready`, `dewee:open`, `dewee:close`, `dewee:send`, `dewee:reply`, `dewee:error`, `dewee:action`, `dewee:link`.
 CSS variables: `--dw-accent`, `--dw-font`, `--dw-radius`, `--dw-width`, `--dw-height`, `--dw-z`.
 
 ## Agent page actions
@@ -195,13 +196,132 @@ or inserts it as HTML, caps calls per answer and automatic turns per message, an
 `mutate`/`destructive` handler without approval. Page context and results are labelled as data for the
 agent, but prompt injection through page content is still possible — do not put secrets in either.
 
+## Signed-in users
+
+When your site knows who the visitor is, the agent can know it too, with private tools that act for
+that user only. You pass one server-side callback. You do not mint tokens, store per-visitor
+credentials or put anything secret in the page: the handler exchanges your user for a Dewee identity
+session, and the gateway derives the user from it.
+
+```ts
+import { createDeweeHandler, optionsFromEnv } from "dewee-webchat/server";
+import { deweeIdentitySdk } from "dewee-webchat/server/identity";
+
+const handler = createDeweeHandler({
+  ...optionsFromEnv(process.env),
+  identity: {
+    sdk: deweeIdentitySdk,
+    // Your own login. Return null for a visitor who is not signed in.
+    authenticate: async (req) => {
+      const user = await getUserFromSessionCookie(req.headers.get("cookie"));
+      return user ? { subject: user.id } : null; // your stable id, never an email address
+    },
+    rebindEachRequest: true, // recommended with a cookie login, see below
+    appId: process.env.DEWEE_IDENTITY_APP_ID!,
+    issuer: process.env.DEWEE_IDENTITY_ISSUER!,
+    assertionSecret: process.env.DEWEE_IDENTITY_ASSERTION_SECRET!, // or privateKeyJwk for a jwks application
+  },
+});
+```
+
+Setup: create the application once with `dewee identity setup --name <site> --issuer <issuer>` (it
+prints the application id and the assertion secret), and install the server SDK next to this package:
+`npm install @dewee/identity`. It is an optional peer dependency used only by the
+`dewee-webchat/server/identity` entry; `dewee-webchat/server` itself never imports it, so a site that
+serves only anonymous visitors bundles fine (webpack, esbuild…) without it.
+`@dewee/identity` is not on npm yet: until it is, build its tarball from the
+[dewee repository](https://github.com/nextlevelbuilder/dewee/blob/dev/packages/dewee-identity/README.md)
+(`pnpm --filter @dewee/identity pack`) and install that file.
+
+| `identity` option | |
+|---|---|
+| `sdk` | Required. `deweeIdentitySdk` from `dewee-webchat/server/identity`. |
+| `authenticate(req)` | Required. Resolves `{ subject }` for a signed-in user, `null` otherwise. Throwing means "could not check". |
+| `appId`, `issuer` | Required. The Dewee application id and its issuer, exactly. |
+| `assertionSecret` \| `privateKeyJwk` (+ `algorithm`) | Exactly one: `hmac` or `jwks` application. Server only. |
+| `audience` | Optional check; must be `dewee:<appId>`. |
+| `agent` | The agent sessions are bound to. Default: `defaultAgent`, else the first of `agents`. |
+| `required` | Default `false`. When `true`, visitors who are not signed in get no session at all. |
+| `rebindEachRequest` | Default `false`. Check the signed-in user again on every `/chat`, `/history` and `/link`. |
+| `sessionTtlSeconds` | 60 to 43200. Default: the gateway default (3600). |
+| `allowInsecureHttp` | Allow plain http to a gateway that is not loopback (private networks only). |
+
+`AuthenticatedUser` has no scopes: the session exchange does not carry any. When a user's permissions
+change, report it from your server with `lifecycle({ event: "scopes_changed", … })` from
+`@dewee/identity`.
+
+How it behaves:
+
+- `POST /session` calls `authenticate`. For a user it returns a visitor token that carries a Dewee
+  identity session, encrypted (AES-256-GCM, key derived from `secret`) so the browser only holds an
+  opaque value. The gateway token, the assertion secret, the private key, the raw identity session and
+  your subject never reach the browser.
+- One identity session per user is kept in memory and reused until it nears expiry, so a page load
+  does not cost an exchange; a session the gateway reports expired or revoked is dropped.
+- `/chat` and `/history` connect to the gateway with that `identity_session` and no `user_id`, and only
+  go on when the gateway confirms it derived a Dewee user (`tuc:…`); a gateway that ignored the session
+  (identity switched off) gets `503 SOURCE_UNAVAILABLE` and nothing runs. The same user gets the same
+  conversations on every device. The session's agent must still be in `agents` on every request.
+- By default the visitor token is the credential: a token for user A keeps chatting as A even if a
+  later request carries B's cookie, and an altered token is refused (401). With
+  `rebindEachRequest: true`, `/chat`, `/history` and `/link` call `authenticate(req)` again and compare
+  it with a keyed digest of the subject sealed in the token: another user or no user is
+  `401 IDENTITY_REQUIRED` (the widget then asks `/session` again), and a throwing `authenticate` is
+  `503 SOURCE_UNAVAILABLE`. Turn it on when your login is a cookie: a widget token replayed under
+  another user's cookie is then useless.
+- Fail closed. If `authenticate` returns `null`, the visitor chats anonymously, exactly as without
+  `identity`, unless `required` is set, in which case no session is issued. If it throws, the answer
+  is `503 SOURCE_UNAVAILABLE` and no session is issued. If the exchange for a signed-in user fails, no
+  session is issued: a user is never silently downgraded. An exchange refusal meant for the operator
+  (an application or agent set up wrong) is `500 identity_misconfigured`, with the reason in your logs.
+- What the identity session allows, until it expires or is revoked: chatting with the bound agent and
+  reading that chat's history as the user, starting web-first links, and listing and removing the
+  user's own linked chat accounts (`/v1/identity/me/bindings`). That is why it never reaches the
+  browser in the clear.
+- `authenticate` sees the request the widget sends. A widget on another origin (`allowedOrigins`)
+  sends no cookies of your site, so a cookie-based `authenticate` only works same-origin.
+- `DEWEE_GATEWAY_TOKEN` must be a tenant API key without an owner: the gateway refuses an identity
+  session next to a key bound to a user (`IDENTITY_CONFLICT`).
+- `identity` cannot be combined with `allowClientCredentials` (the handler refuses to start). Sessions
+  are bound to one agent, so `/config` turns the agent picker off.
+- Gateway identity errors (`IDENTITY_REQUIRED`, `IDENTITY_LINK_REQUIRED`, `LINK_EXPIRED`, `LINK_REVOKED`,
+  `PERMISSION_DENIED`, `SOURCE_UNAVAILABLE`, `IDENTITY_CONFLICT`) reach the widget as
+  `{ error: { code, remediation } }`. The widget shows its own localized message and, on `LINK_EXPIRED`
+  or `LINK_REVOKED`, asks `/session` again.
+- The widget keeps a signed-in session in memory only, so each page load asks your backend who the
+  visitor is. It refreshes the session `min(60 s, lifetime/2)` before it ends, counting the lifetime
+  (`expiresIn`) from when it received it. Call `chat.renewSession()` after a sign-in or sign-out
+  without a page load.
+- Rate limits (default, in memory): 120 `authenticate` calls per IP per minute (checked before
+  `authenticate` runs), 30 signed-in `/session` calls per user per 10 minutes, 5 link starts per user per
+  10 minutes. A visitor who is not signed in and still has a valid anonymous token gets it back as is;
+  only minting a new one counts against the 10 per IP per 10 minutes. A custom `rateLimit` receives the
+  buckets `preauth`, `verified` and `link` besides `session` and `chat`.
+- Keep `authenticate` cheap or cached (a signed-cookie check, not a database round trip per call): it
+  runs on every `/session`, so on every page load, and with `rebindEachRequest` on every `/chat`,
+  `/history` and `/link`, with only the generous per-IP cap in front of it.
+
+**Linking a chat app.** A signed-in user can link their Telegram, Discord or other chat account
+without typing any id: call `chat.startLink()`. The widget asks `POST {endpoint}/link`, which starts
+a Dewee web-first link, and shows the proof code with "Continue on Telegram" for each chat account
+the code can be sent to. The user sends the code in a direct message; Dewee checks both sides and
+links on its own. `dewee:link` fires with `{ expiresAt, deepLinks }`. A link that is already in
+progress answers `409 link_in_progress`, a reused idempotency key `409 idempotency_key_reused`, and a
+gateway with linking switched off `503 linking_unavailable`; the widget shows its own text for each.
+
+The PHP backend does not support signed-in users yet (it has no JWS signing); use the Node/Workers handler.
+
 ## Security model
 
 - The gateway token never leaves your server. Browsers get an HMAC-signed visitor id.
 - Each visitor gets its own gateway user (`webchat-<id>`) and session keys, so history is private to them.
+  A [signed-in user](#signed-in-users) is the user the gateway derives from their Dewee identity session.
 - Only allowlisted agents are reachable; origin allowlist, rate limits (20 messages/min per visitor, 10
   new sessions/10 min per IP by default — pass `rateLimit` for a shared store), 4000-char messages,
   optional Turnstile.
+- The client IP for per-IP limits comes from `cf-connecting-ip`, `x-real-ip` or the first
+  `x-forwarded-for` entry. These headers are only trustworthy behind a proxy that sets them (as
+  before signed-in users existed); elsewhere a client can choose its own IP.
 - "Bring your own gateway" (`allowClientCredentials`) is off by default; when on, internal hosts are refused.
 
 The wire format is documented in [docs/http-contract.md](https://github.com/nextlevelbuilder/dewee-webchat/blob/main/docs/http-contract.md).

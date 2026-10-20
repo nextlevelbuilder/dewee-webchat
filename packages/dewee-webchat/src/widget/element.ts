@@ -1,5 +1,5 @@
 // <dewee-chat> — framework-agnostic chat widget (Shadow DOM, zero dependencies).
-import type { ActionSensitivity, AgentInfo, ChatRequestBody, ChatStreamEvent, HistoryMessage, PublicConfig, ToolCallView } from "../protocol";
+import { isIdentityErrorCode, isLinkErrorCode, type ActionSensitivity, type AgentInfo, type ChatRequestBody, type ChatStreamEvent, type HistoryMessage, type LinkResponse, type PublicConfig, type ToolCallView } from "../protocol";
 import { ActionRegistry, runActionCall, type ActionCallStatus, type ActionConfirmHook, type PageAction, type PageActionInfo } from "../actions/action-runner";
 import {
   formatActionResults,
@@ -410,6 +410,76 @@ export class DeweeChatElement extends ElementBase {
   /** Stops the running reply. */
   stop(): void {
     this.running?.abort();
+  }
+
+  /**
+   * Call after the visitor signs in or out on the host page: the next message uses a session for
+   * the current user, and the conversation is reloaded for them.
+   */
+  async renewSession(): Promise<void> {
+    this.stop();
+    try {
+      await this.client().renewSession();
+    } catch (e) {
+      this.showError(null, e as Error);
+      return;
+    }
+    if (this.activated) await this.loadConversation();
+  }
+
+  /**
+   * Web-first linking for a signed-in user: shows a proof code and the chat apps to send it to
+   * ("Continue on Telegram"). The user never types an account id. Resolves null on failure (the
+   * error is shown in the chat and emitted as `dewee:error`).
+   */
+  async startLink(): Promise<LinkResponse | null> {
+    if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.open();
+    await this.activate();
+    try {
+      const link = await this.client().link();
+      this.renderLink(link);
+      this.emit("dewee:link", { expiresAt: link.expiresAt, deepLinks: link.deepLinks });
+      return link;
+    } catch (e) {
+      this.showError(null, e as Error);
+      return null;
+    }
+  }
+
+  private renderLink(link: LinkResponse) {
+    const s = this.strings;
+    const root = document.createElement("div");
+    root.className = "msg assistant link";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    const md = document.createElement("div");
+    md.className = "md";
+    const p = (text: string) => {
+      const el = document.createElement("p");
+      el.textContent = text;
+      return el;
+    };
+    const code = document.createElement("code");
+    code.textContent = link.proofCode;
+    const codeLine = document.createElement("p");
+    codeLine.appendChild(code);
+    md.append(p(s.linkIntro), codeLine);
+    if (link.deepLinks.length) {
+      const list = document.createElement("ul");
+      for (const t of link.deepLinks) {
+        const li = document.createElement("li");
+        const label = t.displayName || t.name;
+        li.textContent = s.linkContinueOn(channelLabel(t.channelType)) + (label ? ` · ${label}` : "");
+        list.appendChild(li);
+      }
+      md.appendChild(list);
+    } else md.appendChild(p(s.linkNoTargets));
+    md.appendChild(p(s.linkExpires(Math.max(1, Math.round((link.expiresAt - Date.now()) / 60_000)))));
+    bubble.appendChild(md);
+    root.appendChild(bubble);
+    if (!this.messages.length) this.els.log.replaceChildren();
+    this.els.log.appendChild(root);
+    this.scrollToBottom(true);
   }
 
   /** Starts a fresh conversation with the current agent. */
@@ -860,7 +930,7 @@ export class DeweeChatElement extends ElementBase {
         break;
       case "error":
         m.status = "error";
-        this.showError(m, new ApiError(e.message, 500, e.code));
+        this.showError(m, new ApiError(e.message, 500, e.code, e.remediation));
         break;
     }
     this.scheduleUpdate(m);
@@ -895,8 +965,12 @@ export class DeweeChatElement extends ElementBase {
   }
 
   private showError(m: ViewMessage | null, err: Error) {
-    const text = err.message || this.strings.errorGeneric;
-    this.emit("dewee:error", { message: text, code: (err as ApiError).code });
+    const code = (err as ApiError).code;
+    // Identity errors get the widget's own localized copy; the server text is only a fallback.
+    const localized = isIdentityErrorCode(code) ? this.strings.identityErrors[code] : isLinkErrorCode(code) ? this.strings.linkErrors[code] : "";
+    const text = localized || err.message || this.strings.errorGeneric;
+    const remediation = (err as ApiError).remediation;
+    this.emit("dewee:error", remediation ? { message: text, code, remediation } : { message: text, code });
     if (m) {
       m.content = m.content ? `${m.content}\n\n> ⚠️ ${text}` : `⚠️ ${text}`;
       m.status = "error";
@@ -953,6 +1027,13 @@ function decorateHistory(messages: ViewMessage[]): ViewMessage[] {
     });
   });
   return messages;
+}
+
+const CHANNEL_LABELS: Record<string, string> = { telegram: "Telegram", discord: "Discord", zalo: "Zalo", slack: "Slack", whatsapp: "WhatsApp", messenger: "Messenger", feishu: "Feishu", line: "LINE" };
+
+function channelLabel(type: string): string {
+  const key = type.toLowerCase().split(/[_-]/)[0];
+  return CHANNEL_LABELS[key] ?? (type ? type.charAt(0).toUpperCase() + type.slice(1) : "chat");
 }
 
 function safeJson<T>(s: string, fallback: T): T {

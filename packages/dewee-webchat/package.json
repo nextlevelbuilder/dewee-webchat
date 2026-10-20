@@ -45,6 +45,10 @@
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js"
     },
+    "./server/identity": {
+      "types": "./dist/server-identity.d.ts",
+      "import": "./dist/server-identity.js"
+    },
     "./react": {
       "types": "./dist/react.d.ts",
       "import": "./dist/react.js"
@@ -67,13 +71,18 @@
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "test:bundlers": "node scripts/bundler-smoke.mjs",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
+    "@dewee/identity": ">=0.1.0-beta.0 <1",
     "react": ">=18",
     "vue": ">=3.3"
   },
   "peerDependenciesMeta": {
+    "@dewee/identity": {
+      "optional": true
+    },
     "react": {
       "optional": true
     },
@@ -82,15 +91,18 @@
     }
   },
   "devDependencies": {
+    "@dewee/identity": "file:../../vendor/dewee-identity-0.1.0-beta.0.tgz",
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.0",
     "@types/ws": "^8.18.2",
+    "esbuild": "^0.28.2",
     "happy-dom": "^18.0.1",
     "react": "^19.1.0",
     "tsup": "^8.5.0",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4",
     "vue": "^3.5.18",
+    "webpack": "^5.112.0",
     "ws": "^8.22.0"
   },
   "engines": {

@@ -22,32 +22,63 @@ export async function openJobAccessTicket(load: (signal: AbortSignal) => Promise
   controller.signal.addEventListener("abort", rejectAbort!, { once: true });
   signal?.addEventListener("abort", cancel, { once: true });
   const timer = setTimeout(cancel, 30_000);
-  const poll = setInterval(() => { if (popup.closed) cancel(); }, 200);
+  let navigationStarted = false;
+  let finishNavigation: (() => void) | undefined;
+  let refuseNavigation: (() => void) | undefined;
+  const navigation = new Promise<void>((resolve, reject) => {
+    finishNavigation = resolve;
+    refuseNavigation = () => reject(new JobAccessPopupError("job_access_unavailable"));
+  });
+  const poll = setInterval(() => {
+    if (popup.closed) { cancel(); return; }
+    if (!navigationStarted) return;
+    try {
+      if (popup.location.href !== "about:blank") finishNavigation!();
+    } catch {
+      // Cross-origin access becomes unavailable when the submitted navigation commits.
+      finishNavigation!();
+    }
+  }, 200);
   window.addEventListener("pagehide", cancel, { once: true });
   let form: HTMLFormElement | undefined;
   let input: HTMLInputElement | undefined;
+  let launchDocument: Document | undefined;
+  const blocked = (event: SecurityPolicyViolationEvent) => {
+    if (event.disposition === "enforce" && (event.effectiveDirective === "form-action" || event.violatedDirective === "form-action")) refuseNavigation!();
+  };
   try {
     popup.opener = null;
     if (signal?.aborted) cancel();
     const ticket = parseJobAccessLaunch(await Promise.race([load(controller.signal), cancelled]));
     if (popup.closed) throw new JobAccessPopupError("popup_closed");
     if (controller.signal.aborted) throw new JobAccessPopupError("job_access_unavailable");
-    form = document.createElement("form");
+    // Submit from the owned blank popup so a host no-referrer policy cannot
+    // turn the POST Origin into null. Keep the host document policy unchanged.
+    launchDocument = popup.document;
+    const referrer = launchDocument.createElement("meta");
+    referrer.name = "referrer";
+    referrer.content = "strict-origin";
+    launchDocument.head.append(referrer);
+    form = launchDocument.createElement("form");
     form.method = "POST";
     form.action = ticket.bootstrap_url;
-    form.target = name;
+    form.target = "_self";
     form.hidden = true;
-    input = document.createElement("input");
+    input = launchDocument.createElement("input");
     input.type = "hidden";
     input.name = "launch_token";
     input.value = ticket.launch_token;
     form.append(input);
-    document.body.append(form);
+    launchDocument.body.append(form);
     // A native form submission serializes synchronously. Remove the transient
     // token-bearing node immediately, without retaining it in HTML or storage.
+    launchDocument.addEventListener("securitypolicyviolation", blocked);
     HTMLFormElement.prototype.submit.call(form);
+    navigationStarted = true;
     input.value = "";
     ticket.launch_token = "";
+    form.remove();
+    await Promise.race([navigation, cancelled]);
   } catch (error) {
     const closed = popup.closed;
     try { popup.close(); } catch { /* Only this owned popup is closed. */ }
@@ -58,6 +89,7 @@ export async function openJobAccessTicket(load: (signal: AbortSignal) => Promise
   } finally {
     if (input) input.value = "";
     form?.remove();
+    launchDocument?.removeEventListener("securitypolicyviolation", blocked);
     clearTimeout(timer);
     clearInterval(poll);
     window.removeEventListener("pagehide", cancel);

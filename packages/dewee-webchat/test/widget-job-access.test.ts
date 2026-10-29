@@ -6,7 +6,8 @@ import { defineDeweeChat, type DeweeChatElement } from "../src/index";
 const TOKEN = "one_time_ticket_0123456789";
 const ticket = () => ({ bootstrap_url: "https://access.example/identity/job-access/launch", launch_token: TOKEN, expires_at: new Date(Date.now() + 45_000).toISOString() });
 function popup() {
-  const win = { closed: false, opener: window, close: vi.fn() };
+  const popupDocument = document.implementation.createHTMLDocument("Job access");
+  const win = { closed: false, opener: window, document: popupDocument, location: { href: "about:blank" }, close: vi.fn() };
   vi.spyOn(window, "open").mockReturnValue(win as unknown as Window);
   return win;
 }
@@ -24,11 +25,16 @@ describe("job access popup lifecycle", () => {
       submitted = this; field = this.querySelector("input")!;
       expect(this.method.toUpperCase()).toBe("POST");
       expect(this.action).toBe(ticket().bootstrap_url);
+      win.location.href = this.action;
       expect(this.action).not.toContain(TOKEN);
-      expect(this.target).toMatch(/^dewee-job-access-/);
+      expect(this.target).toBe("_self");
+      expect(this.ownerDocument).toBe(win.document);
+      expect(win.document.head.querySelector('meta[name="referrer"]')?.getAttribute("content")).toBe("strict-origin");
+      expect(document.head.querySelector('meta[name="referrer"]')).toBeNull();
       expect(new FormData(this).get("launch_token")).toBe(TOKEN);
       expect(this.querySelectorAll("input")).toHaveLength(1);
       expect(this.isConnected).toBe(true);
+      win.location.href = this.action;
     });
     const pending = openJobAccessTicket(load);
     expect(window.open).toHaveBeenCalledWith("about:blank", expect.stringMatching(/^dewee-job-access-/), expect.any(String));
@@ -68,6 +74,43 @@ describe("job access popup lifecycle", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("reports an asynchronous inherited CSP refusal and clears its transient ticket", async () => {
+    const win = popup(); let field: HTMLInputElement | undefined;
+    vi.spyOn(HTMLFormElement.prototype, "submit").mockImplementation(function (this: HTMLFormElement) {
+      field = this.querySelector("input")!;
+      setTimeout(() => {
+        const violation = new Event("securitypolicyviolation");
+        Object.defineProperty(violation, "effectiveDirective", { value: "form-action" });
+        Object.defineProperty(violation, "disposition", { value: "enforce" });
+        win.document.dispatchEvent(violation);
+      }, 0);
+    });
+    await expect(openJobAccessTicket(async () => ticket())).rejects.toMatchObject({ code: "job_access_unavailable" });
+    expect(field?.value).toBe(""); expect(win.document.querySelector("form")).toBeNull();
+    expect(win.close).toHaveBeenCalledTimes(1);
+  });
+  it("allows navigation when CSP only reports a form-action violation", async () => {
+    const win = popup();
+    vi.spyOn(HTMLFormElement.prototype, "submit").mockImplementation(function (this: HTMLFormElement) {
+      const violation = new Event("securitypolicyviolation");
+      Object.defineProperties(violation, { effectiveDirective: { value: "form-action" }, disposition: { value: "report" } });
+      win.document.dispatchEvent(violation);
+      win.location.href = this.action;
+    });
+    await expect(openJobAccessTicket(async () => ticket())).resolves.toBeUndefined();
+    expect(win.close).not.toHaveBeenCalled(); expect(win.document.querySelector("form")).toBeNull();
+  });
+
+  it("times out safely after submit if no navigation or CSP event arrives", async () => {
+    vi.useFakeTimers(); const win = popup();
+    vi.spyOn(HTMLFormElement.prototype, "submit").mockImplementation(() => {});
+    const pending = openJobAccessTicket(async () => ticket());
+    const rejected = expect(pending).rejects.toMatchObject({ code: "job_access_unavailable" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(win.document.querySelector("form")).toBeNull();
+    await vi.advanceTimersByTimeAsync(30_000); await rejected;
+    expect(win.close).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
+  });
   it("removes the token and closes the popup if native submission fails", async () => {
     const win = popup(); let field: HTMLInputElement | undefined;
     vi.spyOn(HTMLFormElement.prototype, "submit").mockImplementation(function (this: HTMLFormElement) { field = this.querySelector("input")!; throw new Error("submit failed"); });
@@ -113,12 +156,13 @@ describe("job access widget integration", () => {
     expect(calls.filter((path) => path.endsWith("/job-access"))).toHaveLength(0);
   });
   it("launches through the real widget client without retaining tickets in storage, markup or events", async () => {
-    const calls = backend(); const el = await mount(); popup();
+    const calls = backend(); const el = await mount(); const win = popup();
     const events: unknown[] = [];
     for (const name of ["dewee:error", "dewee:send", "dewee:reply"]) el.addEventListener(name, (event) => events.push((event as CustomEvent).detail));
     const submit = vi.spyOn(HTMLFormElement.prototype, "submit").mockImplementation(function (this: HTMLFormElement) {
       expect(new FormData(this).get("launch_token")).toBe(TOKEN);
       expect(this.action).toBe(ticket().bootstrap_url);
+      win.location.href = this.action;
     });
     await el.openJobAccess();
     expect(submit).toHaveBeenCalledTimes(1);
@@ -141,5 +185,3 @@ describe("job access widget integration", () => {
     expect(win.close).toHaveBeenCalledTimes(1); expect(document.querySelector("form")).toBeNull();
   });
 });
-
-

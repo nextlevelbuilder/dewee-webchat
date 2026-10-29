@@ -1,6 +1,6 @@
 {
   "name": "dewee-webchat",
-  "version": "0.4.0",
+  "version": "0.4.1-beta.1",
   "description": "Embeddable chat widget for Dewee AI agents — web component, React/Vue/Astro wrappers and a secure backend handler (Workers, Next.js, Node, Bun, Deno).",
   "license": "MIT",
   "type": "module",

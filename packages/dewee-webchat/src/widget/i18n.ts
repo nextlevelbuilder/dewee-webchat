@@ -43,6 +43,11 @@ export interface Strings {
   linkContinueOn: (channel: string) => string;
   linkExpires: (minutes: number) => string;
   linkNoTargets: string;
+  jobAccess: string;
+  jobAccessOpened: string;
+  jobAccessUnavailable: string;
+  jobAccessPopupBlocked: string;
+  jobAccessPopupClosed: string;
 }
 
 const en: Strings = {
@@ -99,6 +104,11 @@ const en: Strings = {
   linkContinueOn: (channel) => `Continue on ${channel}`,
   linkExpires: (m) => `The code expires in ${m} min.`,
   linkNoTargets: "No chat app is set up for linking yet.",
+  jobAccess: "Job access",
+  jobAccessOpened: "Job access opened in a new window. Review and confirm any permissions there.",
+  jobAccessUnavailable: "Job access could not be opened. Sign in again or retry.",
+  jobAccessPopupBlocked: "Allow popups for this site, then choose Job access again.",
+  jobAccessPopupClosed: "The window was closed. Choose Job access again to retry.",
 };
 
 const vi: Strings = {
@@ -155,6 +165,11 @@ const vi: Strings = {
   linkContinueOn: (channel) => `Tiếp tục trên ${channel}`,
   linkExpires: (m) => `Mã hết hạn sau ${m} phút.`,
   linkNoTargets: "Chưa có ứng dụng chat nào được thiết lập để liên kết.",
+  jobAccess: "Quyền công việc",
+  jobAccessOpened: "Đã mở cửa sổ quyền công việc. Hãy xem lại và xác nhận quyền tại đó.",
+  jobAccessUnavailable: "Chưa mở được quyền công việc. Hãy đăng nhập lại hoặc thử lại.",
+  jobAccessPopupBlocked: "Cho phép cửa sổ bật lên cho trang này rồi chọn Quyền công việc lần nữa.",
+  jobAccessPopupClosed: "Cửa sổ đã đóng. Chọn Quyền công việc lần nữa để thử lại.",
 };
 
 export const locales: Record<string, Strings> = { en, vi };
@@ -165,6 +180,7 @@ export function pickStrings(locale?: string): Strings {
 }
 
 export const icons = {
+  jobAccess: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4v5c0 5-8 9-8 9s-8-4-8-9V7l8-4Z"/><path d="m8 12 3 3 5-6"/></svg>`,
   action: `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg>`,
   chat: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8.5 8.5 0 0 1-12.4 7.6L3 21l1.4-5.1A8.5 8.5 0 1 1 21 12Z"/><path d="M8.5 11h.01M12 11h.01M15.5 11h.01"/></svg>`,
   close: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>`,

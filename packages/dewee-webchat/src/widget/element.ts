@@ -13,6 +13,7 @@ import {
 } from "../actions/directives";
 import { ACTION_LIMITS, stripPageBlock } from "../actions/page-block";
 import { ApiClient, ApiError, type RequestHeadersOption } from "./api-client";
+import { JobAccessPopupError, openJobAccessTicket } from "./job-access";
 import { showConfirmDialog } from "./confirm-dialog";
 import { icons, pickStrings, type Strings } from "./i18n";
 import { renderMarkdown } from "./markdown";
@@ -176,6 +177,7 @@ export class DeweeChatElement extends ElementBase {
   private conversationId = "";
   private messages: ViewMessage[] = [];
   private running: AbortController | null = null;
+  private jobAccessLaunch: AbortController | null = null;
   private activated = false;
   private strings: Strings = pickStrings();
   private mql: MediaQueryList | null = null;
@@ -188,7 +190,7 @@ export class DeweeChatElement extends ElementBase {
   private els!: {
     launcher: HTMLButtonElement; panel: HTMLElement; log: HTMLElement; title: HTMLElement; subtitle: HTMLElement;
     status: HTMLElement; avatar: HTMLElement; select: HTMLSelectElement; input: HTMLTextAreaElement; send: HTMLButtonElement;
-    newChat: HTMLButtonElement; close: HTMLButtonElement; foot: HTMLElement; cooldown: HTMLElement; announcer: HTMLElement;
+    newChat: HTMLButtonElement; jobAccess: HTMLButtonElement; close: HTMLButtonElement; foot: HTMLElement; cooldown: HTMLElement; announcer: HTMLElement;
   };
 
   constructor() {
@@ -479,6 +481,29 @@ export class DeweeChatElement extends ElementBase {
     }
   }
 
+  /** Opens the hosted permission review; the verified session stays on the backend. */
+  async openJobAccess(): Promise<void> {
+    if (this.jobAccessLaunch) return;
+    const controller = new AbortController();
+    this.jobAccessLaunch = controller;
+    this.els.jobAccess.disabled = true;
+    try {
+      await openJobAccessTicket((signal) => this.client().jobAccess(signal), controller.signal);
+      this.showNotice(this.strings.jobAccessOpened);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      if (error instanceof JobAccessPopupError) {
+        this.showNotice(error.code === "popup_blocked" ? this.strings.jobAccessPopupBlocked :
+          error.code === "popup_closed" ? this.strings.jobAccessPopupClosed : this.strings.jobAccessUnavailable);
+      } else if (error instanceof ApiError && isIdentityErrorCode(error.code)) {
+        this.showError(null, error);
+      } else this.showNotice(this.strings.jobAccessUnavailable);
+    } finally {
+      this.jobAccessLaunch = null;
+      this.els.jobAccess.disabled = false;
+    }
+  }
+
   private renderLink(link: LinkResponse) {
     const s = this.strings;
     const root = document.createElement("div");
@@ -537,6 +562,7 @@ export class DeweeChatElement extends ElementBase {
   }
 
   disconnectedCallback(): void {
+    this.jobAccessLaunch?.abort();
     this.stop();
     this.mql?.removeEventListener("change", this.onScheme);
   }
@@ -623,6 +649,8 @@ export class DeweeChatElement extends ElementBase {
     e.close.title = s.close;
     e.newChat.setAttribute("aria-label", s.newChat);
     e.newChat.title = s.newChat;
+    e.jobAccess.setAttribute("aria-label", s.jobAccess);
+    e.jobAccess.title = s.jobAccess;
     e.input.placeholder = c.placeholder || s.placeholder;
     e.foot.hidden = !!c.hideBranding;
     e.foot.querySelector(".by")!.textContent = s.poweredBy + " ";
@@ -653,6 +681,7 @@ export class DeweeChatElement extends ElementBase {
             <div class="subtitle"><span class="dot"></span><span class="status"></span><select class="agent-select" hidden></select></div>
           </div>
           <button class="icon-btn new">${icons.newChat}</button>
+          <button class="icon-btn job-access" hidden>${icons.jobAccess}</button>
           <button class="icon-btn close">${icons.close}</button>
         </header>
         <div class="log" part="log" role="log" aria-live="polite"></div>
@@ -671,7 +700,7 @@ export class DeweeChatElement extends ElementBase {
     this.els = {
       launcher: $(".launcher"), panel: $(".panel"), log: $(".log"), title: $(".title"), subtitle: $(".subtitle"),
       status: $(".status"), avatar: $(".avatar"), select: $(".agent-select"), input: $("textarea"), send: $(".send"),
-      newChat: $(".new"), close: $(".close"), foot: $(".foot"), cooldown: $(".cooldown"), announcer: $(".announcer"),
+      newChat: $(".new"), jobAccess: $(".job-access"), close: $(".close"), foot: $(".foot"), cooldown: $(".cooldown"), announcer: $(".announcer"),
     };
     const e = this.els;
     e.launcher.addEventListener("click", () => this.toggle());
@@ -679,6 +708,7 @@ export class DeweeChatElement extends ElementBase {
     // Follow the stream until the visitor scrolls up; content growth alone fires no scroll event.
     e.log.addEventListener("scroll", () => { this.following = this.nearBottom(); }, { passive: true });
     e.newChat.addEventListener("click", () => this.newConversation());
+    e.jobAccess.addEventListener("click", () => { void this.openJobAccess(); });
     e.select.addEventListener("change", () => this.switchAgent(e.select.value));
     $<HTMLFormElement>("form").addEventListener("submit", (ev) => {
       ev.preventDefault();
@@ -736,6 +766,7 @@ export class DeweeChatElement extends ElementBase {
   }
 
   private renderSubtitle() {
+    this.els.jobAccess.hidden = this.server?.identity !== true;
     const e = this.els;
     const c = this.config;
     const agents = this.server?.agents ?? [];

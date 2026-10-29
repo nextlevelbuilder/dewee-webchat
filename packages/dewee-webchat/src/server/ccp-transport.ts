@@ -7,6 +7,7 @@
 // shown, quotas, and every authorization of the visitor. Nothing CCP says is passed to a browser
 // verbatim: events and errors are rebuilt from known fields with this module's own messages.
 import { stripPageBlock } from "../actions/page-block";
+import { parseJobAccessLaunch, type JobAccessLaunch } from "../job-access";
 import { isAdmissionErrorCode, isIdentityErrorCode, type AdmissionErrorCode, type AgentInfo, type ChatStreamEvent, type HistoryMessage, type IdentityErrorCode, type LinkResponse, type Remediation, type ToolCallView } from "../protocol";
 import { CcpClient, CcpError, knownRemediation, readSseJson, type CcpRequest, type CcpRoute } from "./ccp-client";
 import { DEAD_SESSION_CODES, IDENTITY_ERRORS } from "./identity-errors";
@@ -460,6 +461,18 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
         if (e instanceof CcpError && DEAD_SESSION_CODES.has(e.code)) return; // already dead: nothing to revoke
         console.warn("[dewee-webchat] ccp identity/revoke failed:", e instanceof CcpError ? e.code : (e as Error)?.name);
       });
+    },
+
+    /** One-time hosted-page launch, with the original session kept server-side. */
+    async jobAccess(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { identitySession: string; agent: string }): Promise<JobAccessLaunch> {
+      const data = await withEdge(ctx, visitorId, sealed, (edge) => client.json<unknown>("job-access", {
+        ...base(ctx), session: edge.token, body: { identity_session: input.identitySession, agent: input.agent },
+      }));
+      try {
+        const launch = parseJobAccessLaunch(data);
+        if (launch.launch_token === input.identitySession) throw new Error("Invalid launch ticket");
+        return launch;
+      } catch { throw new CcpError(502, "ccp_bad_response", "Job access is unavailable"); }
     },
 
     /** Web-first link for a signed-in visitor. */

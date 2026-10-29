@@ -7,7 +7,7 @@
 // another origin. Nothing a visitor sends ever becomes part of a URL.
 
 /** Routes of the public ingress this client calls. Fixed names: callers cannot inject path segments. */
-export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "link";
+export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "link" | "job-access";
 
 /** Validated CCP endpoint options (see {@link parseCcpOptions}). */
 export interface CcpOptions {

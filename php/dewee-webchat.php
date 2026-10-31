@@ -1683,7 +1683,7 @@ final class DeweeWebchat
     // ---------------------------------------------------------------- security helpers
 
     /**
-     * Fixed-window limiter backed by small lock files in the temp dir.
+     * Fixed-window limiter backed by small lock files in the private temp dir (see privateTempDir).
      * Override with option 'rateLimit' => callable(string $key, string $bucket): bool, or false to disable.
      */
     private function rateLimit(string $key, string $bucket): bool
@@ -1696,12 +1696,20 @@ final class DeweeWebchat
             return (bool) $custom($key, $bucket);
         }
         [$max, $windowMs] = self::RATE_LIMITS[$bucket];
-        $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'dewee-webchat-rl';
-        if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+        // A shared temp dir would let another account on the host reset, inflate or redirect the counters.
+        $dir = self::privateTempDir();
+        if ($dir === null) {
             error_log('[dewee-webchat] Rate limiter storage unavailable; requests are not limited.');
             return true;
         }
-        $fp = @fopen($dir . DIRECTORY_SEPARATOR . hash('sha256', "{$bucket}:{$key}"), 'c+');
+        $file = $dir . DIRECTORY_SEPARATOR . 'rl-' . hash('sha256', "{$bucket}:{$key}");
+        // Exclusive creation never follows a planted link; an existing file must be this user's own.
+        $fp = @fopen($file, 'x+');
+        if ($fp !== false) {
+            @chmod($file, 0600);
+        } elseif (self::ownedPrivateFile($file)) {
+            $fp = @fopen($file, 'r+');
+        }
         if ($fp === false) {
             error_log('[dewee-webchat] Rate limiter storage unavailable; requests are not limited.');
             return true;
@@ -1724,7 +1732,7 @@ final class DeweeWebchat
             fclose($fp);
         }
         if (random_int(1, 200) === 1) {
-            foreach (glob($dir . DIRECTORY_SEPARATOR . '*') ?: [] as $f) {
+            foreach (glob($dir . DIRECTORY_SEPARATOR . 'rl-*') ?: [] as $f) {
                 if (@filemtime($f) < time() - 3600) {
                     @unlink($f);
                 }

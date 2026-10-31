@@ -3,7 +3,7 @@
 // contract next to the TS handler's answers, error mapping and redaction, redirect refusal, timeout
 // abort. Runs when a PHP 8.1+ binary is available (PHP_BIN or `php` on PATH); skipped otherwise.
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -415,6 +415,20 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     for (let i = 0; i < 11; i++) statuses.push((await call("/session", { method: "POST", headers: { "x-forwarded-for": "198.51.100.99" }, body: "{}" })).status);
     expect(statuses.slice(0, 10).every((x) => x === 200)).toBe(true);
     expect(statuses[10]).toBe(429);
+  });
+
+  it("keeps rate-limit counters in the private temp directory, never in a shared one", async () => {
+    // Another account on a shared host could have created the old shared directory first.
+    const shared = join(dir, "tmp", "dewee-webchat-rl");
+    spawnSync("mkdir", ["-p", shared]);
+    chmodSync(shared, 0o777);
+    setOptions({ rateLimit: true });
+    expect((await call("/session", { method: "POST", headers: { "x-forwarded-for": "198.51.100.42" }, body: "{}" })).status).toBe(200);
+    expect(readdirSync(shared)).toEqual([]);
+    const [priv] = cacheDirs();
+    const counters = readdirSync(priv).filter((n) => n.startsWith("rl-"));
+    expect(counters.length).toBeGreaterThan(0);
+    for (const n of counters) expect(statSync(join(priv, n)).mode & 0o077).toBe(0);
   });
 
   it(

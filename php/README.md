@@ -34,7 +34,7 @@ CCP and copy its values (agents, allowed sites and limits are set there):
 | `DEWEE_CCP_CHAT_URL` | Ingress URL, `https://<ccp>/api/public/webchat/v1/wci_…` (https; plain http to `localhost` only) |
 | `DEWEE_WEBCHAT_INTEGRATION_ID` | `wci_…`, must match the end of the URL |
 | `DEWEE_WEBCHAT_INTEGRATION_SECRET` | `dwc_…`. Server only; sent to that origin only, redirects are refused |
-| `DEWEE_WEBCHAT_SECRET` | HMAC secret for visitor tokens (>= 32 random chars; required with CCP) |
+| `DEWEE_WEBCHAT_SECRET` | HMAC secret for visitor tokens (at least 32 random bytes; required with either transport) |
 | `DEWEE_WEBCHAT_TRANSPORT` | Optional `ccp` or `legacy-gateway`; otherwise the variables set decide |
 | `DEWEE_ALLOWED_ORIGINS` (csv or `*`) | Optional |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Require Cloudflare Turnstile for new sessions |
@@ -51,15 +51,17 @@ Deprecated `legacy-gateway` transport (direct Gateway URL and token, see
 | `DEWEE_ALLOW_CLIENT_CREDENTIALS=true`, `DEWEE_CLIENT_CREDENTIAL_HOSTS` | Bring-your-own gateway (playgrounds only) |
 
 CCP and gateway variables together are refused: the endpoint answers `500 not_configured` and logs
-why (`error_log`), so a credential is never sent to an origin you did not choose. The deprecation
-warning of the legacy transport is logged at most once a day.
+why (`error_log`), so a credential is never sent to an origin you did not choose. When private temp
+storage is available, the legacy transport's deprecation warning is logged at most once a day. Its
+throttle marker is stored in the private temp directory described below, never in a shared global temp file.
 
 With CCP, the integration config is cached for 60 s in a directory private to the PHP user,
 `sys_get_temp_dir()/dewee-webchat-<uid>` (created `0700`). If that directory is a link, belongs to
 another user or is open to others (another account on a shared host could have created it), nothing
 is cached and `error_log` says why; a cached file is only read when it is this user's and not
-writable by others. The CCP edge session lives in the visitor token (encrypted, same format as the
-Node handler), because PHP keeps no memory between requests. `/session` reports the edge session's
+writable by others. The legacy warning marker uses that same private directory. The CCP edge session
+lives in the visitor token (encrypted, same format as the Node handler), because PHP keeps no memory
+between requests. `/session` reports the edge session's
 end as `expiresAt` (and `expiresIn`), so the widget asks for a new token before it lapses; that
 refresh keeps the visitor and re-seals a refreshed edge session, and chat requests do not refresh or
 open one. A returning visitor's `/session` is rate limited per visitor, a new visitor's per IP, and
@@ -74,7 +76,9 @@ Array options use the TS names (`transport`, `ccp` = `['chatUrl' => …, 'integr
 default to 20 messages/min per visitor+IP and 10 sessions/10 min per IP, kept in files under
 `sys_get_temp_dir()`. They are defense in depth: the Dewee gateway owns the shared message limit, and its
 `POLICY_DENIED` / `RATE_LIMITED` refusals (and, with transport `ccp`, CCP's refusals of a message) are answered as typed errors exactly like the TypeScript handler
-([admission errors](../docs/http-contract.md#admission-errors)). Without a secret, a generated one is stored in the temp dir (set your own).
+([admission errors](../docs/http-contract.md#admission-errors)). Set `DEWEE_WEBCHAT_SECRET` for either transport;
+without a secret of at least 32 bytes, the backend refuses startup with `500 not_configured`. It does
+not generate or persist a fallback secret.
 
 ## Streaming (SSE) behind a web server
 

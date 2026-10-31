@@ -229,9 +229,7 @@ final class DeweeWebchat
             'timeoutMs' => 180000,
         ], array_filter($options, static fn ($v) => $v !== null));
 
-        $this->secret = is_string($this->o['secret'] ?? null) && $this->o['secret'] !== ''
-            ? $this->o['secret']
-            : self::fallbackSecret();
+        $this->secret = is_string($this->o['secret'] ?? null) ? $this->o['secret'] : '';
 
         $agents = $this->o['agents'] ?? [];
         $this->wildcardAgents = $agents === '*';
@@ -303,11 +301,14 @@ final class DeweeWebchat
         if ($hasCcp) {
             $refuse('transport "legacy-gateway" is set together with ccp options; remove one of them');
         }
+        if (!is_string($o['secret'] ?? null) || strlen($o['secret']) < 32) {
+            $refuse('the legacy-gateway transport needs secret (DEWEE_WEBCHAT_SECRET), at least 32 bytes');
+        }
         self::warnLegacyOnce();
         return 'legacy-gateway';
     }
 
-    /** PHP has no long-lived process: the deprecation warning is throttled to once a day with a temp marker. */
+    /** PHP has no long-lived process: a private temp marker throttles the warning when storage is available. */
     private static function warnLegacyOnce(): void
     {
         static $warned = false;
@@ -315,32 +316,25 @@ final class DeweeWebchat
             return;
         }
         $warned = true;
-        $marker = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'dewee-webchat-legacy-gateway-warned';
-        $at = @filemtime($marker);
-        if ($at !== false && $at > time() - 86400) {
-            return;
+        $dir = self::privateTempDir();
+        if ($dir !== null) {
+            $marker = $dir . DIRECTORY_SEPARATOR . 'legacy-gateway-warned';
+            if (self::ownedPrivateFile($marker)) {
+                $at = @filemtime($marker);
+                if ($at !== false && $at > time() - 86400) {
+                    return;
+                }
+                @touch($marker);
+            } else {
+                // Exclusive creation avoids following a planted symlink or overwriting another file.
+                $handle = @fopen($marker, 'x');
+                if (is_resource($handle)) {
+                    @chmod($marker, 0600);
+                    fclose($handle);
+                }
+            }
         }
-        @touch($marker);
         error_log('[dewee-webchat] transport "legacy-gateway" (a direct Gateway URL and token) is deprecated. Create a Website chat integration in CCP and switch to transport "ccp": ' . self::MIGRATION_GUIDE);
-    }
-
-    /**
-     * PHP has no long-lived process, so an in-memory ephemeral secret would invalidate every
-     * token on the next request. Persist a random one in the temp dir instead and warn.
-     */
-    private static function fallbackSecret(): string
-    {
-        error_log('[dewee-webchat] No secret configured: using a generated one stored in the temp dir. Set DEWEE_WEBCHAT_SECRET.');
-        $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'dewee-webchat-secret';
-        $s = @file_get_contents($file);
-        if (is_string($s) && strlen($s) >= 32) {
-            return $s;
-        }
-        $s = self::randomId(32);
-        if (@file_put_contents($file, $s, LOCK_EX) !== false) {
-            @chmod($file, 0600);
-        }
-        return $s;
     }
 
     // ---------------------------------------------------------------- routing
@@ -1024,7 +1018,7 @@ final class DeweeWebchat
         if (isset($memo[$key])) {
             return $memo[$key];
         }
-        $dir = self::privateCacheDir();
+        $dir = self::privateTempDir();
         $file = $dir !== null ? $dir . DIRECTORY_SEPARATOR . "ccp-config-{$key}.json" : null;
         if ($file !== null && self::ownedPrivateFile($file)) {
             $mtime = @filemtime($file);
@@ -1047,12 +1041,12 @@ final class DeweeWebchat
     }
 
     /**
-     * A cache directory only this process's user can write: `dewee-webchat-<uid>` in the temp dir,
+     * A directory only this process's user can access: `dewee-webchat-<uid>` in the temp dir,
      * created 0700. On shared hosting the temp dir is shared, so another account could create the
-     * directory (or plant a config) first: a directory that is a link, not owned by this user or open to
-     * others is not used, and nothing is cached. Null when there is no such directory.
+     * directory (or plant a file) first: a directory that is a link, not owned by this user or open to
+     * others is not used. Null when there is no such directory.
      */
-    private static function privateCacheDir(): ?string
+    private static function privateTempDir(): ?string
     {
         static $dir = false;
         if ($dir !== false) {
@@ -1066,7 +1060,7 @@ final class DeweeWebchat
         clearstatcache(true, $d);
         $perms = @fileperms($d);
         if ($uid === null || is_link($d) || !is_dir($d) || @fileowner($d) !== $uid || $perms === false || ($perms & 0077) !== 0) {
-            error_log('[dewee-webchat] the CCP config cache directory is missing or not private to this user; the config is not cached');
+            error_log('[dewee-webchat] the private temp directory is missing or not private to this user; temporary data is not stored');
             return $dir = null;
         }
         return $dir = $d;

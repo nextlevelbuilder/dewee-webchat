@@ -114,7 +114,9 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
       { ccp: { ...ok, chatUrl: `https://ccp.example.com/api/public/webchat/v1/wci_bcdefghijklmnopqrstuvwxyza` }, secret: VISITOR_SECRET },
       { ccp: { ...ok, integrationSecret: "sk-gateway-token" }, secret: VISITOR_SECRET },
       { ccp: { ...ok, chatUrl: `${url}?x=1` }, secret: VISITOR_SECRET },
+      { gatewayUrl: "https://gw.example", token: "t", secret: VISITOR_SECRET },
       { gatewayUrl: "https://gw.example", token: "t" },
+      { gatewayUrl: "https://gw.example", token: "t", secret: "short" },
     ];
     const out = php(
       `$r = [];
@@ -138,6 +140,8 @@ echo json_encode($r);`,
     expect(out[10]).toMatch(/refused: .*dwc_ secret/);
     expect(out[11]).toMatch(/refused: .*query or fragment/);
     expect(out[12]).toBe("legacy-gateway");
+    expect(out[13]).toMatch(/refused: .*legacy-gateway transport needs secret .* at least 32 bytes/);
+    expect(out[14]).toMatch(/refused: .*legacy-gateway transport needs secret .* at least 32 bytes/);
     expect(out.join("\n")).not.toContain(INTEGRATION_SECRET);
   });
 

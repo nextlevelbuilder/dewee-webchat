@@ -1,10 +1,14 @@
 name: Release
 
-# Push a tag that matches packages/dewee-webchat/package.json (e.g. v0.1.2) to publish to npm
-# through npm Trusted Publishing (OIDC, no NPM_TOKEN) and create the GitHub release.
+# Version-matching v* tags publish through npm Trusted Publishing (OIDC).
+# Numbered betas go to the beta dist-tag and GitHub prereleases; stable uses latest.
 on:
   push:
     tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
 
 permissions:
   contents: write # create the GitHub release
@@ -13,6 +17,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: npm
     steps:
       - uses: actions/checkout@v4
@@ -22,19 +27,21 @@ jobs:
           node-version: 22
           cache: pnpm
           registry-url: https://registry.npmjs.org
+      - name: Validate release channel and tag
+        id: channel
+        run: |
+          node --test scripts/release-channel.test.mjs
+          node scripts/release-channel.mjs packages/dewee-webchat/package.json "$GITHUB_REF_NAME"
       # Trusted Publishing needs npm >= 11.5.1.
       - run: npm install -g npm@11
       - run: pnpm install --frozen-lockfile
 
-      - name: Check tag matches package version
+      - name: Check whether npm version is already published
         id: version
+        env:
+          RELEASE_VERSION: ${{ steps.channel.outputs.version }}
         run: |
-          version=$(node -p "require('./packages/dewee-webchat/package.json').version")
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match package version $version"; exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if npm view "dewee-webchat@$version" version >/dev/null 2>&1; then
+          if npm view "dewee-webchat@$RELEASE_VERSION" version >/dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
@@ -47,14 +54,21 @@ jobs:
       - name: Publish to npm
         if: steps.version.outputs.published == 'false'
         working-directory: packages/dewee-webchat
-        run: npm publish --access public --provenance
+        env:
+          NPM_DIST_TAG: ${{ steps.channel.outputs.npm_tag }}
+        run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ steps.channel.outputs.prerelease }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" php/dewee-webchat.php --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" php/dewee-webchat.php --title "$GITHUB_REF_NAME" --generate-notes
+            echo "Release already exists; leaving its assets unchanged."
+            exit 0
           fi
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" php/dewee-webchat.php --verify-tag --title "$GITHUB_REF_NAME" --generate-notes "${flags[@]}"

@@ -49,6 +49,7 @@ import {
 import { DEAD_SESSION_CODES, IDENTITY_ERRORS } from "./identity-errors";
 import { CcpClient, CcpError, parseCcpOptions, type CcpOptions } from "./ccp-client";
 import { resolveTransport } from "./transport-selection";
+import { JobAccessRefusal, mintJobAccess } from "./job-access";
 import { CCP_AGENT_RE, CCP_ID_RE, EDGE_RESEAL_MS, browserErrorFor, createCcpTransport, type BrowserError, type CcpConfig, type EdgeSession, type VisitorContext } from "./ccp-transport";
 
 /**
@@ -545,15 +546,15 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
    * With `rebindEachRequest`: the request's own login must still be the user the token was issued for.
    * Returns the refusal, or null to go on.
    */
-  async function rebindRefusal(req: Request, claims: VisitorClaims): Promise<Response | null> {
-    if (!idn?.rebindEachRequest || !claims.ids) return null;
+  async function rebindRefusal(req: Request, claims: VisitorClaims, required = false): Promise<Response | null> {
+    if (!idn || (!required && !idn.rebindEachRequest) || !claims.ids) return null;
     const throttled = await preauthRefusal(req);
     if (throttled) return throttled;
     let user: AuthenticatedUser | null;
     try {
       user = await idn.authenticate(req);
     } catch (e) {
-      console.warn("[dewee-webchat] identity.authenticate failed:", e);
+      console.warn("[dewee-webchat] identity.authenticate failed:", e instanceof Error ? e.name : "unknown");
       return identityFail(req, "SOURCE_UNAVAILABLE", { action: "retry_later", audience: "end_user" });
     }
     const current = !!user && typeof user.subject === "string" && user.subject !== "" ? await subjectDigest(secret!, user.subject) : null;
@@ -1178,6 +1179,36 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     }
   }
 
+  /** A launch is a human browser action, checked against the current login even when chat rebind is optional. */
+  async function handleJobAccess(req: Request): Promise<Response> {
+    const origin = req.headers.get("origin");
+    try {
+      const parsed = new URL(origin ?? "");
+      if (parsed.protocol !== "https:" || parsed.origin !== origin) return fail(req, 403, "Open job access from your signed-in chat", "forbidden_origin");
+    } catch { return fail(req, 403, "Open job access from your signed-in chat", "forbidden_origin"); }
+    const claims = await visitorFrom(req);
+    if (!claims?.ids || !claims.ida) return identityFail(req, "IDENTITY_REQUIRED");
+    const refused = await rebindRefusal(req, claims, true);
+    if (refused) return refused;
+    const agent = ccp ? ccpAgentFor(req, claims, claims.ida) : await agentFor(claims, claims.ida, serverCreds(), false);
+    if (agent instanceof Response) return agent;
+    if (!agent) return fail(req, 403, "Agent not allowed", "agent_not_allowed");
+    if (limiter && !(await limiter(`visitor:${claims.v}`, "link"))) return fail(req, 429, "Too many requests, try again later", "rate_limited");
+    let body: unknown;
+    try { body = await req.json(); } catch { return fail(req, 400, "Invalid request", "invalid_request"); }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length) return fail(req, 400, "Invalid request", "invalid_request");
+    try {
+      const launch = ccp
+        ? await ccp.jobAccess(visitorContext(req), claims.v, sealedEdge(claims), { identitySession: claims.ids, agent })
+        : await mintJobAccess(o.gatewayUrl!, claims.ids, origin!);
+      return json(req, launch);
+    } catch (error) {
+      if (error instanceof JobAccessRefusal) return identityFail(req, error.code);
+      if (error instanceof CcpError) return ccpFail(req, error, "job-access", claims.ids);
+      return fail(req, 502, "Job access is unavailable. Try again later.", "job_access_unavailable");
+    }
+  }
+
   /** Web-first linking: starts a Dewee link for the signed-in user and returns the proof code. */
   async function handleLink(req: Request): Promise<Response> {
     const claims = await visitorFrom(req);
@@ -1254,6 +1285,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (req.method === "POST" && action === "chat") return await handleChat(req);
       if (req.method === "GET" && action === "history") return await handleHistory(req);
       if (req.method === "POST" && action === "link" && idn) return await handleLink(req);
+      if (req.method === "POST" && action === "job-access" && idn) return await handleJobAccess(req);
       return fail(req, 404, "Not found", "not_found");
     } catch (e) {
       if (!ccp) return fail(req, 500, (e as Error).message || "Internal error", "internal");

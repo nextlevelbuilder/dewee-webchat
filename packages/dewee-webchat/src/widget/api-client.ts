@@ -1,4 +1,5 @@
 // Browser client for the dewee-webchat backend HTTP contract.
+import { parseJobAccessLaunch, type JobAccessLaunch } from "../job-access";
 import {
   HEADER_GATEWAY_TOKEN,
   HEADER_GATEWAY_URL,
@@ -272,6 +273,24 @@ export class ApiClient {
   async renewSession(): Promise<SessionResponse> {
     this.session = null;
     return this.ensureSession();
+  }
+
+  /** Requests a single-use launch ticket. Does not refresh or swap the signed-in session after refusal. */
+  async jobAccess(signal: AbortSignal): Promise<JobAccessLaunch> {
+    try {
+      const session = await this.ensureSession();
+      if (!session.verified) throw new ApiError("Sign in to open job access", 401, "IDENTITY_REQUIRED");
+      if (signal.aborted) throw new ApiError("Job access was cancelled", 0, "job_access_unavailable");
+      const response = await this.request(this.url("job-access"), {
+        method: "POST", headers: await this.headers(true), body: "{}", signal, redirect: "error",
+      });
+      return parseJobAccessLaunch(await this.parse<unknown>(response));
+    } catch (error) {
+      const code = error instanceof ApiError && typeof error.code === "string" &&
+        ["IDENTITY_REQUIRED", "LINK_EXPIRED", "LINK_REVOKED", "PERMISSION_DENIED", "SOURCE_UNAVAILABLE"].includes(error.code)
+        ? error.code : "job_access_unavailable";
+      throw new ApiError("Job access is unavailable. Sign in again or retry.", error instanceof ApiError ? error.status : 0, code);
+    }
   }
 
   /** Starts a web-first link of a chat account for the signed-in user (identity backends only). */

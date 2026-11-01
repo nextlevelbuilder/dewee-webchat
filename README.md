@@ -55,6 +55,7 @@ deprecated `legacy-gateway` transport; each example's README shows the CCP confi
 | Astro | [webchat-astro.dewee.sh](https://webchat-astro.dewee.sh) | [examples/astro](examples/astro) |
 | React + Vite | [webchat-react.dewee.sh](https://webchat-react.dewee.sh) | [examples/react-vite](examples/react-vite) |
 | Vue + Vite | [webchat-vue.dewee.sh](https://webchat-vue.dewee.sh) | [examples/vue-vite](examples/vue-vite) |
+| Astro (Node SSR, CCP only: login, page actions, payments) | local | [examples/astro-node](examples/astro-node) |
 | Node + Express | local | [examples/node-express](examples/node-express) |
 | PHP (no Composer) | local | [examples/php](examples/php) · [php/](php) |
 
@@ -67,7 +68,8 @@ deprecated `legacy-gateway` transport; each example's README shows the CCP confi
 | [`cdn/`](cdn) | Worker that serves versioned bundles at `webchat-cdn.dewee.sh` |
 | [`docs/http-contract.md`](docs/http-contract.md) | Wire format between the widget and any backend |
 | [`docs/migrating-to-ccp-transport.md`](docs/migrating-to-ccp-transport.md) | Moving from a direct Gateway URL and token to a CCP Website chat integration |
-| [`examples/`](examples) | Runnable integrations |
+| [`docs/ccp-host-smoke.md`](docs/ccp-host-smoke.md) | CCP smoke tests for the Astro Node and Next.js hosts, staging run, and who does what (SDK, host, backend) |
+| [`examples/`](examples) | Runnable integrations; [`examples/ccp-smoke`](examples/ccp-smoke) runs the built hosts against a fake CCP |
 | [`vendor/`](vendor) | Temporary: the packed `@dewee/identity` SDK used by the tests (see below) |
 
 ## Development
@@ -77,6 +79,7 @@ pnpm install
 pnpm test        # vitest
 pnpm typecheck
 pnpm build       # packages/dewee-webchat/dist
+pnpm -C examples/ccp-smoke build:hosts && pnpm -C examples/ccp-smoke test   # host smoke over CCP
 ```
 
 `@dewee/identity` (the Dewee identity server SDK) is not published to npm yet. Until it is, the tests use a

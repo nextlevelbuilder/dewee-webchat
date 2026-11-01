@@ -22,6 +22,23 @@ jobs:
       # dewee-webchat/server must bundle (webpack, esbuild) without the optional @dewee/identity SDK.
       - run: pnpm test:bundlers
 
+  # The built Astro Node and Next.js examples, started as real servers, against the fake CCP ingress.
+  ccp-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm -C examples/ccp-smoke typecheck
+      - run: pnpm -C examples/astro-node typecheck
+      - run: pnpm -C examples/ccp-smoke build:hosts
+      - run: pnpm -C examples/ccp-smoke test
+
   php:
     runs-on: ubuntu-latest
     steps:

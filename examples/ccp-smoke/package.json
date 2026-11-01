@@ -1,0 +1,18 @@
+{
+  "name": "example-ccp-smoke",
+  "private": true,
+  "type": "module",
+  "description": "CCP-first smoke tests: the built Astro Node and Next.js App Router examples against a fake CCP ingress (CI) or a staging integration.",
+  "scripts": {
+    "build:hosts": "node scripts/build-hosts.mjs",
+    "test": "vitest run",
+    "test:staging": "node scripts/run-staging.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "dewee-webchat": "workspace:*",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

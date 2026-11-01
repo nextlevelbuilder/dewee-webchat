@@ -1,0 +1,126 @@
+---
+import DeweeChat from "dewee-webchat/astro";
+import { DEMO_USERS, currentUser } from "../lib/demo-login";
+import { ordersOf } from "../lib/orders";
+
+export const prerender = false;
+
+let user: string | null = null;
+try {
+  user = currentUser(Astro.request);
+} catch {
+  // The user directory is down: render signed out; the widget gets 503 SOURCE_UNAVAILABLE on its own.
+}
+const orders = user ? ordersOf(user) : [];
+const money = (n: number) => `${n.toLocaleString("vi-VN")} ₫`;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Astro Node + dewee-webchat (CCP)</title>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Example · Astro Node SSR · CCP transport</p>
+      <h1>Orders</h1>
+      {
+        user ? (
+          <p>
+            Signed in as <strong>{DEMO_USERS[user]}</strong> (<code>{user}</code>).{" "}
+            <button id="logout" type="button">Sign out</button>
+          </p>
+        ) : (
+          <p>
+            Not signed in: the widget chats anonymously. Demo sign-in:{" "}
+            {Object.entries(DEMO_USERS).map(([id, name]) => (
+              <button class="login" type="button" data-user={id}>
+                {name}
+              </button>
+            ))}
+          </p>
+        )
+      }
+
+      {
+        orders.length > 0 && (
+          <table>
+            <thead>
+              <tr><th>Order</th><th>Status</th><th>Total</th></tr>
+            </thead>
+            <tbody>
+              {orders.map((o) => (
+                <tr><td><code>{o.id}</code></td><td>{o.status}</td><td>{money(o.total)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        )
+      }
+
+      <!-- Rendered by the host from its own payment API, never from chat text. -->
+      <section id="checkout" hidden data-dewee-ignore>
+        <h2>Checkout ready</h2>
+        <p>Amount: <strong id="checkout-amount"></strong></p>
+        <p><a id="checkout-link" rel="noopener noreferrer" target="_blank">Open the payment page</a></p>
+      </section>
+
+      <p class="hint">Ask the assistant: “What is the status of ord_1001a?” or “Pay ord_1001a”.</p>
+    </main>
+
+    <DeweeChat endpoint="/api/dewee" mode="floating" title="Shop assistant" subtitle="Astro Node example" accentColor="#5446e8" />
+
+    <script>
+      import { tosePageActions } from "../lib/page-actions";
+
+      const money = (n: number, currency: string) => `${n.toLocaleString("vi-VN")} ${currency === "VND" ? "₫" : currency}`;
+
+      const { actions, confirm } = tosePageActions({
+        fetch: (input, init) => fetch(input, init),
+        // The host's own approval step, showing the amount the server quoted.
+        approvePayment: async (q) => window.confirm(`Pay ${money(q.amount, q.currency)} for order ${q.orderId}?`),
+        showCheckout: (p) => {
+          const section = document.getElementById("checkout")!;
+          document.getElementById("checkout-amount")!.textContent = money(p.amount, p.currency);
+          const link = document.getElementById("checkout-link") as HTMLAnchorElement;
+          // From the host API, which built it from its configured provider. A QR code would be a host
+          // component fed by this same value.
+          link.href = p.checkoutUrl;
+          section.hidden = false;
+        },
+      });
+
+      customElements.whenDefined("dewee-chat").then(() => {
+        const chat = document.querySelector("dewee-chat")!;
+        chat.configure({ actions, confirm, getPageContext: () => ({ route: location.pathname }) });
+
+        const post = (url: string, body: unknown) =>
+          fetch(url, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+        for (const button of document.querySelectorAll<HTMLButtonElement>("button.login")) {
+          button.addEventListener("click", async () => {
+            await post("/api/auth/login", { userId: button.dataset.user });
+            location.reload();
+          });
+        }
+        document.getElementById("logout")?.addEventListener("click", async () => {
+          // The hint lets the logout route revoke the exact identity session, whichever instance issued it.
+          await post("/api/auth/logout", { hint: chat.reuseHint() });
+          location.reload();
+        });
+      });
+    </script>
+  </body>
+</html>
+
+<style is:global>
+  body { margin: 0; font-family: system-ui, sans-serif; color: #1b1f4b; background: #f7f7fc; line-height: 1.6; }
+  main { max-width: 720px; margin: 0 auto; padding: 56px 16px 120px; }
+  .eyebrow { margin: 0; color: #5446e8; font-weight: 600; font-size: 0.8rem; letter-spacing: 0.08em; text-transform: uppercase; }
+  table { width: 100%; border-collapse: collapse; margin: 1em 0; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #e3e3f0; }
+  button { font: inherit; margin-right: 6px; }
+  #checkout { margin-top: 1.5em; padding: 12px 16px; border: 1px solid #c9c6f7; border-radius: 10px; background: #fff; }
+  .hint { color: #555a80; }
+</style>

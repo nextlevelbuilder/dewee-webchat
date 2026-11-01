@@ -11,6 +11,7 @@ import {
   type ActionResultStatus,
   type ParsedCall,
 } from "../actions/directives";
+import { createDomActions, type DomActions, type DomActionsRoot } from "../actions/dom-actions";
 import { ACTION_LIMITS, stripPageBlock } from "../actions/page-block";
 import { ApiClient, ApiError, type RequestHeadersOption } from "./api-client";
 import { JobAccessPopupError, openJobAccessTicket } from "./job-access";
@@ -73,6 +74,13 @@ export interface DeweeChatConfig {
   /** Per-handler timeout. Default 30000 ms. */
   actionTimeoutMs?: number;
   /**
+   * Built-in page actions that read and operate the page DOM (page.snapshot, page.scroll, page.click,
+   * page.fill). Off by default. Host actions with the same name win. click/fill always ask the visitor.
+   */
+  domActions?: boolean;
+  /** Limits the built-in DOM actions to this element or selector. Default: document.body. */
+  domActionsRoot?: DomActionsRoot;
+  /**
    * Extra headers for every request to `endpoint` (e.g. a CSRF token). A function is called before
    * each request. Cannot override content-type, authorization or the gateway credential headers.
    */
@@ -105,7 +113,7 @@ export interface ActionEventDetail {
 }
 
 /** Option keys that hold functions/objects: applied without re-rendering the widget. */
-type BehaviorKey = "actions" | "confirm" | "getPageContext" | "headers" | "fetch";
+type BehaviorKey = "actions" | "confirm" | "getPageContext" | "headers" | "fetch" | "domActionsRoot";
 
 interface ViewRefs {
   root: HTMLElement;
@@ -131,10 +139,10 @@ interface ViewMessage extends HistoryMessage {
   actions?: ActionCallView[];
 }
 
-const BOOL_ATTRS = ["show-reasoning", "show-tool-calls", "allow-agent-switch", "open", "persist", "hide-branding", "launcher-avatar"];
+const BOOL_ATTRS = ["show-reasoning", "show-tool-calls", "allow-agent-switch", "open", "persist", "hide-branding", "launcher-avatar", "dom-actions"];
 const ATTRS = [
   "endpoint", "agent", "title", "subtitle", "greeting", "intro", "placeholder", "suggestions", "avatar", "position",
-  "mode", "theme", "accent-color", "locale", "gateway-url", "gateway-token", "width", "height", "z-index", ...BOOL_ATTRS,
+  "mode", "theme", "accent-color", "locale", "gateway-url", "gateway-token", "width", "height", "z-index", "dom-actions-root", ...BOOL_ATTRS,
 ];
 
 const camel = (s: string) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -183,7 +191,9 @@ export class DeweeChatElement extends ElementBase {
   private mql: MediaQueryList | null = null;
   private registry = new ActionRegistry();
   private propActionNames = new Set<string>();
-  private hooks: Pick<DeweeChatConfig, "confirm" | "getPageContext" | "headers" | "fetch"> = {};
+  private hooks: Pick<DeweeChatConfig, "confirm" | "getPageContext" | "headers" | "fetch" | "domActionsRoot"> = {};
+  /** Built-in DOM actions, created on first use when `domActions` is on (keeps the snapshot refs). */
+  private dom: DomActions | null = null;
   private acks = new Map<string, string>();
   /** Pause after a RATE_LIMITED refusal; send stays disabled until it ends. */
   private cooldown = new SendCooldown((s) => this.renderCooldown(s), () => this.endCooldown());
@@ -216,13 +226,17 @@ export class DeweeChatElement extends ElementBase {
 
   /** Updates configuration at runtime (wins over attributes). */
   configure(partial: Partial<DeweeChatConfig>): void {
-    const { actions, confirm, getPageContext, headers, fetch, ...rest } = partial;
+    const { actions, confirm, getPageContext, headers, fetch, domActionsRoot, ...rest } = partial;
     const has = (k: BehaviorKey) => Object.prototype.hasOwnProperty.call(partial, k);
     if (has("actions")) this.setPropActions(actions ?? []);
     if (has("confirm")) this.hooks.confirm = confirm;
     if (has("getPageContext")) this.hooks.getPageContext = getPageContext;
     if (has("headers")) this.hooks.headers = headers;
     if (has("fetch")) this.hooks.fetch = fetch;
+    if (has("domActionsRoot")) {
+      if (domActionsRoot === undefined) delete this.hooks.domActionsRoot;
+      else this.hooks.domActionsRoot = domActionsRoot;
+    }
     if (!Object.keys(rest).length) return;
     this.overrides = { ...this.overrides, ...rest };
     if (this.els) this.applyConfig(); // otherwise applied on connect
@@ -247,9 +261,24 @@ export class DeweeChatElement extends ElementBase {
   get fetch(): typeof fetch | undefined { return this.hooks.fetch; }
   set fetch(v: typeof fetch | undefined) { this.hooks.fetch = v; }
 
-  /** Names of the currently registered page actions. */
+  /** Names of the page actions offered to the agent (host actions, then enabled built-ins). */
   get actionNames(): string[] {
-    return this.registry.names();
+    return this.actionRegistry().names();
+  }
+
+  /** Host actions plus the enabled built-in DOM actions whose names the host did not take. */
+  private actionRegistry(): ActionRegistry {
+    if (!this.config.domActions) return this.registry;
+    this.dom ??= createDomActions({
+      root: () => this.hooks.domActionsRoot ?? this.getAttribute("dom-actions-root") ?? undefined,
+      exclude: (el) => el === this || this.contains(el) || el.closest("dewee-chat") !== null,
+    });
+    const host = this.registry.names().map((n) => this.registry.get(n)!);
+    const room = ACTION_LIMITS.maxActions - host.length;
+    const builtins = this.dom.actions.filter((a) => !this.registry.get(a.name)).slice(0, Math.max(0, room));
+    const all = new ActionRegistry();
+    all.register([...host, ...builtins]);
+    return all;
   }
 
   private setPropActions(actions: PageAction[]) {
@@ -294,7 +323,7 @@ export class DeweeChatElement extends ElementBase {
     for (let round = 0; next; round++) {
       const reply = await this.runTurn(next.message, next.hidden);
       next = null;
-      if (reply.status !== "done" || reply.stopped || !this.registry.size) break;
+      if (reply.status !== "done" || reply.stopped || !this.actionRegistry().size) break;
       const { calls } = parseDirectives(reply.content);
       if (!calls.length) break;
       reply.actions = calls.map((c) => ({ id: c.id, name: c.name, args: c.ok ? c.args : undefined, status: "pending" as const }));
@@ -345,8 +374,9 @@ export class DeweeChatElement extends ElementBase {
 
   private chatBody(message: string): ChatRequestBody & { agent: string; conversationId: string } {
     const body: ChatRequestBody & { agent: string; conversationId: string } = { message, agent: this.agentId, conversationId: this.conversationId };
-    if (this.registry.size) {
-      body.actions = this.registry.manifest();
+    const registry = this.actionRegistry();
+    if (registry.size) {
+      body.actions = registry.manifest();
       const ack = this.getAck();
       if (ack) body.actionsHash = ack;
     }
@@ -391,15 +421,16 @@ export class DeweeChatElement extends ElementBase {
     this.setRunning(ctrl);
     const results: ActionResult[] = [];
     const base = { agent: this.agentId, conversationId: this.conversationId };
+    const registry = this.actionRegistry();
     try {
       for (const [i, call] of calls.entries()) {
         const view = reply.actions![i];
-        const sensitivity = call.ok ? this.registry.get(call.name)?.sensitivity : undefined;
+        const sensitivity = call.ok ? registry.get(call.name)?.sensitivity : undefined;
         const args = call.ok ? call.args : undefined;
         this.emit("dewee:action", { phase: "start", id: call.id, name: call.name, sensitivity, args, ...base } satisfies ActionEventDetail);
         const r = await runActionCall(call, {
-          registry: this.registry,
-          confirm: (action, a) => this.confirmAction(action, a, ctrl.signal),
+          registry,
+          confirm: (action, a) => this.confirmAction(registry, action, a, ctrl.signal),
           signal: ctrl.signal,
           timeoutMs: this.config.actionTimeoutMs,
           ...base,
@@ -419,10 +450,14 @@ export class DeweeChatElement extends ElementBase {
     return ctrl.signal.aborted ? null : results;
   }
 
-  private confirmAction(action: PageActionInfo & { callId: string }, args: Record<string, unknown>, signal: AbortSignal): Promise<boolean> | boolean {
-    if (this.hooks.confirm) return this.hooks.confirm(action, args);
+  private confirmAction(registry: ActionRegistry, action: PageActionInfo & { callId: string }, args: Record<string, unknown>, signal: AbortSignal): Promise<boolean> | boolean {
+    // A built-in click/fill names its target by ref; show the visitor which element that is.
+    const builtin = this.dom?.actions.includes(registry.get(action.name)!);
+    const target = builtin ? this.dom!.target(args) : undefined;
+    const shown = target ? { ...args, target } : args;
+    if (this.hooks.confirm) return this.hooks.confirm(action, shown);
     if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.open();
-    return showConfirmDialog(this.els.panel, this.strings, action, args, signal);
+    return showConfirmDialog(this.els.panel, this.strings, action, shown, signal);
   }
 
   private showNotice(text: string) {
@@ -938,7 +973,7 @@ export class DeweeChatElement extends ElementBase {
     v.trace.hidden = !v.trace.childElementCount;
 
     // content (page action directives are hidden; their calls render as chips below)
-    const shown = this.registry.size || m.actions ? stripDirectives(m.content) : m.content;
+    const shown = this.actionRegistry().size || m.actions ? stripDirectives(m.content) : m.content;
     const typing = m.status === "streaming" && !shown;
     v.md.hidden = !typing && !shown && !!m.actions?.length;
     if (typing) {

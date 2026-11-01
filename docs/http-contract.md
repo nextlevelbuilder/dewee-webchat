@@ -160,6 +160,20 @@ messages are ordinary chat messages, so rate limits and `maxMessageLength` apply
 
 **Errors** (JSON, before streaming): `400 invalid_actions`, `413 actions_too_large`, `413 context_too_large`.
 
+**Built-in DOM actions.** With `domActions` on, the widget adds four ordinary manifest entries after the
+host's own (a host action with the same name replaces the built-in one; the total stays within 32). The
+backend treats them like any other action.
+
+| Name | Sensitivity | Args | Result |
+|---|---|---|---|
+| `page.snapshot` | `read` | `query?` (≤ 100 chars), `offset?`, `limit?` (1–100, default 40) | `{ generation, url, title, total, offset, elements: ["e1 button \"Save\"", …], scrollY, maxScrollY }` |
+| `page.scroll` | `read` | `direction?` (`up`/`down`/`top`/`bottom`) or `ref` + `generation` | `{ direction? \| ref, scrollY, maxScrollY }` |
+| `page.click` | `mutate` | `ref`, `generation` | `{ ref, clicked }` |
+| `page.fill` | `mutate` | `ref`, `generation`, `text` (≤ 10 000 chars) | `{ ref, value }` |
+
+`ref` matches `^e[0-9]{1,4}$` and is valid only with the `generation` of the latest snapshot; older refs
+fail with `status: "error"`.
+
 ## Signed-in users
 
 Optional. A backend that signs users in through Dewee (the Node/Workers handler with the `identity`

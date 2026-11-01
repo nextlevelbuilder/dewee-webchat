@@ -153,6 +153,8 @@ Attributes use kebab-case (`show-reasoning="false"`), `data-*` on the script tag
 | `actions`, `confirm`, `getPageContext` | | [Page actions](#agent-page-actions) (JS/props only) |
 | `maxActionRounds` | `5` | Automatic action turns per visitor message |
 | `actionTimeoutMs` | `30000` | Per-handler timeout |
+| `domActions` | `false` | [Built-in DOM actions](#built-in-dom-actions): snapshot, scroll, click, fill |
+| `domActionsRoot` | `document.body` | Selector or element the built-in DOM actions are limited to |
 | `headers` | | Extra request headers, object or `() => object \| Promise<object>` called before every request (JS/props only) |
 | `fetch` | `globalThis.fetch` | Custom fetch for every widget request (JS/props only) |
 
@@ -252,6 +254,43 @@ an allowlist for navigation (never `location.href = args.url`). The widget never
 or inserts it as HTML, caps calls per answer and automatic turns per message, and never runs a
 `mutate`/`destructive` handler without approval. Page context and results are labelled as data for the
 agent, but prompt injection through page content is still possible — do not put secrets in either.
+
+### Built-in DOM actions
+
+Without writing handlers, a page can let the agent scroll, click and type on it. They are off by
+default:
+
+```html
+<script src="https://webchat-cdn.dewee.sh/v/latest/dewee-webchat.js"
+  data-endpoint="/api/dewee" data-dom-actions="true" data-dom-actions-root="#app" defer></script>
+```
+
+```tsx
+<DeweeChat endpoint="/api/dewee" domActions domActionsRoot="#app" />
+```
+
+| Action | Sensitivity | What it does |
+|---|---|---|
+| `page.snapshot` | `read` | Lists visible links, buttons and form fields as `e3 textbox "Email" value="…"`, with a `generation` |
+| `page.scroll` | `read` | Scrolls one screen up/down, to the top/bottom, or an element (`ref`) into view |
+| `page.click` | `mutate` | Clicks an element by `ref` + `generation` |
+| `page.fill` | `mutate` | Sets the value of a text field, textarea, select or editable area, then fires `input` and `change` |
+
+- `page.click` and `page.fill` always ask the visitor first; the dialog (or your `confirm` hook, as
+  `args.target`) names the element, e.g. `button "Delete run"`.
+- Refs come only from the latest snapshot. A ref from an older snapshot, or an element that is gone,
+  hidden or now sensitive, is refused, and the agent is told to take a new snapshot.
+- Never listed or touched: password, payment card and one-time-code fields (by `type`, `autocomplete`
+  and name), hidden elements, the widget itself, and anything inside `[data-dewee-ignore]`. Put
+  `data-dewee-ignore` on whatever else the agent must not reach.
+- `page.fill` uses the native value setter, so React and Vue controlled inputs see the change. Events are
+  synthetic (`isTrusted` is false): pages that require trusted events, file pickers and popups opened by a
+  click will not react.
+- Your own actions keep working; registering an action with a built-in name (say `page.click`)
+  replaces the built-in one.
+- The built-ins operate the DOM, not your app's permissions: the agent can do whatever the visitor's
+  clicks can, after approval. Narrow it with `domActionsRoot` and `data-dewee-ignore`, and keep the server
+  as the authority.
 
 ## Signed-in users
 

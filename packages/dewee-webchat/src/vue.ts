@@ -6,7 +6,7 @@ const keys = [
   "endpoint", "agent", "title", "subtitle", "greeting", "intro", "placeholder", "suggestions", "avatar", "launcherAvatar",
   "position", "mode", "theme", "accentColor", "locale", "showReasoning", "showToolCalls", "allowAgentSwitch", "open",
   "persist", "hideBranding", "gatewayUrl", "gatewayToken", "width", "height", "zIndex", "actions", "confirm", "getPageContext",
-  "maxActionRounds", "actionTimeoutMs", "headers", "fetch",
+  "maxActionRounds", "actionTimeoutMs", "headers", "fetch", "domActions", "domActionsRoot",
 ] as const;
 
 const props = Object.fromEntries(keys.map((k) => [k, { type: null as unknown as PropType<any>, default: undefined }])) as {
@@ -44,5 +44,5 @@ export const DeweeChat = defineComponent({
 });
 
 export default DeweeChat;
-export type { ActionConfirmHook, ActionEventDetail, PageAction, PageActionContext, RequestHeadersOption } from "./index";
+export type { ActionConfirmHook, ActionEventDetail, DomActionsRoot, PageAction, PageActionContext, RequestHeadersOption } from "./index";
 export type { DeweeChatConfig, DeweeChatElement };

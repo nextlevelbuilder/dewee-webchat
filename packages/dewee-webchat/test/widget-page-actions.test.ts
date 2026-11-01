@@ -96,3 +96,56 @@ describe("<dewee-chat> page actions", () => {
     expect(el.shadowRoot!.textContent).toContain('"name":"navigate"'); // shown as a normal code block
   });
 });
+
+describe("<dewee-chat> built-in DOM actions", () => {
+  it("are off by default", async () => {
+    const chats = mockBackend(() => ({ content: "hi" }));
+    const el = await mount();
+    el.registerActions({ name: "navigate", description: "Go", sensitivity: "navigate", handler: () => null });
+    await el.send("hello");
+    expect(chats[0].actions.map((a: any) => a.name)).toEqual(["navigate"]);
+  });
+
+  it("snapshot, then click and fill only with the visitor's approval naming the target", async () => {
+    const page = document.createElement("form");
+    page.innerHTML = `<input aria-label="Search"><button type="button">Go</button>`;
+    document.body.appendChild(page);
+    const clicked = vi.fn();
+    page.querySelector("button")!.addEventListener("click", clicked);
+    const chats = mockBackend((_b, n) => ({
+      content: n === 1 ? directive("page.snapshot")
+        : n === 2 ? directive("page.click", { ref: "e2", generation: 1 }, "c2") + "\n\n" + directive("page.fill", { ref: "e1", generation: 1, text: "dewee" }, "c3")
+        : "Done.",
+    }));
+    const el = await mount();
+    el.setAttribute("dom-actions", "true"); // what data-dom-actions="true" sets through the CDN script
+    const confirm = vi.fn(async (action: { name: string }, _args: Record<string, unknown>) => action.name === "page.click");
+    el.configure({ confirm });
+    await el.send("press Go and search for dewee");
+    expect(chats[0].actions.map((a: any) => [a.name, a.sensitivity])).toEqual([
+      ["page.snapshot", "read"], ["page.scroll", "read"], ["page.click", "mutate"], ["page.fill", "mutate"],
+    ]);
+    expect(chats[1].message).toContain('"status":"ok"');
+    expect(chats[1].message).toContain('e2 button \\"Go\\"');
+    expect(confirm).toHaveBeenCalledTimes(2); // snapshot ran without asking
+    expect(confirm.mock.calls[0][1]).toEqual({ ref: "e2", generation: 1, target: 'button "Go"' });
+    expect(confirm.mock.calls[1][1]).toMatchObject({ text: "dewee", target: 'textbox "Search"' });
+    expect(clicked).toHaveBeenCalledOnce();
+    expect(page.querySelector("input")!.value).toBe(""); // fill was denied
+    expect(chats[2].message).toContain('"name":"page.fill","status":"denied"');
+  });
+
+  it("lets a host action with the same name win", async () => {
+    const chats = mockBackend((_b, n) => ({ content: n === 1 ? directive("page.click", { ref: "x" }) : "ok" }));
+    const el = await mount();
+    const handler = vi.fn(() => "host");
+    el.configure({ domActions: true, confirm: async () => true });
+    el.registerActions({ name: "page.click", description: "Host click", sensitivity: "mutate", handler });
+    await el.send("click");
+    expect(chats[0].actions.filter((a: any) => a.name === "page.click")).toEqual([
+      { name: "page.click", description: "Host click", sensitivity: "mutate", parameters: { type: "object", properties: {} } },
+    ]);
+    expect(chats[0].actions.map((a: any) => a.name)).toEqual(["page.click", "page.snapshot", "page.scroll", "page.fill"]);
+    expect(handler).toHaveBeenCalledOnce();
+  });
+});

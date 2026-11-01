@@ -113,7 +113,9 @@ at most 32 entries and 16 KB in total. `pageContext` is any JSON value up to 4 K
 parameters`; missing `parameters` → `{"type":"object","properties":{}}`) and hashes it (first 16 hex
 chars of SHA-256 over the JSON). The hash comes back in the `start` event as `actionsHash`. After a
 completed turn the widget sends it as `actionsHash`; when it still matches, the manifest is not repeated.
-The hash is opaque and backend-specific.
+The widget keeps that acknowledgement per session `visitorId` as well as per `conversationId`, because
+the backend conversation belongs to the visitor: after a sign-in, a sign-out or a different user, the
+first turn omits `actionsHash` and the manifest is sent again. The hash is opaque and backend-specific.
 
 **Gateway message.** The backend prepends a block to the visitor's message:
 

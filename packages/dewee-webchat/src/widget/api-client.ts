@@ -183,6 +183,11 @@ export class ApiClient {
     }
   }
 
+  /** The visitor of the session in use, or null before one is held. Backend conversations are keyed by it. */
+  visitorId(): string | null {
+    return this.session?.visitorId ?? null;
+  }
+
   /** Returns a valid visitor session, creating or refreshing it when needed. */
   ensureSession(): Promise<SessionResponse> {
     if (this.session && this.fresh(this.session)) return Promise.resolve(this.session);
@@ -331,8 +336,11 @@ export class ApiClient {
     await this.ensureSession();
     let res = await this.request(this.url("chat"), { method: "POST", headers: await this.headers(true), body: JSON.stringify(input), signal });
     if (res.status === 401) {
+      const before = this.visitorId();
       this.forgetSession();
       await this.ensureSession();
+      // Another visitor means another backend conversation, which has not seen the action manifest.
+      if (input.actionsHash && this.visitorId() !== before) input = { ...input, actionsHash: undefined };
       res = await this.request(this.url("chat"), { method: "POST", headers: await this.headers(true), body: JSON.stringify(input), signal });
     }
     if (!res.ok || !res.body) await this.parse(res);

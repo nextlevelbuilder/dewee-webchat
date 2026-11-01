@@ -136,6 +136,8 @@ interface ViewMessage extends HistoryMessage {
   /** The visitor pressed Stop: never execute directives from a cut-off answer. */
   stopped?: boolean;
   actionsHash?: string;
+  /** Visitor of the session that answered with `actionsHash`: the ack is stored for that conversation. */
+  ackVisitor?: string;
   actions?: ActionCallView[];
 }
 
@@ -348,6 +350,8 @@ export class DeweeChatElement extends ElementBase {
     this.setRunning(new AbortController());
     this.emit("dewee:send", { message, agent: this.agentId, conversationId: this.conversationId, auto: hidden || undefined });
     try {
+      // The session decides which backend conversation (visitor) the page-action ack belongs to.
+      await this.client().ensureSession();
       await this.client().chat(this.chatBody(message), (e) => this.onStreamEvent(reply, e), this.running!.signal);
       if (reply.status === "streaming") reply.status = "done";
     } catch (e) {
@@ -364,7 +368,7 @@ export class DeweeChatElement extends ElementBase {
       this.updateMessage(reply);
       this.setRunning(null);
       if (reply.status === "done") {
-        if (reply.actionsHash && !reply.stopped) this.setAck(reply.actionsHash);
+        if (reply.actionsHash && reply.ackVisitor && !reply.stopped) this.setAck(reply.actionsHash, reply.ackVisitor);
         this.emit("dewee:reply", { content: reply.content, agent: this.agentId, conversationId: this.conversationId });
         if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
       }
@@ -377,7 +381,8 @@ export class DeweeChatElement extends ElementBase {
     const registry = this.actionRegistry();
     if (registry.size) {
       body.actions = registry.manifest();
-      const ack = this.getAck();
+      const visitor = this.client().visitorId();
+      const ack = visitor ? this.getAck(visitor) : undefined;
       if (ack) body.actionsHash = ack;
     }
     const ctx = this.pageContext();
@@ -402,17 +407,23 @@ export class DeweeChatElement extends ElementBase {
     }
   }
 
-  private ackKey() {
-    return `dewee-webchat:actions:${this.config.endpoint}:${this.agentId}:${this.conversationId}`;
+  /**
+   * The backend keys a conversation by visitor as well as by id, so a sign-in, a sign-out or another
+   * user starts a conversation that has not seen the manifest, even with the same conversation id.
+   */
+  private ackKey(visitor: string) {
+    return `dewee-webchat:actions:${this.config.endpoint}:${this.agentId}:${visitor}:${this.conversationId}`;
   }
 
-  private getAck(): string | undefined {
-    return this.acks.get(this.ackKey()) ?? (this.config.persist !== false ? store.get(this.ackKey()) ?? undefined : undefined);
+  private getAck(visitor: string): string | undefined {
+    const key = this.ackKey(visitor);
+    return this.acks.get(key) ?? (this.config.persist !== false ? store.get(key) ?? undefined : undefined);
   }
 
-  private setAck(hash: string) {
-    this.acks.set(this.ackKey(), hash);
-    if (this.config.persist !== false) store.set(this.ackKey(), hash);
+  private setAck(hash: string, visitor: string) {
+    const key = this.ackKey(visitor);
+    this.acks.set(key, hash);
+    if (this.config.persist !== false) store.set(key, hash);
   }
 
   /** Executes the calls of one answer in order. Resolves null when the visitor stopped the chain. */
@@ -1037,7 +1048,11 @@ export class DeweeChatElement extends ElementBase {
   private onStreamEvent(m: ViewMessage, e: ChatStreamEvent) {
     switch (e.type) {
       case "start":
-        if (e.actionsHash) m.actionsHash = e.actionsHash;
+        if (e.actionsHash) {
+          m.actionsHash = e.actionsHash;
+          // The session that served this run; a renewal after the stream must not move the ack.
+          m.ackVisitor = this.client().visitorId() ?? undefined;
+        }
         if (e.conversationId && e.conversationId !== this.conversationId) {
           this.conversationId = e.conversationId;
           if (this.config.persist !== false) store.set(this.convKey(), e.conversationId);

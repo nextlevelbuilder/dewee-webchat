@@ -70,16 +70,33 @@ export async function startHost(kind: HostKind, env: Record<string, string>): Pr
   const exited = new Promise<void>((r) => child.once("exit", () => r()));
   const origin = `http://127.0.0.1:${port}`;
 
+  // Ends the process tree: on Windows SIGTERM already ends the process, so taskkill catches children too.
+  const kill = async () => {
+    if (child.exitCode !== null) return;
+    if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+    else child.kill("SIGTERM");
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    await exited;
+    clearTimeout(timer);
+  };
+
   const deadline = Date.now() + 60_000;
   while (true) {
-    if (child.exitCode !== null) throw new Error(`${kind} exited during startup:\n${out}`);
+    if (child.exitCode !== null) throw new Error(`${kind} exited during startup:
+${out}`);
     try {
-      await fetch(`${origin}/api/dewee/config`);
+      await fetch(`${origin}/api/dewee/config`, { signal: AbortSignal.timeout(2_000) });
+      // Another process may have taken the port first: the answer then came from it, and this child dies.
+      await new Promise((r) => setTimeout(r, 100));
+      if (child.exitCode !== null) throw new Error(`${kind} exited during startup:
+${out}`);
       break;
-    } catch {
+    } catch (err) {
+      if (child.exitCode !== null) throw err;
       if (Date.now() > deadline) {
-        child.kill();
-        throw new Error(`${kind} did not start within 60 s:\n${out}`);
+        await kill();
+        throw new Error(`${kind} did not start within 60 s:
+${out}`);
       }
       await new Promise((r) => setTimeout(r, 250));
     }
@@ -90,16 +107,7 @@ export async function startHost(kind: HostKind, env: Record<string, string>): Pr
     origin,
     logs: () => out,
     async stop() {
-      if (child.exitCode === null) {
-        child.kill("SIGTERM");
-        const timer = setTimeout(() => {
-          // Ignored SIGTERM (or a child of its own on Windows): end the whole tree.
-          if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
-          else child.kill("SIGKILL");
-        }, 5_000);
-        await exited;
-        clearTimeout(timer);
-      }
+      await kill();
       for (let i = 0; i < 20 && (await portOpen(port)); i++) await new Promise((r) => setTimeout(r, 100));
       if (await portOpen(port)) throw new Error(`${kind}: port ${port} is still open after stop`);
     },

@@ -104,6 +104,8 @@ pnpm -C examples/ccp-smoke test:staging
 
 [`src/lib/dewee.ts`](../examples/astro-node/src/lib/dewee.ts) maps the host login to
 `identity.authenticate`: the stable user id becomes the subject, the cookie never leaves the host.
+The demo login cookie carries a signed expiry (8 hours) and is `Secure` when `SITE_ORIGIN` (or the
+request) is https.
 `rebindEachRequest: true` because the login is a cookie: a widget token replayed under another user's
 cookie is refused (`401 IDENTITY_REQUIRED`) and that user's session is revoked at CCP; a request with
 no login is only refused. The logout route calls `handler.revoke(user, request, hint)` with the
@@ -137,8 +139,9 @@ routes use `SITE_ORIGIN` for the same reason.
 `payments.create` is a `mutate` action whose only argument is the order id. Its `confirm` hook asks
 the backend for a signed quote and shows the server's amount; only an explicit "yes" lets the handler
 send that quote back. The backend creates nothing without a quote and checks again: login, same-origin
-JSON, owner, order still unpaid, amount unchanged, quote not expired or reused. The checkout URL goes
-to the host UI, not back to the agent.
+JSON, owner, order still unpaid, amount unchanged, quote not expired, and its signed nonce not used
+before. The example keeps used nonces in memory; a real backend stores them (or an idempotency key)
+where every instance sees them. The checkout URL goes to the host UI, not back to the agent.
 
 ### QR codes and links
 

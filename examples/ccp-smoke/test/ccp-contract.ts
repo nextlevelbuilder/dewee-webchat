@@ -77,7 +77,9 @@ export function ccpContract(ctx: () => ContractContext): void {
     const b = open();
     const { token } = await newSession(b);
     if (!STAGING) fake().state.leaky = true; // CCP frames a public widget must never forward
-    const res = await b.request("/api/dewee/chat", { token, body: { message: "Xin chào", conversationId: "conv_smoke_0001" } });
+    const res = await b
+      .request("/api/dewee/chat", { token, body: { message: "Xin chào", conversationId: "conv_smoke_0001" } })
+      .finally(() => !STAGING && (fake().state.leaky = false));
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     const events = sseEvents(res.text);
@@ -86,7 +88,6 @@ export function ccpContract(ctx: () => ContractContext): void {
     expect(events.some((e) => e.type === "error")).toBe(false);
     if (!STAGING) {
       expect(events.map((e) => e.type)).toEqual(["start", "delta", "done"]);
-      fake().state.leaky = false;
     }
     const history = await b.request("/api/dewee/history?conversationId=conv_smoke_0001", { token });
     expect(history.status).toBe(200);
@@ -172,17 +173,17 @@ export function ccpContract(ctx: () => ContractContext): void {
     expect(failed.at(-1)).toMatchObject({ type: "error", code: "run_failed" });
 
     fake().state.secrets.clear(); // the integration secret was revoked or rotated away
-    const revoked = await b.request("/api/dewee/session", { body: {} });
+    const revoked = await b
+      .request("/api/dewee/session", { body: {} })
+      .finally(() => fake().state.secrets.add(ctx().target.env.DEWEE_WEBCHAT_INTEGRATION_SECRET));
     expect(revoked.status).toBe(500);
     expect(revoked.json().error.code).toBe("not_configured");
-    fake().state.secrets.add(ctx().target.env.DEWEE_WEBCHAT_INTEGRATION_SECRET);
   });
 
   it.skipIf(STAGING)("an expired edge session is refreshed through /session", async () => {
     const b = open();
     fake().state.edgeTtlSeconds = 1;
-    const first = await newSession(b);
-    fake().state.edgeTtlSeconds = 3600;
+    const first = await newSession(b).finally(() => (fake().state.edgeTtlSeconds = 3600));
     await new Promise((r) => setTimeout(r, 1_500));
     const refreshes = fake().routes("session").length;
     const second = await b.request("/api/dewee/session", { body: { token: first.token } });

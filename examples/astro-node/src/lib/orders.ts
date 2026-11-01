@@ -30,6 +30,8 @@ const ORDERS: Order[] = [
   { id: "ord_2002a", owner: "u_2002", status: "awaiting_payment", total: 990_000, currency: "VND" },
 ];
 const payments = new Map<string, Payment>();
+/** Quote nonces already spent, until they expire. A real backend keeps them in its database, shared by every instance. */
+const usedQuotes = new Map<string, number>();
 
 /** The user's own order; another user's order is "not found", so ids cannot be probed. */
 export function orderFor(user: string, id: string): Order | null {
@@ -53,7 +55,8 @@ function checkoutBase(): string {
  */
 export function quoteFor(user: string, order: Order): { quote: string; orderId: string; amount: number; currency: string; expiresAt: number } {
   const expiresAt = Date.now() + QUOTE_TTL_MS;
-  const body = Buffer.from(JSON.stringify({ u: user, o: order.id, a: order.total, c: order.currency, exp: expiresAt })).toString("base64url");
+  const n = randomBytes(12).toString("base64url");
+  const body = Buffer.from(JSON.stringify({ u: user, o: order.id, a: order.total, c: order.currency, exp: expiresAt, n })).toString("base64url");
   return { quote: `${body}.${mac("quote", body)}`, orderId: order.id, amount: order.total, currency: order.currency, expiresAt };
 }
 
@@ -67,13 +70,16 @@ export function createPayment(user: string, quote: unknown): Payment | PaymentRe
   if (typeof quote !== "string" || !quote.includes(".")) return { status: 400, code: "approval_required", message: "Payment needs a quote the user approved" };
   const [body, sig] = quote.split(".");
   if (!body || !sig || !macEqual(sig, mac("quote", body))) return { status: 400, code: "invalid_quote", message: "Quote is invalid" };
-  const q = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as { u: string; o: string; a: number; c: string; exp: number };
+  const q = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as { u: string; o: string; a: number; c: string; exp: number; n: string };
   if (q.u !== user) return { status: 403, code: "forbidden", message: "Quote belongs to another user" };
   if (q.exp < Date.now()) return { status: 400, code: "quote_expired", message: "Quote expired, ask again" };
+  for (const [n, exp] of usedQuotes) if (exp < Date.now()) usedQuotes.delete(n);
+  if (usedQuotes.has(q.n)) return { status: 409, code: "quote_used", message: "Quote was already used" };
   const order = orderFor(user, q.o);
   if (!order) return { status: 404, code: "not_found", message: "Order not found" };
   if (order.status !== "awaiting_payment") return { status: 409, code: "already_paid", message: "Order does not need a payment" };
   if (order.total !== q.a || order.currency !== q.c) return { status: 409, code: "amount_changed", message: "Order amount changed, ask again" };
+  usedQuotes.set(q.n, q.exp);
   const paymentId = `pay_${randomBytes(8).toString("hex")}`;
   const payment: Payment = { paymentId, orderId: order.id, amount: order.total, currency: order.currency, checkoutUrl: `${checkoutBase()}/${paymentId}` };
   payments.set(order.id, payment);

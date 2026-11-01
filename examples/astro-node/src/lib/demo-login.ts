@@ -23,12 +23,19 @@ export function macEqual(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-export function loginCookie(userId: string, secure: boolean): string {
-  return `${LOGIN_COOKIE}=${userId}.${mac("login", userId)}; Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
+const LOGIN_TTL_S = 8 * 60 * 60;
+
+/** Secure cookies when the public origin is https, which behind a TLS proxy only SITE_ORIGIN knows. */
+const isSecure = (req: Request) => (process.env.SITE_ORIGIN || req.url).startsWith("https:");
+
+/** `userId.expiry.signature`: the expiry is signed, so a copied cookie stops working with the session. */
+export function loginCookie(userId: string, req: Request): string {
+  const value = `${userId}.${Math.floor(Date.now() / 1000) + LOGIN_TTL_S}`;
+  return `${LOGIN_COOKIE}=${value}.${mac("login", value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${LOGIN_TTL_S}${isSecure(req) ? "; Secure" : ""}`;
 }
 
-export function clearedLoginCookie(secure: boolean): string {
-  return `${LOGIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`;
+export function clearedLoginCookie(req: Request): string {
+  return `${LOGIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${isSecure(req) ? "; Secure" : ""}`;
 }
 
 /**
@@ -41,8 +48,10 @@ export function currentUser(req: Request): string | null {
   if (!raw) return null;
   if (process.env.DEMO_USER_DIRECTORY === "down") throw new Error("user directory unavailable");
   const dot = raw.lastIndexOf(".");
-  const userId = raw.slice(0, dot);
-  if (dot < 1 || !macEqual(raw.slice(dot + 1), mac("login", userId))) return null;
+  const value = raw.slice(0, dot);
+  if (dot < 1 || !macEqual(raw.slice(dot + 1), mac("login", value))) return null;
+  const [userId, exp] = value.split(".");
+  if (!(Number(exp) * 1000 > Date.now())) return null;
   return Object.hasOwn(DEMO_USERS, userId) ? userId : null;
 }
 

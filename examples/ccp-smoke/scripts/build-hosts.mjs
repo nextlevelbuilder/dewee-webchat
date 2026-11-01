@@ -14,9 +14,10 @@ const CANARY = {
   DEWEE_IDENTITY_ASSERTION_SECRET: "BUILD_CANARY_assertion_secret_000000000001",
   DEMO_LOGIN_SECRET: "BUILD_CANARY_demo_login_secret_00000000001",
 };
+// Everything a browser can receive: static assets, and for Next.js also the prerendered pages.
 const HOSTS = [
-  { name: "astro-node", client: "dist/client" },
-  { name: "nextjs", client: ".next/static" },
+  { name: "astro-node", client: ["dist/client"] },
+  { name: "nextjs", client: [".next/static", ".next/server/app"], only: /\.(html|rsc|body|js|css|json)$/ },
 ];
 
 function build(name) {
@@ -41,7 +42,8 @@ const filesUnder = (dir) =>
 let leaks = 0;
 for (const host of HOSTS) {
   build(host.name);
-  for (const file of filesUnder(join(EXAMPLES, host.name, host.client))) {
+  const files = host.client.flatMap((dir) => filesUnder(join(EXAMPLES, host.name, dir)));
+  for (const file of files.filter((f) => !host.only || host.only.test(f))) {
     const text = readFileSync(file, "latin1");
     for (const [name, value] of Object.entries(CANARY)) {
       if (text.includes(value)) {

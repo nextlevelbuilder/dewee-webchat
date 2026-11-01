@@ -33,7 +33,14 @@ beforeAll(async () => {
   target.secrets.push(DEMO_LOGIN_SECRET);
   // The integration lets signed-in customers in next to anonymous visitors (CCP config).
   if (target.fake) target.fake.state.config = { ...target.fake.state.config, mode: "signed_in_optional", identity_enabled: true };
-  [host, second] = await Promise.all([startHost("astro-node", hostEnv()), startHost("astro-node", hostEnv())]);
+  const started = await Promise.allSettled([startHost("astro-node", hostEnv()), startHost("astro-node", hostEnv())]);
+  const failed = started.find((r) => r.status === "rejected");
+  if (failed) {
+    // Stop the instance that did start, so it does not outlive the run.
+    await Promise.all(started.map((r) => (r.status === "fulfilled" ? r.value.stop() : undefined)));
+    throw failed.reason;
+  }
+  [host, second] = started.map((r) => (r as PromiseFulfilledResult<Host>).value);
 });
 
 afterAll(async () => {
@@ -133,6 +140,11 @@ describe.skipIf(STAGING && !process.env.DEWEE_IDENTITY_APP_ID)("Astro Node SSR: 
       const res = await b.request("/api/dewee/session", { cookie: await login(open(), "u_1001"), body: {} });
       expect(res.status).toBe(503);
       expect(res.json().error.code).toBe("SOURCE_UNAVAILABLE");
+
+      // Signing out still works during the outage: the cookie is cleared.
+      const out = await b.request("/api/auth/logout", { cookie: await login(open(), "u_1001"), body: null });
+      expect(out.status).toBe(200);
+      expect(out.headers.get("set-cookie")).toMatch(/tose_demo_session=;.*Max-Age=0/);
     } finally {
       await down.stop();
     }
@@ -226,6 +238,7 @@ describe("Astro Node SSR: TOSE-style backend routes the page actions call", () =
 
     const replay = await b.request("/api/payments", { cookie: lan, body: { quote: quote.quote } });
     expect(replay.status).toBe(409);
+    expect(replay.json().error.code).toBe("quote_used");
   });
 
   it("chat carries the page-action manifest to CCP; a malformed manifest is refused locally", async () => {

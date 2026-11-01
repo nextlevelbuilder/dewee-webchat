@@ -9,9 +9,13 @@ export const prerender = false;
 
 export const POST: APIRoute = async ({ request }) => {
   if (!sameOriginJson(request)) return errorResponse(403, "forbidden_origin", "Same-origin JSON only");
-  const user = currentUser(request);
-  const { hint } = await request.clone().json().catch(() => ({}));
-  if (user) await dewee().revoke(user, request, typeof hint === "string" ? hint : undefined);
-  const secure = new URL(request.url).protocol === "https:";
-  return jsonResponse({ ok: true }, 200, { "set-cookie": clearedLoginCookie(secure) });
+  // The cookie is cleared even when the user directory is down: signing out must always work.
+  let user: string | null = null;
+  try {
+    user = currentUser(request);
+  } catch {}
+  const body = await request.clone().json().catch(() => null);
+  const hint = typeof body?.hint === "string" ? body.hint : undefined;
+  if (user) await dewee().revoke(user, request, hint);
+  return jsonResponse({ ok: true, revoked: Boolean(user) }, 200, { "set-cookie": clearedLoginCookie(request) });
 };

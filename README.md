@@ -91,10 +91,11 @@ through `file:`. This is temporary: once the SDK is published, the dev dependenc
 Run the playground locally: copy `examples/cloudflare/.dev.vars.example` to `.dev.vars`, fill it in, then
 `pnpm -C examples/cloudflare dev`.
 
-Release: bump `packages/dewee-webchat/package.json` (and `VERSION` in `php/dewee-webchat.php`), commit, then
-push a matching tag (`git tag v0.1.2 && git push origin v0.1.2`). [`release.yml`](.github/workflows/release.yml)
+Release: bump `packages/dewee-webchat/package.json` (and `VERSION` in `php/dewee-webchat.php`), merge
+the change to `main` and wait for CI, then tag the verified commit with a matching version
+(`git tag v0.1.2 <verified-main-sha> && git push origin v0.1.2`). [`release.yml`](.github/workflows/release.yml)
 publishes to npm through npm Trusted Publishing (OIDC, no token) and creates the GitHub release. Then run
-`node cdn/scripts/build-cdn.mjs && pnpm -C examples/cloudflare exec wrangler deploy --config ../../cdn/wrangler.jsonc`
+`pnpm build && node cdn/scripts/build-cdn.mjs && pnpm -C examples/cloudflare exec wrangler deploy --config ../../cdn/wrangler.jsonc`
 to add the version to the CDN.
 
 ## License

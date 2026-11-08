@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import { releaseChannel } from "./release-channel.mjs";
+
+test("PHP and package expose the same release version", () => {
+  const { version } = JSON.parse(readFileSync(new URL("../packages/dewee-webchat/package.json", import.meta.url), "utf8"));
+  const php = readFileSync(new URL("../php/dewee-webchat.php", import.meta.url), "utf8");
+  const versions = [...php.matchAll(/public const VERSION = '([^']+)';/g)];
+  assert.equal(versions.length, 1);
+  assert.equal(versions[0][1], version);
+});
 
 test("numbered beta uses beta npm tag and GitHub prerelease", () => {
   assert.deepEqual(releaseChannel("0.4.1-beta.1", "v0.4.1-beta.1"), { version: "0.4.1-beta.1", npmTag: "beta", prerelease: true });

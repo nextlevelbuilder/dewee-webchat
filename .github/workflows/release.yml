@@ -21,12 +21,20 @@ jobs:
     environment: npm
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           registry-url: https://registry.npmjs.org
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: sodium
+      - name: Verify release commit is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Validate release channel and tag
         id: channel
         run: |
@@ -48,6 +56,7 @@ jobs:
           fi
 
       - run: pnpm -C packages/dewee-webchat typecheck
+      - run: php -l php/dewee-webchat.php
       - run: pnpm -C packages/dewee-webchat test
       - run: pnpm -C packages/dewee-webchat build
 

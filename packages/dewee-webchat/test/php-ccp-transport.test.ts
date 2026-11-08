@@ -198,7 +198,7 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     const tsJson = async (path: string, init?: RequestInit) => (await ts(new Request(`https://shop.example/api/dewee${path}`, init))).json();
 
     const { version: _v, ...tsConfig } = await tsJson("/config");
-    expect((await call("/config")).json()).toEqual({ ...tsConfig, version: "0.4.2" });
+    expect((await call("/config")).json()).toEqual({ ...tsConfig, version: "0.5.0-beta.1" });
 
     const s = await session();
     expect(s.visitorId).toMatch(/^[A-Za-z0-9_-]{22}$/);

@@ -243,6 +243,7 @@ details > summary svg.ic { width: 14px; height: 14px; flex: none; }
 .btn:focus-visible { outline: 3px solid color-mix(in srgb, var(--dw-accent) 45%, transparent); outline-offset: 2px; }
 .credential-request .bubble { overflow-wrap: anywhere; max-width: 100%; }
 .credential-request p { margin: 8px 0; }
+.credential-request .spin { display: inline-block; vertical-align: middle; }
 .credential-request ul { margin: 8px 0; padding-inline-start: 20px; }
 .credential-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 

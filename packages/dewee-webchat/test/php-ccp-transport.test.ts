@@ -389,10 +389,11 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     expect(ccp.routes("session").map((r) => r.headers["x-dewee-visitor-ip"])).toEqual(["2001:db8::9", undefined]);
   });
 
-  it("leaves the legacy gateway transport's /session unchanged", async () => {
+  it("returns legacy visitor claims and a relative expiry", async () => {
     setOptions({ ccp: undefined, gatewayUrl: "https://gw.example", token: "gw-token", agents: ["shop"] });
     const s = await session();
-    expect(Object.keys(s).sort()).toEqual(["expiresAt", "token", "visitorId"]);
+    expect(Object.keys(s).sort()).toEqual(["expiresAt", "expiresIn", "token", "visitorId"]);
+    expect(s.expiresIn).toBeGreaterThan(29 * 86_400_000);
     expect(await verifyVisitorToken(VISITOR_SECRET, s.token)).toEqual({ v: s.visitorId, exp: s.expiresAt });
     expect(s.expiresAt - Date.now()).toBeGreaterThan(29 * 86_400_000);
     // A returning visitor keeps its id, also from a token a CCP backend issued.

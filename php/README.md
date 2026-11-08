@@ -120,7 +120,7 @@ not generate or persist a fallback secret.
 
 The image proxy also needs the private temporary directory for its shared concurrency limit. If it
 cannot verify private storage (including on Windows hosts where POSIX ownership checks are unavailable),
-it returns `503 image_unavailable` instead of fetching. See [issue #33](https://github.com/nextlevelbuilder/dewee-webchat/issues/33).
+it returns `503 image_unavailable` instead of fetching. Follow [issue #9](https://github.com/nextlevelbuilder/dewee-webchat/issues/9) for the remaining image proxy limitation.
 
 ## Streaming (SSE) behind a web server
 

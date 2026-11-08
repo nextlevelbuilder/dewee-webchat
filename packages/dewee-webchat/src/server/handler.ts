@@ -186,8 +186,10 @@ export interface DeweeHandlerOptions {
   token?: string;
   /** Legacy gateway transport. */
   tenantId?: string;
-  /** HMAC secret for visitor tokens (>= 32 random chars). */
+  /** HMAC secret for visitor tokens (at least 32 random UTF-8 bytes). */
   secret?: string;
+  /** Legacy gateway only: permit a process-local secret for development. Sessions reset on restart. */
+  allowEphemeralSecret?: boolean;
   /** Legacy gateway transport: agents visitors may talk to. The first is the default. `"*"` = every active agent. */
   agents?: Array<string | AgentInfo> | "*";
   defaultAgent?: string;
@@ -306,9 +308,11 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   const transport = resolveTransport(o);
   let secret = o.secret;
   if (!secret) {
+    if (o.allowEphemeralSecret !== true) throw new Error("[dewee-webchat] Configure secret (DEWEE_WEBCHAT_SECRET), or explicitly enable allowEphemeralSecret for development");
     secret = randomId(32);
     console.warn("[dewee-webchat] No secret configured: using an ephemeral one. Visitor sessions reset on restart.");
   }
+  if (new TextEncoder().encode(secret).length < 32) throw new Error("[dewee-webchat] secret (DEWEE_WEBCHAT_SECRET) must be at least 32 bytes");
   const limiter: RateLimiter | null =
     o.rateLimit === false
       ? null

@@ -359,6 +359,16 @@ must use the configured HTTPS origin and the Dewee hosted-form route. It contain
 do not log, cache, publish, or add it to chat messages. The hosted form independently requires a
 workspace approval administrator.
 
+When the Gateway and CCP advertise `member_link_proof`, the widget exposes **Link workspace
+account**. The member starts a link under My linked accounts in their workspace, enters its
+one-time code in the widget's separate form, then returns to the workspace to confirm. The
+backend's `POST {base}/member-link-proof` accepts only `{code}`, requires the verified visitor
+and a fresh authenticated host user, and forwards the code through CCP without adding it to chat.
+The response is `{state: "proved"}`; it does not complete the link. The Gateway flag
+`GOCLAW_WEBCHAT_MEMBER_LINK_PROOF_ENABLED` defaults off. Chat requests containing a proof code in
+the message or attached content are refused so the code is not ingested as conversation content.
+The member link and current workspace membership are checked again for every credential action.
+
 After completion, `POST /chat` with an empty `message` and `credentialRequestId` resumes the bound
 conversation. Gateway enforces one continuation; `credential_request_not_ready` and
 `credential_request_resumed` are 409, `credential_request_not_found` is 404, and

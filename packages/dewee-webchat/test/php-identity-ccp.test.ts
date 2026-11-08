@@ -121,6 +121,23 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     expect((await fetch(`${base}/credential-request`, { method: "POST", headers: { ...headers, cookie: "uid=user-b" }, body })).status).toBe(401);
   });
 
+  it("requires the current identity for member proof and keeps the code out of chat", async () => {
+    ccp.state.config = { ...ccp.state.config, member_link_proof: true };
+    const issued = await (await session("user-a")).json();
+    const headers = { cookie:"uid=user-a", origin:"https://shop.example", authorization:`Bearer ${issued.token}`, "x-test-feature":"on" };
+    const config = await (await fetch(`${base}/config`, {headers})).json();
+    expect(config.memberLinkProof).toBe(true);
+    const code = "MEM-ABCDEFGHIJKLMNOP";
+    const proof = await fetch(`${base}/member-link-proof`, {method:"POST",headers,body:JSON.stringify({code})});
+    expect(proof.status).toBe(200); expect(await proof.json()).toEqual({state:"proved"});
+    expect(ccp.routes("identity/member-link-proof").at(-1)?.body).toMatchObject({agent:"shop",code});
+    expect((await fetch(`${base}/member-link-proof`, {method:"POST",headers:{...headers,cookie:"uid=user-b"},body:JSON.stringify({code})})).status).toBe(401);
+    const chat = await fetch(`${base}/chat`, {method:"POST",headers,body:JSON.stringify({agent:"shop",conversationId:"conversation_01",message:`my code ${code}`})});
+    expect(chat.status).toBe(400); expect(await chat.text()).not.toContain(code); expect(ccp.routes("chat")).toHaveLength(0);
+    const page = await fetch(`${base}/chat`, {method:"POST",headers,body:JSON.stringify({agent:"shop",conversationId:"conversation_01",message:"help",page_context:{version:1,url:"https://shop.example",content:{format:"text",text:code}}})});
+    expect(page.status).toBe(400); expect(ccp.routes("chat")).toHaveLength(0);
+  });
+
   it.each([false, true])("defers selected-agent credential policy to the runtime when default capability is %s", async (defaultEnabled) => {
     ccp.state.config = { ...ccp.state.config, credential_requests: defaultEnabled };
     const id = "0b7e4c1e-2f6a-4d1b-9c3e-5a8f7d6e4b21";

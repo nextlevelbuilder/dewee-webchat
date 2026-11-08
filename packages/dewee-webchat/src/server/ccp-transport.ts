@@ -56,6 +56,7 @@ export interface CcpConfig {
   allowAgentSwitch: boolean;
   mode: "anonymous" | "signed_in_optional" | "signed_in_required";
   identityEnabled: boolean;
+  memberLinkProof: boolean;
   showThinking: boolean;
   showToolActivity: boolean;
   maxMessageChars: number;
@@ -210,6 +211,7 @@ function parseConfig(data: Record<string, any>): CcpConfig {
     allowAgentSwitch: typeof data.allow_agent_switch === "boolean" ? data.allow_agent_switch && agents.length > 1 : agents.length > 1,
     mode,
     identityEnabled: data.identity_enabled === true,
+    memberLinkProof: data.member_link_proof === true,
     // Reasoning and tool activity stay hidden unless the integration turns them on explicitly.
     showThinking: data.show_thinking === true,
     showToolActivity: data.show_tool_activity === true,
@@ -502,6 +504,13 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
         if (launch.launch_token === input.identitySession) throw new Error("Invalid launch ticket");
         return launch;
       } catch { throw new CcpError(502, "ccp_bad_response", "Job access is unavailable"); }
+    },
+
+    async memberLinkProof(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { identitySession: string; agent: string; code: string }): Promise<void> {
+      const data = await withEdge(ctx, visitorId, sealed, (edge) => client.json<Record<string, unknown>>("identity/member-link-proof", {
+        ...base(ctx), session: edge.token, body: { identity_session: input.identitySession, agent: input.agent, code: input.code },
+      }));
+      if (data.state !== "proved") throw new CcpError(502, "ccp_bad_response", "Member verification unavailable");
     },
 
     /** Web-first link for a signed-in visitor. */

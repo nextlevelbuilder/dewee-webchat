@@ -185,12 +185,12 @@ Vanilla: `chat.configure({ headers, fetch })` or the `chat.headers` / `chat.fetc
 every request to `endpoint` (config, session, history, link, chat). It cannot override `content-type`,
 `authorization` (which carries the anonymous or signed-in session token), `x-dewee-gateway-url` or
 `x-dewee-gateway-token` (case-insensitive; such keys are dropped). Header names are sent lower-cased. For a
-cross-origin `endpoint`, the backend's CORS preflight must allow the extra headers; the built-in handlers only
-allow their own. A custom `fetch` receives every request as sent, including the session bearer token of a
+cross-origin `endpoint`, configure the backend's `allowedOrigins` and `allowedHeaders: ["x-csrf-token"]`.
+The built-in TS and PHP handlers accept header names containing letters, digits and hyphens. A custom `fetch` receives every request as sent, including the session bearer token of a
 signed-in user, so only the trusted host page should supply it.
 
 Anonymous visitor sessions are reused until less than 10% of the token lifetime remains (at most 24 h, at least
-30 s), so backends with short session TTLs do not mint a new session on every request. With `transport: "ccp"`,
+30 s, and no more than half the lifetime), so backends with short session TTLs do not mint a new session on every request. With `transport: "ccp"`,
 `/session` reports the end of the CCP edge session sealed in the token as `expiresAt` (and `expiresIn`), so the
 widget asks `/session` again before it lapses, about once an hour, although the token itself lives 30 days. That
 refresh keeps the visitor id and re-seals a refreshed edge session, so a host that keeps no memory between

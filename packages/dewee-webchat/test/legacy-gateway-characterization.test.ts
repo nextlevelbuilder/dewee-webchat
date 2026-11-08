@@ -1,7 +1,7 @@
 // Characterization of the browser-facing responses of the legacy (direct Gateway WebSocket)
 // transport. The snapshots were recorded before the transport switch was introduced; they must
-// keep passing unchanged so that hosts on `transport: "legacy-gateway"` see byte-identical
-// statuses, headers and bodies. Random values (tokens, visitor ids, conversation ids) are
+// track intentional contract changes for hosts on `transport: "legacy-gateway"`.
+// Random values (tokens, visitor ids, conversation ids) are
 // normalized before comparison.
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
@@ -71,6 +71,7 @@ function normalize(text: string, extra: Record<string, string> = {}): string {
   return out
     .replace(/"token":"[^"]+"/g, '"token":"<token>"')
     .replace(/"expiresAt":\d+/g, '"expiresAt":"<epoch-ms>"')
+    .replace(/"expiresIn":\d+/g, '"expiresIn":"<duration-ms>"')
     .replace(/"version":"[^"]+"/g, '"version":"<version>"');
 }
 
@@ -93,9 +94,11 @@ describe("legacy-gateway transport: browser responses", () => {
   it("session (new and refreshed)", async () => {
     const h = createDeweeHandler(opts());
     const first = await h(new Request(`${BASE}/session`, { method: "POST", body: "{}" }));
-    const s = (await first.clone().json()) as { token: string; visitorId: string };
+    const s = (await first.clone().json()) as { token: string; visitorId: string; expiresIn: number };
+    expect(s.expiresIn).toBeGreaterThan(0);
     expect(await capture(first, { [s.visitorId]: "<visitor>" })).toMatchSnapshot();
     const refreshed = await h(new Request(`${BASE}/session`, { method: "POST", body: JSON.stringify({ token: s.token }) }));
+    expect((await refreshed.clone().json()).expiresIn).toBeGreaterThan(0);
     expect(await capture(refreshed, { [s.visitorId]: "<visitor>" })).toMatchSnapshot();
   });
 

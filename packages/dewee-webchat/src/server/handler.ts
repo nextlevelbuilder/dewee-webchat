@@ -197,6 +197,8 @@ export interface DeweeHandlerOptions {
   allowAgentSwitch?: boolean;
   /** Cross-origin sites allowed to call this backend. Same-origin is always allowed. */
   allowedOrigins?: string[] | "*";
+  /** Additional header names allowed in cross-origin requests. */
+  allowedHeaders?: string[];
   /**
    * Legacy gateway transport: let visitors bring their own gateway URL + token (sent per request, never stored).
    * Meant for playgrounds. `allowedHosts` restricts which gateways may be targeted.
@@ -306,6 +308,9 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     ...options,
   };
   const transport = resolveTransport(o);
+  if (o.allowedHeaders !== undefined && (!Array.isArray(o.allowedHeaders) || o.allowedHeaders.some((name) => typeof name !== "string" || !/^[A-Za-z0-9-]+$/.test(name)))) {
+    throw new Error("[dewee-webchat] allowedHeaders must contain valid header names (letters, digits and hyphens)");
+  }
   let secret = o.secret;
   if (!secret) {
     if (o.allowEphemeralSecret !== true) throw new Error("[dewee-webchat] Configure secret (DEWEE_WEBCHAT_SECRET), or explicitly enable allowEphemeralSecret for development");
@@ -406,7 +411,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     return {
       "Access-Control-Allow-Origin": origin,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": `content-type, authorization, ${HEADER_GATEWAY_URL}, ${HEADER_GATEWAY_TOKEN}`,
+      "Access-Control-Allow-Headers": [...new Set(["content-type", "authorization", HEADER_GATEWAY_URL, HEADER_GATEWAY_TOKEN, ...(o.allowedHeaders ?? []).map((h) => h.toLowerCase())])].join(", "),
       "Access-Control-Max-Age": "600",
       Vary: "Origin",
     };
@@ -841,7 +846,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     if (!(ccp && previous) && !(await turnstilePassed(body, ip))) return fail(req, 403, "Verification failed", "turnstile_failed");
     const visitorId = previous?.v ?? randomId(16);
     const expiresAt = Date.now() + o.sessionTtlMs;
-    if (!ccp) return json(req, { visitorId, token: await signVisitorToken(secret!, { v: visitorId, exp: expiresAt }), expiresAt });
+    if (!ccp) return json(req, { visitorId, token: await signVisitorToken(secret!, { v: visitorId, exp: expiresAt }), expiresAt, expiresIn: Math.max(0, expiresAt - Date.now()) });
     // CCP admits the visitor (its own quotas) before a token is issued. A stale sealed edge session
     // (a host without shared memory never saw it refreshed) is refreshed for the same visitor here, so
     // the token handed back carries a fresh one.
@@ -891,7 +896,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     const previous = await anonymousPrevious(body);
     if (previous && previous.exp - Date.now() > ANON_REUSE_MS) {
       if (!ccp) {
-        const reused: SessionResponse = { visitorId: previous.v, token: body.token, expiresAt: previous.exp };
+        const reused: SessionResponse = { visitorId: previous.v, token: body.token, expiresAt: previous.exp, expiresIn: Math.max(0, previous.exp - Date.now()) };
         return json(req, reused);
       }
       // CCP: handed back as is only while its sealed edge session is fresh; else re-sealed below.

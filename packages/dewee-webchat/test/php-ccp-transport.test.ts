@@ -98,6 +98,21 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
     dropConfigCache();
   });
 
+  it("extends CORS headers only for an allowed origin", async () => {
+    setOptions({ allowedOrigins: ["https://shop.example"], allowedHeaders: ["X-CSRF-Token"] });
+    const pre = await call("/chat", { method: "OPTIONS", headers: { origin: "https://shop.example" } });
+    expect(pre.headers.get("access-control-allow-headers")).toContain("x-csrf-token");
+    const other = await call("/chat", { method: "OPTIONS", headers: { origin: "https://other.example" } });
+    expect(other.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("returns a relative lifetime for a legacy anonymous session", async () => {
+    setOptions({ ccp: null, gatewayUrl: "https://gateway.example", token: "test", sessionTtlMs: 60000 });
+    const s = await session();
+    expect(s.expiresIn).toBeGreaterThan(0);
+    expect(s.expiresIn).toBeLessThanOrEqual(60000);
+  });
+
   it("selects the transport explicitly and refuses conflicting or unsafe options", () => {
     const url = `http://127.0.0.1:1/api/public/webchat/v1/${INTEGRATION_ID}`;
     const ok = { chatUrl: url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET };

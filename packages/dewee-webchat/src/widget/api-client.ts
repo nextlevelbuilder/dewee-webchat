@@ -77,6 +77,8 @@ export class ApiClient {
   private session: HeldSession | null = null;
   private config: PublicConfig | null = null;
   private sessionPromise: Promise<SessionResponse> | null = null;
+  private supersededSessions = new Map<number, Promise<SessionResponse>>();
+  private sessionGeneration = 0;
 
   constructor(private o: ApiClientOptions) {}
 
@@ -121,7 +123,7 @@ export class ApiClient {
     if (auth) {
       // Read the token only after the host headers resolved: a renewSession() during that await
       // clears the session, and the request must carry the renewed one, never none or a stale one.
-      const s = this.session && this.fresh(this.session) ? this.session : await this.ensureSession();
+      const s = await this.ensureSession();
       h.authorization = `Bearer ${s.token}`;
     }
     return h;
@@ -148,7 +150,8 @@ export class ApiClient {
 
   /**
    * Session reuse. A signed-in session follows its schedule (see `scheduleRefresh`). An anonymous
-   * token is refreshed once less than 10% of its lifetime (at most 24 h, at least 30 s) remains; a
+   * token is refreshed once less than 10% of its lifetime (at most 24 h, at least 30 s, and no more
+   * than half the lifetime) remains; a
    * stored token from before `obtainedAt` existed uses the 24 h margin. When the backend reports the
    * lifetime (`expiresIn`), it is counted from receipt, so a skewed browser clock does not matter.
    */
@@ -157,7 +160,7 @@ export class ApiClient {
     const reported = typeof s.expiresIn === "number" && s.expiresIn >= 0 && s.obtainedAt;
     const end = reported ? s.obtainedAt! + s.expiresIn! : s.expiresAt;
     const lifetime = reported ? s.expiresIn! : s.obtainedAt ? s.expiresAt - s.obtainedAt : Infinity;
-    const margin = Math.min(86_400_000, Math.max(30_000, lifetime * 0.1));
+    const margin = Math.min(86_400_000, lifetime / 2, Math.max(30_000, lifetime * 0.1));
     return end - Date.now() > margin;
   }
 
@@ -177,7 +180,11 @@ export class ApiClient {
     if (!saved) return null;
     try {
       const s = JSON.parse(saved) as HeldSession;
-      return s.verified ? null : s;
+      if (s.verified) {
+        store.del(this.storageKey);
+        return null;
+      }
+      return s;
     } catch {
       return null; // corrupted entry
     }
@@ -190,25 +197,39 @@ export class ApiClient {
 
   /** Returns a valid visitor session, creating or refreshing it when needed. */
   ensureSession(): Promise<SessionResponse> {
+    if (this.sessionPromise) return this.sessionPromise;
     if (this.session && this.fresh(this.session)) return Promise.resolve(this.session);
-    return (this.sessionPromise ??= this.loadSession().finally(() => (this.sessionPromise = null)));
+    const generation = this.sessionGeneration;
+    const promise = this.loadSession(generation).catch((error) => {
+      if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
+      throw error;
+    }).finally(() => {
+      if (this.sessionPromise === promise) this.sessionPromise = null;
+      this.supersededSessions.delete(generation);
+    });
+    return (this.sessionPromise = promise);
   }
 
-  private async loadSession(): Promise<SessionResponse> {
+  private async loadSession(generation: number): Promise<SessionResponse> {
     if (!this.session) {
       const s = this.stored();
       if (s) {
         // A backend that signs users in decides who the visitor is on every page load: the
         // stored anonymous token only seeds the visitor id when the user is not signed in.
-        if (this.fresh(s) && !(await this.getConfig()).identity) return (this.session = s);
+        if (this.fresh(s)) {
+          const cfg = await this.getConfig();
+          if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
+          if (!cfg.identity) return (this.session = s);
+        }
         this.session = s; // close to expiry: refresh below, keeping the same visitor id
       }
     }
-    return this.createSession();
+    return this.createSession(generation);
   }
 
-  private async createSession(): Promise<SessionResponse> {
+  private async createSession(generation: number): Promise<SessionResponse> {
     const cfg = await this.getConfig();
+    if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
     const body: Record<string, string> = {};
     const previous = this.session && !this.session.verified ? this.session : this.stored();
     if (previous?.token) body.token = previous.token;
@@ -236,10 +257,13 @@ export class ApiClient {
         s = await post();
       }
     } catch (e) {
+      if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
+      this.session = null;
       // Nobody is signed in (or sign-in is required): the hint has no user left to serve.
       if (e instanceof ApiError && e.status === 401) tabStore.del(this.reuseKey);
       throw e;
     }
+    if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
     // obtainedAt lets fresh() size the refresh margin to the server's token lifetime.
     const now = Date.now();
     const held: HeldSession = { ...s, obtainedAt: now };
@@ -276,8 +300,14 @@ export class ApiClient {
    * stored anonymous visitor id is kept, so an anonymous visitor's history survives.
    */
   async renewSession(): Promise<SessionResponse> {
+    const previousGeneration = this.sessionGeneration;
+    const previous = this.sessionPromise;
+    this.sessionGeneration++;
     this.session = null;
-    return this.ensureSession();
+    this.sessionPromise = null;
+    const next = this.ensureSession();
+    if (previous) this.supersededSessions.set(previousGeneration, next);
+    return next;
   }
 
   /** Requests a single-use launch ticket. Does not refresh or swap the signed-in session after refusal. */

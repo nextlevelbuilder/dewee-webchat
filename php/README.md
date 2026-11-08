@@ -71,7 +71,7 @@ trust it only behind a proxy that overwrites that header. A turn that times out,
 write, at most 15 s later), is aborted at CCP.
 
 Array options use the TS names (`transport`, `ccp` = `['chatUrl' => …, 'integrationId' => …,
-'integrationSecret' => …]`, `gatewayUrl`, `token`, `agents`, `allowedOrigins`, `rateLimit` =
+'integrationSecret' => …]`, `gatewayUrl`, `token`, `agents`, `allowedOrigins`, `allowedHeaders` (additional CORS header names), `rateLimit` =
 `false` or `callable(string $key, string $bucket): bool`, `onChat`, `timeoutMs`, …). Rate limits
 default to 20 messages/min per visitor+IP and 10 sessions/10 min per IP, kept in files in the
 private temp directory described above (when it is unavailable, requests are not limited and `error_log` says

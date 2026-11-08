@@ -15,6 +15,27 @@ beforeAll(() => defineDeweeChat());
 afterEach(() => { document.body.replaceChildren(); localStorage.clear(); vi.unstubAllGlobals(); ViewportObserver.observers = []; });
 
 describe.each(["inline", "floating"])("Markdown images in %s mode", (mode) => {
+  it("loads a service-binding image using its tagged capability ticket", async () => {
+    vi.stubGlobal("IntersectionObserver", ViewportObserver);
+    const json = (data: unknown) => new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } });
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const path = new URL(url, "https://site.test").pathname;
+      if (path.endsWith("/config")) return json({ agents: [{ id: "support" }], defaultAgent: "support", maxMessageLength: 4000 });
+      if (path.endsWith("/session")) return json({ visitorId: "visitor", token: "test", expiresAt: Date.now() + 86400000 });
+      if (path.endsWith("/image-ticket")) return json({ ticket: "s.catalog-v1.encrypted_ticket" });
+      if (path.endsWith("/history")) return json({ messages: [{ role: "assistant", content: image }] });
+      return json({});
+    }));
+    localStorage.setItem("dewee-webchat:conv:/api/dewee::support", "conversation_123");
+    const el = document.createElement("dewee-chat") as DeweeChatElement;
+    el.setAttribute("endpoint", "/api/dewee"); el.setAttribute("mode", mode);
+    el.setAttribute("image-origins", '["https://shop.example"]');
+    document.body.appendChild(el); if (mode === "floating") el.open();
+    await vi.waitFor(() => expect(el.shadowRoot!.querySelector(".md img")).not.toBeNull());
+    ViewportObserver.observers.at(-1)?.enter();
+    await vi.waitFor(() => expect(el.shadowRoot!.querySelector(".md img")?.getAttribute("src")).toContain("ticket=s.catalog-v1.encrypted_ticket"));
+  });
+
   it("does not load an image repeatedly while a reply streams", async () => {
     vi.stubGlobal("IntersectionObserver", ViewportObserver);
     const json = (data: unknown) => new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } });

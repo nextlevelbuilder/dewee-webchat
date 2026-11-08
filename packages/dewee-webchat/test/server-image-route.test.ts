@@ -4,6 +4,7 @@ const network = vi.hoisted(() => vi.fn());
 vi.mock("../src/server/public-image-fetch-node", () => ({ publicImageFetchNode: network }));
 import { createDeweeHandler, signVisitorToken } from "../src/server";
 import { issueImageTicket, verifyImageTicket } from "../src/server/image-proxy";
+import { ApiClient } from "../src/widget/api-client";
 
 const secret = "fixture-secret-at-least-32-bytes-long";
 const handler = () => createDeweeHandler({ gatewayUrl: "https://gateway.example", token: "server-only", secret, agents: ["support"], rateLimit: false, imageSources: ["https://cdn.example/images/"] });
@@ -162,6 +163,27 @@ describe("image proxy route", () => {
     expect((await h(imageRequest(ticket))).status).toBe(502);
     binding.fetch.mockResolvedValueOnce(new Response("not an image", { headers: { "content-type": "image/png" } }));
     expect((await h(imageRequest(ticket))).status).toBe(502);
+  });
+
+  it("lets the browser client use the actual service-binding ticket issued by the handler", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Cloudflare-Workers" });
+    const binding = { fetch: vi.fn().mockImplementation(async () => png()) };
+    const h = createDeweeHandler({ gatewayUrl: "https://gateway.example", token: "server-only", secret, agents: ["support"], rateLimit: false,
+      imageSources: ["https://cdn.chat.example/public/"], cloudflarePublicImageServices: [{ id: "catalog-v1", binding, prefixes: ["https://cdn.chat.example/public/"] }] });
+    const client = new ApiClient({ endpoint: "https://chat.example/api/dewee", fetch: async (input, init) => {
+      const headers = new Headers(init?.headers); headers.set("authorization", `Bearer ${await token()}`);
+      return h(new Request(input, { ...init, headers }));
+    } });
+    const url = await client.imageUrl("https://cdn.chat.example/public/a.png");
+    expect((await h(new Request(url))).status).toBe(200);
+    expect(binding.fetch).toHaveBeenCalledOnce();
+  });
+
+  it("refuses malformed service ticket tags before constructing an image URL", async () => {
+    for (const ticket of ["s..cipher", "s.a.b.extra", "s.a../cipher", "s.a.cipher?other=x", `s.${"x".repeat(65)}.cipher`, `s.a.${"x".repeat(8193)}`]) {
+      const client = new ApiClient({ endpoint: "https://chat.example/api/dewee", fetch: async () => new Response(JSON.stringify({ ticket }), { headers: { "content-type": "application/json" } }) });
+      await expect(client.imageUrl("https://cdn.chat.example/public/a.png"), ticket.slice(0, 80)).rejects.toThrow("Invalid image ticket");
+    }
   });
 
   it("rejects malformed or broad public service prefixes", () => {

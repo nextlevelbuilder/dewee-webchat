@@ -144,7 +144,7 @@ export class ApiClient {
   async imageUrl(source: string, signal?: AbortSignal): Promise<string> {
     const res = await this.request(this.url("image-ticket"), { method: "POST", headers: await this.headers(true), body: JSON.stringify({ url: source }), redirect: "error", signal });
     const data = await this.parse<{ ticket: string }>(res);
-    if (typeof data.ticket !== "string" || !/^[A-Za-z0-9_-]{1,8192}$/.test(data.ticket)) throw new Error("Invalid image ticket");
+    if (typeof data.ticket !== "string" || !/^(?:[A-Za-z0-9_-]{1,8192}|s\.[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{1,8192})$/.test(data.ticket)) throw new Error("Invalid image ticket");
     return this.url("image", { ticket: data.ticket });
   }
 

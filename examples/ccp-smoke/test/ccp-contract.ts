@@ -6,6 +6,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { signVisitorToken } from "dewee-webchat/server";
 import { expect, it } from "vitest";
+import { forgeToken } from "../../../packages/dewee-webchat/test/helpers/forge-token";
 import { browser, nextIp, servedScripts, sseEvents, type Browser } from "../src/browser";
 import type { Host } from "../src/hosts";
 import { PARTNER_ORIGIN, STAGING, VISITOR_SECRET, type Target } from "../src/target";
@@ -101,7 +102,7 @@ export function ccpContract(ctx: () => ContractContext): void {
     const { token, visitorId } = await newSession(b);
     const expired = await signVisitorToken(VISITOR_SECRET, { v: visitorId, exp: Date.now() - 1_000 });
     const forged = await signVisitorToken("another-secret-of-at-least-32-characters", { v: visitorId, exp: Date.now() + 60_000 });
-    for (const bad of [expired, forged, `${token.slice(0, -2)}xx`, undefined]) {
+    for (const bad of [expired, forged, forgeToken(token), undefined]) {
       const chat = await b.request("/api/dewee/chat", { token: bad, body: { message: "hi" } });
       expect(chat.status).toBe(401);
       expect(chat.json().error.code).toBe("unauthorized");

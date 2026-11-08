@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { signVisitorToken } from "../src/server";
 import { signReuseHint } from "../src/server/security";
+import { forgeToken } from "./helpers/forge-token";
 
 const PHP = process.env.PHP_BIN || "php";
 const hasPhp = spawnSync(PHP, ["-v"]).status === 0;
@@ -99,10 +100,10 @@ echo json_encode([
   'signedIn' => DeweeWebchat::verifyVisitorToken($s, $in['signedIn']),
   'expired' => DeweeWebchat::verifyVisitorToken($s, $in['expired']),
   'hint' => DeweeWebchat::verifyVisitorToken($s, $in['hint']),
-  'tampered' => DeweeWebchat::verifyVisitorToken($s, substr($in['legacy'], 0, -2) . 'xx'),
+  'tampered' => DeweeWebchat::verifyVisitorToken($s, $in['tampered']),
   'otherSecret' => DeweeWebchat::verifyVisitorToken(str_repeat('o', 40), $in['legacy']),
 ]);`,
-      { secret: VISITOR_SECRET, legacy, withEdge, signedIn, expired, hint, exp },
+      { secret: VISITOR_SECRET, legacy, withEdge, signedIn, expired, hint, exp, tampered: forgeToken(legacy) },
     );
     // Exactly the two claims, nothing added.
     expect(out.legacy).toEqual({ v: "visitor_legacy_01", exp });

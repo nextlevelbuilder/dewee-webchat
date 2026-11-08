@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { verifyVisitorToken } from "../src/server";
 import { verifyReuseHint } from "../src/server/security";
 import { APP_ID, ASSERTION_SECRET, INTEGRATION_ID, INTEGRATION_SECRET, ISSUER, startFakeCcp, type FakeCcp } from "./helpers/fake-ccp-ingress";
+import { forgeToken } from "./helpers/forge-token";
 
 const php = process.env.PHP_BIN || "php";
 const available = spawnSync(php, ["-v"]).status === 0;
@@ -74,7 +75,7 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     const issued = await (await session("user-a")).json();
     const claims = await verifyVisitorToken(secret, issued.token);
     const send = (cookie: string, token = issued.token, agent = "shop") => fetch(`${base}/chat`, { method: "POST", headers: { cookie: `uid=${cookie}`, authorization: `Bearer ${token}` }, body: JSON.stringify({ message: "hello", conversationId: "conv_php_ident_1", agent }) });
-    expect((await send("user-a", issued.token.slice(0, -2) + "aa")).status).toBe(401);
+    expect((await send("user-a", forgeToken(issued.token))).status).toBe(401);
     expect((await send("user-a", issued.token, "other")).status).toBe(403);
     const response = await send("user-a");
     expect(response.status).toBe(200);

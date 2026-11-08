@@ -10,6 +10,7 @@ import { EDGE_RESEAL_MS } from "../src/server/ccp-transport";
 import { deweeIdentitySdk } from "../src/server/identity";
 import { signReuseHint, signVisitorToken } from "../src/server/security";
 import { APP_ID, ASSERTION_SECRET, INTEGRATION_ID, INTEGRATION_SECRET, ISSUER, mintEdge, startFakeCcp, type FakeCcp } from "./helpers/fake-ccp-ingress";
+import { forgeToken } from "./helpers/forge-token";
 
 const VISITOR_SECRET = "visitor-secret-NEVER-IN-BROWSER-00000000001";
 const BASE = "https://shop.example/api/dewee";
@@ -175,7 +176,7 @@ describe("ccp /session edges", () => {
     expect(r.status).toBe(200);
     expect(r.json().visitorId).toBe("visitor_turnstile_1");
     // An expired or forged token is no proof.
-    expect((await session(h, { token: `${token.slice(0, -2)}xx` })).status).toBe(403);
+    expect((await session(h, { token: forgeToken(token) })).status).toBe(403);
   });
 
   it("keeps the legacy gateway transport challenging every /session", async () => {
@@ -289,7 +290,7 @@ describe("stateless host: signed-in user", () => {
     const h = stateless({}, {});
     const a = (await session(h, {}, "user-a")).json();
     const c = (await claims(a.token))!;
-    const tampered = `${a.reuseHint.slice(0, -2)}xx`;
+    const tampered = forgeToken(a.reuseHint);
     const expiring = await signReuseHint(VISITOR_SECRET, { ...c, exp: Date.now() + 60_000 });
     const otherAgent = await signReuseHint(VISITOR_SECRET, { ...c, ida: "support" });
     for (const hint of [tampered, expiring, otherAgent]) {

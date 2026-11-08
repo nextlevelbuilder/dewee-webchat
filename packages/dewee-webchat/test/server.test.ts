@@ -3,6 +3,7 @@ import { WebSocketServer } from "ws";
 import type { AddressInfo } from "node:net";
 import { createDeweeHandler, foldHistory, signVisitorToken, verifyVisitorToken } from "../src/server";
 import type { ChatStreamEvent } from "../src/protocol";
+import { forgeToken } from "./helpers/forge-token";
 
 // A fake gateway speaking the WS v3 protocol: connect, chat.send (streams agent events), chat.history.
 let wss: WebSocketServer;
@@ -78,9 +79,15 @@ describe("visitor tokens", () => {
     const t = await signVisitorToken("k".repeat(32), { v: "visitor_123", exp: Date.now() + 1000 });
     expect((await verifyVisitorToken("k".repeat(32), t))?.v).toBe("visitor_123");
     expect(await verifyVisitorToken("x".repeat(32), t)).toBeNull();
-    expect(await verifyVisitorToken("k".repeat(32), t.slice(0, -2) + "aa")).toBeNull();
+    expect(await verifyVisitorToken("k".repeat(32), forgeToken(t))).toBeNull();
     const old = await signVisitorToken("k".repeat(32), { v: "visitor_123", exp: Date.now() - 1 });
     expect(await verifyVisitorToken("k".repeat(32), old)).toBeNull();
+  });
+  it("rejects a changed signature across tokens with varying encoded suffixes", async () => {
+    for (let i = 0; i < 64; i++) {
+      const token = await signVisitorToken("k".repeat(32), { v: `visitor_${i}`, exp: Date.now() + 60_000 });
+      expect(await verifyVisitorToken("k".repeat(32), forgeToken(token))).toBeNull();
+    }
   });
 });
 

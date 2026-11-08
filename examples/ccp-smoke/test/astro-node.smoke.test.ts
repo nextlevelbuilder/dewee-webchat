@@ -5,6 +5,7 @@
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { forgeToken } from "../../../packages/dewee-webchat/test/helpers/forge-token";
 import { tosePageActions } from "../../astro-node/src/lib/page-actions";
 import { browser, nextIp, sseEvents, type Browser } from "../src/browser";
 import { EXAMPLES, startHost, type Host } from "../src/hosts";
@@ -219,7 +220,7 @@ describe("Astro Node SSR: TOSE-style backend routes the page actions call", () =
     const quote = (await b.request("/api/payments/quote?orderId=ord_1001a", { cookie: lan })).json();
     expect(quote).toMatchObject({ orderId: "ord_1001a", amount: 250000, currency: "VND" });
 
-    const tampered = await b.request("/api/payments", { cookie: lan, body: { quote: `${quote.quote.slice(0, -2)}xx` } });
+    const tampered = await b.request("/api/payments", { cookie: lan, body: { quote: forgeToken(quote.quote) } });
     expect(tampered.status).toBe(400);
     expect(tampered.json().error.code).toBe("invalid_quote");
 

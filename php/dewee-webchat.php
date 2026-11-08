@@ -65,7 +65,7 @@ final class DeweeCcpError extends RuntimeException
 
 final class DeweeWebchat
 {
-    public const VERSION = '0.5.0-beta.1';
+    public const VERSION = '0.5.0-beta.2';
     public const PAGE_BLOCK_OPEN = '[[dewee-page v1]]';
     public const PAGE_BLOCK_CLOSE = '[[/dewee-page]]';
     /** Mirrors ACTION_LIMITS in src/actions/page-block.ts. */

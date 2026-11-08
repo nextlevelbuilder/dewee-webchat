@@ -887,6 +887,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       maxMessageLength: Math.min(o.maxMessageLength, cfg.maxMessageChars),
       ...(cfg.pageContextVersions.length ? { pageContextVersions: cfg.pageContextVersions } : {}),
       ...(credentialFormOrigin ? { credentialFormOrigin } : {}),
+      ...(credentialFormOrigin && cfg.memberLinkProof ? { memberLinkProof: true } : {}),
       version: VERSION,
     };
     if (idn) {
@@ -1017,6 +1018,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return fail(req, 400, "Invalid request", "bad_request");
     const body: any = input.body;
     const message = typeof body?.message === "string" ? body.message.trim() : "";
+    if (/MEM-[A-Z2-7]{16}/i.test(JSON.stringify(body))) return fail(req, 400, "Use the member linking form for your verification code", "member_proof_in_message");
     const resumeId = body?.credentialRequestId;
     if (resumeId !== undefined) {
       if (!ccp || !credentialFormOrigin || !claims.ids || typeof resumeId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(resumeId) || (body.message !== undefined && typeof body.message !== "string") || message || body?.actions != null || body?.pageContext != null || body?.page_context != null || typeof body?.conversationId !== "string" || !CCP_ID_RE.test(body.conversationId)) return fail(req, 400, "Invalid request", "bad_request");
@@ -1398,6 +1400,26 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     }
   }
 
+  async function handleMemberLinkProof(req: Request): Promise<Response> {
+    if (!ccp || !credentialFormOrigin || !idn) return fail(req, 404, "Not found", "not_found");
+    const origin = req.headers.get("origin");
+    try { const u = new URL(origin ?? ""); if (u.protocol !== "https:" || u.origin !== origin) throw new Error(); }
+    catch { return fail(req, 403, "Origin not allowed", "forbidden_origin"); }
+    const claims = await visitorFrom(req);
+    if (!claims?.ids || !claims.ida) return identityFail(req, "IDENTITY_REQUIRED");
+    const refused = await rebindRefusal(req, claims, true);
+    if (refused) return refused;
+    if (limiter && !(await limiter(`member-proof:${claims.v}`, "link"))) return fail(req, 429, "Too many requests", "rate_limited");
+    const raw = await readImageTicketBody(req);
+    let body: unknown;
+    try { body = raw && JSON.parse(raw); } catch { return fail(req, 400, "Invalid request", "bad_request"); }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "code") || typeof (body as {code?: unknown}).code !== "string" || !/^MEM-[A-Z2-7]{16}$/.test((body as {code: string}).code)) return fail(req, 400, "Invalid request", "bad_request");
+    try {
+      await ccp.memberLinkProof(visitorContext(req), claims.v, sealedEdge(claims), { identitySession: claims.ids, agent: claims.ida, code: (body as {code: string}).code });
+      return json(req, { state: "proved" });
+    } catch (error) { return ccpFail(req, error, "identity/member-link-proof", claims.ids); }
+  }
+
   /** Logout hook (see {@link DeweeHandler.revoke}). */
   async function revoke(subject: string, request?: Request, token?: string): Promise<void> {
     if (!idn || typeof subject !== "string" || subject === "") return;
@@ -1487,6 +1509,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (req.method === "POST" && action === "chat") return await handleChat(req);
       if (req.method === "GET" && action === "history") return await handleHistory(req);
       if (req.method === "POST" && action === "link" && idn) return await handleLink(req);
+      if (req.method === "POST" && action === "member-link-proof") return await handleMemberLinkProof(req);
       if (req.method === "POST" && action === "job-access" && idn) return await handleJobAccess(req);
       if (req.method === "POST" && (action === "credential-request" || action === "credential-request-handoff" || action === "credential-request-cancel")) return await handleCredentialRequest(req, action);
       return fail(req, 404, "Not found", "not_found");

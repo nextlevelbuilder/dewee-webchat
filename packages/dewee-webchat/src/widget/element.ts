@@ -224,7 +224,7 @@ export class DeweeChatElement extends ElementBase {
   private els!: {
     launcher: HTMLButtonElement; panel: HTMLElement; log: HTMLElement; title: HTMLElement; subtitle: HTMLElement;
     status: HTMLElement; avatar: HTMLElement; select: HTMLSelectElement; input: HTMLTextAreaElement; send: HTMLButtonElement;
-    newChat: HTMLButtonElement; jobAccess: HTMLButtonElement; close: HTMLButtonElement; foot: HTMLElement; cooldown: HTMLElement; announcer: HTMLElement;
+    newChat: HTMLButtonElement; jobAccess: HTMLButtonElement; memberLink: HTMLButtonElement; close: HTMLButtonElement; foot: HTMLElement; cooldown: HTMLElement; announcer: HTMLElement;
     pageChoice: HTMLInputElement; pageWrap: HTMLElement; pageLabel: HTMLElement; pagePreview: HTMLElement;
   };
 
@@ -341,6 +341,9 @@ export class DeweeChatElement extends ElementBase {
   async send(text: string): Promise<void> {
     const message = text.trim();
     if (!message || this.running || this.preparingPage || this.cooldown.active) return;
+    if (/MEM-[A-Z2-7]{16}/i.test(message)) {
+      this.els.input.value = ""; this.autosize(); this.showNotice(this.strings.memberLinkPrivate); return;
+    }
     if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.open();
     await this.activate();
     let attachment: PageContextAttachment | undefined;
@@ -377,6 +380,9 @@ export class DeweeChatElement extends ElementBase {
     // at most `maxActionRounds` times per visitor message.
     let next: { message: string; hidden: boolean } | null = { message, hidden: false };
     for (let round = 0; next; round++) {
+      if (/MEM-[A-Z2-7]{16}/i.test(next.message) || (attachment && /MEM-[A-Z2-7]{16}/i.test(JSON.stringify(attachment)))) {
+        this.showNotice(this.strings.memberLinkPrivate); break;
+      }
       const reply = await this.runTurn(next.message, next.hidden, round === 0 ? attachment : undefined);
       next = null;
       if (reply.status !== "done" || reply.stopped || !this.actionRegistry().size) break;
@@ -584,6 +590,52 @@ export class DeweeChatElement extends ElementBase {
     }
   }
 
+  private async openMemberLink(): Promise<void> {
+    if (this.root.querySelector(".member-link-dialog")) return;
+    const s = this.strings;
+    try {
+      if (!(await this.client().ensureSession()).verified) { this.showNotice(s.memberLinkSignIn); return; }
+    } catch { this.showNotice(s.memberLinkError); return; }
+    if (this.root.querySelector(".member-link-dialog")) return;
+    const backdrop = document.createElement("div");
+    backdrop.className = "confirm-backdrop member-link-dialog";
+    backdrop.innerHTML = `<form class="confirm" role="dialog" aria-modal="true" aria-labelledby="dw-member-link-title">
+      <h3 id="dw-member-link-title"></h3><p class="member-link-instructions"></p>
+      <label><span class="member-link-label"></span><input class="member-link-code" type="text" autocomplete="off" spellcheck="false" maxlength="20" required></label>
+      <p class="member-link-error" role="alert" hidden></p><div class="confirm-buttons"><button type="button" class="btn deny"></button><button type="submit" class="btn allow"></button></div></form>`;
+    const form = backdrop.querySelector("form")!;
+    const input = backdrop.querySelector<HTMLInputElement>("input")!;
+    const error = backdrop.querySelector<HTMLElement>(".member-link-error")!;
+    const cancel = backdrop.querySelector<HTMLButtonElement>(".deny")!;
+    const submit = backdrop.querySelector<HTMLButtonElement>(".allow")!;
+    backdrop.querySelector("h3")!.textContent = s.memberLink;
+    backdrop.querySelector(".member-link-instructions")!.textContent = s.memberLinkInstructions;
+    backdrop.querySelector(".member-link-label")!.textContent = s.memberLinkCode;
+    cancel.textContent = s.memberLinkCancel;
+    submit.textContent = s.memberLinkSubmit;
+    const close = () => { input.value = ""; backdrop.remove(); this.els.memberLink.focus(); };
+    cancel.addEventListener("click", close);
+    backdrop.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !submit.disabled) { event.preventDefault(); event.stopPropagation(); close(); }
+      if (event.key === "Tab") {
+        const targets = [input, cancel, submit].filter((el) => !el.disabled);
+        const current = targets.indexOf(this.root.activeElement as HTMLInputElement & HTMLButtonElement);
+        event.preventDefault(); targets[(current + (event.shiftKey ? targets.length - 1 : 1)) % targets.length].focus();
+      }
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const code = input.value.trim().toUpperCase();
+      if (!/^MEM-[A-Z2-7]{16}$/.test(code)) { error.textContent = s.memberLinkError; error.hidden = false; return; }
+      input.value = ""; submit.disabled = true; cancel.disabled = true;
+      void this.client().memberLinkProof(code).then(() => { close(); this.showNotice(s.memberLinkSuccess); }).catch(() => {
+        error.textContent = s.memberLinkError; error.hidden = false; submit.disabled = false; cancel.disabled = false; input.focus();
+      });
+    });
+    this.els.panel.appendChild(backdrop);
+    input.focus();
+  }
+
   /** Opens the hosted permission review; the verified session stays on the backend. */
   async openJobAccess(): Promise<void> {
     if (this.jobAccessLaunch) return;
@@ -762,6 +814,8 @@ export class DeweeChatElement extends ElementBase {
     e.newChat.title = s.newChat;
     e.jobAccess.setAttribute("aria-label", s.jobAccess);
     e.jobAccess.title = s.jobAccess;
+    e.memberLink.setAttribute("aria-label", s.memberLink);
+    e.memberLink.title = s.memberLink;
     e.input.placeholder = c.placeholder || s.placeholder;
     e.pageLabel.textContent = s.pageShare;
     this.updatePageChoice();
@@ -800,6 +854,7 @@ export class DeweeChatElement extends ElementBase {
           </div>
           <button class="icon-btn new">${icons.newChat}</button>
           <button class="icon-btn job-access" hidden>${icons.jobAccess}</button>
+          <button class="icon-btn member-link" hidden>${icons.jobAccess}</button>
           <button class="icon-btn close">${icons.close}</button>
         </header>
         <div class="log" part="log" role="log" aria-live="polite"></div>
@@ -819,7 +874,7 @@ export class DeweeChatElement extends ElementBase {
     this.els = {
       launcher: $(".launcher"), panel: $(".panel"), log: $(".log"), title: $(".title"), subtitle: $(".subtitle"),
       status: $(".status"), avatar: $(".avatar"), select: $(".agent-select"), input: $("textarea"), send: $(".send"),
-      newChat: $(".new"), jobAccess: $(".job-access"), close: $(".close"), foot: $(".foot"), cooldown: $(".cooldown"), announcer: $(".announcer"),
+      newChat: $(".new"), jobAccess: $(".job-access"), memberLink: $(".member-link"), close: $(".close"), foot: $(".foot"), cooldown: $(".cooldown"), announcer: $(".announcer"),
       pageChoice: $(".page-choice"), pageWrap: $(".page-context"), pageLabel: $(".page-label"), pagePreview: $(".page-preview"),
     };
     const e = this.els;
@@ -829,6 +884,7 @@ export class DeweeChatElement extends ElementBase {
     e.log.addEventListener("scroll", () => { this.following = this.nearBottom(); }, { passive: true });
     e.newChat.addEventListener("click", () => this.newConversation());
     e.jobAccess.addEventListener("click", () => { void this.openJobAccess(); });
+    e.memberLink.addEventListener("click", () => { void this.openMemberLink(); });
     e.pageChoice.addEventListener("change", () => { void this.choosePage(); });
     e.select.addEventListener("change", () => this.switchAgent(e.select.value));
     $<HTMLFormElement>("form").addEventListener("submit", (ev) => {
@@ -950,6 +1006,7 @@ export class DeweeChatElement extends ElementBase {
 
   private renderSubtitle() {
     this.els.jobAccess.hidden = this.server?.identity !== true;
+    this.els.memberLink.hidden = this.server?.identity !== true || this.server?.memberLinkProof !== true;
     const e = this.els;
     const c = this.config;
     const agents = this.server?.agents ?? [];

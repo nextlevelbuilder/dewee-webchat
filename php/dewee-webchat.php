@@ -434,6 +434,7 @@ final class DeweeWebchat
                 $method === 'POST' && $action === 'image-ticket' && !empty($this->o['imageSources']) => $this->handleImageTicket(),
                 $method === 'GET' && $action === 'image' && !empty($this->o['imageSources']) => $this->handleImage(),
                 $method === 'POST' && $action === 'link' && $this->identity !== null => $this->handleLink(),
+                $method === 'POST' && $action === 'member-link-proof' => $this->handleMemberLinkProof(),
                 $method === 'POST' && $action === 'job-access' && $this->identity !== null => $this->handleJobAccess(),
                 $method === 'POST' && in_array($action, ['credential-request', 'credential-request-handoff', 'credential-request-cancel'], true) => $this->handleCredentialRequest($action),
                 default => $this->fail(404, 'Not found', 'not_found'),
@@ -976,6 +977,28 @@ final class DeweeWebchat
         } catch (DeweeCcpError $e) { $this->ccpFail($e, $route); }
     }
 
+    private function handleMemberLinkProof(): void
+    {
+        if ($this->ccp === null || $this->identity === null || $this->credentialFormOrigin === null) { $this->fail(404, 'Not found', 'not_found'); return; }
+        $origin = self::header('origin') ?? '';
+        $parsed = parse_url($origin);
+        if (!is_array($parsed) || ($parsed['scheme'] ?? '') !== 'https' || empty($parsed['host']) || isset($parsed['user']) || isset($parsed['pass']) || isset($parsed['path']) || isset($parsed['query']) || isset($parsed['fragment']) || (isset($parsed['port']) && $parsed['port'] === 443) || $origin !== 'https://' . strtolower($parsed['host']) . (isset($parsed['port']) ? ':' . $parsed['port'] : '')) { $this->fail(403, 'Origin not allowed', 'forbidden_origin'); return; }
+        $claims = $this->claimsFromRequest();
+        if (!isset($claims['ids'], $claims['ida'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims, true)) return;
+        if (!$this->rateLimit('member-proof:' . $claims['v'], 'link')) { $this->fail(429, 'Too many requests', 'rate_limited'); return; }
+        $raw = file_get_contents('php://input', false, null, 0, 1025);
+        $body = is_string($raw) && strlen($raw) <= 1024 ? json_decode($raw, true) : null;
+        if (!is_array($body) || array_keys($body) !== ['code'] || !is_string($body['code']) || !preg_match('/^MEM-[A-Z2-7]{16}$/D', $body['code'])) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
+        try {
+            $ctx = $this->visitorContext();
+            $input = ['identity_session' => $claims['ids'], 'agent' => $claims['ida'], 'code' => $body['code']];
+            $result = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json('identity/member-link-proof', $ctx + ['body' => $input, 'session' => $edge['token']]));
+            if (($result['state'] ?? null) !== 'proved') { $this->fail(502, 'Member verification unavailable', 'member_link_unavailable'); return; }
+            $this->json(['state' => 'proved']);
+        } catch (DeweeCcpError $e) { $this->ccpFail($e, 'identity/member-link-proof'); }
+    }
+
     private function handleLink(): void
     {
         $claims = $this->claimsFromRequest();
@@ -1066,6 +1089,7 @@ final class DeweeWebchat
         $body = is_string($raw) ? json_decode($raw, true) : null;
         if (!$rawBody instanceof stdClass || !is_array($body)) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
         $message = is_string($body['message'] ?? null) ? self::jsTrim($body['message']) : '';
+        if (preg_match('/MEM-[A-Z2-7]{16}/i', (string) json_encode($body))) { $this->fail(400, 'Use the member linking form for your verification code', 'member_proof_in_message'); return; }
         $resume = $body['credentialRequestId'] ?? null;
         if (array_key_exists('credentialRequestId', $body) && $resume === null) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
         if ($resume !== null) {
@@ -1305,6 +1329,7 @@ final class DeweeWebchat
             'maxMessageLength' => min((int) $this->o['maxMessageLength'], $cfg['maxMessageChars']),
             'pageContextVersions' => !empty($cfg['pageContextVersions']) ? $cfg['pageContextVersions'] : null,
             'credentialFormOrigin' => $this->credentialFormOrigin,
+            'memberLinkProof' => $this->credentialFormOrigin !== null && ($cfg['memberLinkProof'] ?? false) ? true : null,
             'version' => self::VERSION,
         ]));
     }
@@ -1748,6 +1773,7 @@ final class DeweeWebchat
             'allowAgentSwitch' => is_bool($data['allow_agent_switch'] ?? null) ? $data['allow_agent_switch'] && count($agents) > 1 : count($agents) > 1,
             'mode' => $mode,
             'identityEnabled' => ($data['identity_enabled'] ?? null) === true,
+            'memberLinkProof' => ($data['member_link_proof'] ?? null) === true,
             // Reasoning and tool activity stay hidden unless the integration turns them on explicitly.
             'showThinking' => ($data['show_thinking'] ?? null) === true,
             'showToolActivity' => ($data['show_tool_activity'] ?? null) === true,
@@ -2949,7 +2975,7 @@ final class DeweeWebchat
  */
 final class DeweeCcpClient
 {
-    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'link', 'job-access', 'credential-request', 'credential-request-handoff', 'credential-request-cancel'];
+    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'identity/member-link-proof', 'link', 'job-access', 'credential-request', 'credential-request-handoff', 'credential-request-cancel'];
     private const INTEGRATION_ID_RE = '/^wci_[a-z2-7]{26}$/';
     private const SECRET_RE = '/^dwc_[A-Za-z0-9_-]{16,256}$/';
     private const INGRESS_PATH_RE = '#/api/public/webchat/v1/(wci_[a-z2-7]{26})$#';

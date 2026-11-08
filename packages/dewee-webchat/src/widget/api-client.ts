@@ -345,6 +345,16 @@ export class ApiClient {
     return this.parse<LinkResponse>(res);
   }
 
+  async memberLinkProof(code: string): Promise<void> {
+    const session = await this.ensureSession();
+    if (!session.verified || !(await this.getConfig()).memberLinkProof) throw new ApiError("Member verification unavailable", 403, "member_link_unavailable");
+    const headers = await this.headers(true);
+    if (this.session !== session) throw new Error("identity changed");
+    const response = await this.request(this.url("member-link-proof"), { method: "POST", headers, body: JSON.stringify({ code }), redirect: "error" });
+    const result = await this.parse<{ state?: string }>(response);
+    if (this.session !== session || result.state !== "proved") throw new Error("Member verification unavailable");
+  }
+
   async history(agent: string, conversationId: string): Promise<HistoryMessage[]> {
     return (await this.historyDetails(agent, conversationId)).messages;
   }

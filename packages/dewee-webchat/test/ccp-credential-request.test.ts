@@ -38,6 +38,21 @@ function request(token:string, route:string, extraHeaders:Record<string,string>=
 }
 
 describe("CCP credential handoff", () => {
+  it("submits member proof only for the current signed-in user without sending it to chat", async () => {
+    ccp.state.config = {...ccp.state.config, member_link_proof: true};
+    const h = handler(); const token = await session(h); const code = "MEM-ABCDEFGHIJKLMNOP";
+    const config = await (await h(new Request(`${base}/config`))).json();
+    expect(config.memberLinkProof).toBe(true);
+    const ok = await h(request(token, "member-link-proof", {}, { code }));
+    expect(ok.status).toBe(200); expect(await ok.json()).toEqual({state:"proved"});
+    expect(ccp.routes("identity/member-link-proof").at(-1)?.body).toMatchObject({agent:"shop", code});
+    expect((await h(request(token, "member-link-proof", {cookie:"uid=bob"}, {code}))).status).toBeGreaterThanOrEqual(400);
+    expect((await h(request(token, "member-link-proof", {}, {code:"bad"}))).status).toBe(400);
+    const blocked = await h(request(token, "chat", {}, {agent:"shop",conversationId:"conversation_01",message:`my code ${code}`}));
+    expect(blocked.status).toBe(400); expect(await blocked.text()).not.toContain(code); expect(ccp.routes("chat")).toHaveLength(0);
+    const page = await h(request(token, "chat", {}, {agent:"shop",conversationId:"conversation_01",message:"help",page_context:{version:1,url:"https://shop.example",content:{format:"text",text:code}}}));
+    expect(page.status).toBe(400); expect(ccp.routes("chat")).toHaveLength(0);
+  });
   it("requires an ASCII HTTPS origin, allowing explicit punycode", () => {
     expect(()=>handler(true,undefined,"https://bücher.example")).toThrow(/ASCII HTTPS origin/);
     expect(()=>handler(true,undefined,"https://%61pp.example")).toThrow(/ASCII HTTPS origin/);

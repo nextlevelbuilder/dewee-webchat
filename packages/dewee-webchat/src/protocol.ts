@@ -76,6 +76,8 @@ export interface PublicConfig {
   pageContextVersions?: number[];
   /** Present (true) when the backend signs users in through Dewee: the widget then asks `/session` on every page load. */
   identity?: boolean;
+  /** The signed-in visitor may submit a workspace member linking code. */
+  memberLinkProof?: boolean;
   /** Trusted origin of the hosted credential form, present only when explicitly enabled. */
   credentialFormOrigin?: string;
   /**

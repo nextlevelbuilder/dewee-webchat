@@ -240,6 +240,10 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       if (s) s.revoked = true;
       return send(res, 200, { revoked: true });
     }
+    if (route === "identity/member-link-proof") {
+      if (!actor.startsWith("tuc:") || !/^MEM-[A-Z2-7]{16}$/.test(body?.code ?? "")) return error(res, 400, "invalid_request");
+      return send(res, 200, { state: "proved" });
+    }
     if (route === "link") {
       // The real shape: `{channel, url}` per chat account (contract §1.8).
       return send(res, 201, { proof_code: "482913", expires_at: new Date(Date.now() + 600_000).toISOString(), deep_links: [{ channel: "telegram", url: "https://t.me/acme_bot?start=482913" }, { channel: "bad channel!", url: "https://x.example" }] });

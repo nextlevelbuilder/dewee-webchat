@@ -6,14 +6,14 @@ const keys = [
   "endpoint", "agent", "title", "subtitle", "greeting", "intro", "placeholder", "suggestions", "avatar", "launcherAvatar",
   "position", "mode", "theme", "accentColor", "locale", "showReasoning", "showToolCalls", "allowAgentSwitch", "open",
   "persist", "hideBranding", "gatewayUrl", "gatewayToken", "width", "height", "zIndex", "actions", "confirm", "getPageContext",
-  "maxActionRounds", "actionTimeoutMs", "headers", "fetch", "domActions", "domActionsRoot", "imageOrigins",
+  "maxActionRounds", "actionTimeoutMs", "headers", "fetch", "domActions", "domActionsRoot", "imageOrigins", "pageContext", "contextSelector", "excludeSelectors", "contextProvider",
 ] as const;
 
 const props = Object.fromEntries(keys.map((k) => [k, { type: null as unknown as PropType<any>, default: undefined }])) as {
   [K in (typeof keys)[number]]: { type: PropType<any>; default: undefined };
 };
 
-const EVENTS = ["ready", "send", "reply", "error", "open", "close", "action"] as const;
+const EVENTS = ["ready", "send", "reply", "error", "open", "close", "action", "context-ready", "context-error"] as const;
 
 export const DeweeChat = defineComponent({
   name: "DeweeChat",

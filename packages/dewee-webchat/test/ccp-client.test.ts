@@ -116,7 +116,7 @@ describe("SSE framing", () => {
 
   it("ends a turn whose terminal frame came without a blank line", async () => {
     const transport = createCcpTransport(client(hangingFetch() as unknown as typeof fetch));
-    const cfg: CcpConfig = { agents: [{ id: "shop" }], defaultAgent: "shop", allowAgentSwitch: false, mode: "anonymous", identityEnabled: false, showThinking: false, showToolActivity: false, maxMessageChars: 100 };
+    const cfg: CcpConfig = { agents: [{ id: "shop" }], defaultAgent: "shop", allowAgentSwitch: false, mode: "anonymous", identityEnabled: false, showThinking: false, showToolActivity: false, maxMessageChars: 100, pageContextVersions: [] };
     const res = new Response(stream(['data: {"type":"start","runId":"r1"}\r\n\r', '\ndata: {"type":"delta","text":"hi"}\r\n\r\ndata: {"type":"done","content":"hi"}']));
     const events: ChatStreamEvent[] = [];
     for await (const e of transport.chatEvents(res, cfg, "conv_sse_0001", "shop")) events.push(e);
@@ -135,7 +135,7 @@ describe("remediation from CCP", () => {
 
   it("drops an unknown remediation from a stream error", async () => {
     const transport = createCcpTransport(client(hangingFetch() as unknown as typeof fetch));
-    const cfg: CcpConfig = { agents: [{ id: "shop" }], defaultAgent: "shop", allowAgentSwitch: false, mode: "anonymous", identityEnabled: false, showThinking: false, showToolActivity: false, maxMessageChars: 100 };
+    const cfg: CcpConfig = { agents: [{ id: "shop" }], defaultAgent: "shop", allowAgentSwitch: false, mode: "anonymous", identityEnabled: false, showThinking: false, showToolActivity: false, maxMessageChars: 100, pageContextVersions: [] };
     const run = async (remediation: unknown) => {
       const res = new Response(stream([`data: ${JSON.stringify({ type: "error", code: "LINK_REVOKED", remediation })}\n\n`]));
       const out: ChatStreamEvent[] = [];

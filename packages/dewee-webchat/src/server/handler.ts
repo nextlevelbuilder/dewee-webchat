@@ -49,6 +49,7 @@ import {
 import { DEAD_SESSION_CODES, IDENTITY_ERRORS } from "./identity-errors";
 import { CcpClient, CcpError, parseCcpOptions, type CcpOptions } from "./ccp-client";
 import { resolveTransport } from "./transport-selection";
+import { readChatBody, validPageContext } from "./page-context";
 import { JobAccessRefusal, mintJobAccess } from "./job-access";
 import { CCP_AGENT_RE, CCP_ID_RE, EDGE_RESEAL_MS, browserErrorFor, createCcpTransport, type BrowserError, type CcpConfig, type EdgeSession, type VisitorContext } from "./ccp-transport";
 import { memoryIdentitySessionStore, type IdentitySessionStore, type StoredIdentitySession } from "./identity-session-store";
@@ -801,6 +802,14 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       maxMessageLength: o.maxMessageLength,
       version: VERSION,
     };
+    if (creds && new URL(req.url).searchParams.get("pageContext") === "1") {
+      if (limiter && !(await limiter(clientIp(req), "preauth"))) return fail(req, 429, "Too many requests, slow down", "rate_limited");
+      try {
+        const probe = await GatewayConnection.connect(creds, o.userIdPrefix + "capability-probe");
+        if (probe.pageContextVersions.length) body.pageContextVersions = probe.pageContextVersions;
+        probe.close();
+      } catch { /* Chat works without the optional attachment when capability discovery fails. */ }
+    }
     if (idn) {
       // Identity sessions are bound to one agent, so the widget must not switch.
       body.defaultAgent = identityAgent;
@@ -828,6 +837,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       turnstileSiteKey: o.turnstile?.siteKey,
       ...(o.turnstile ? { refreshWithoutTurnstile: true } : {}),
       maxMessageLength: Math.min(o.maxMessageLength, cfg.maxMessageChars),
+      ...(cfg.pageContextVersions.length ? { pageContextVersions: cfg.pageContextVersions } : {}),
       version: VERSION,
     };
     if (idn) {
@@ -953,7 +963,10 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     if (error) return fail(req, 400, error, "bad_credentials");
     if (!creds && !ccp) return fail(req, 500, "Gateway is not configured", "not_configured");
 
-    const body: any = await req.json().catch(() => null);
+    const input = await readChatBody(req);
+    if ("error" in input) return fail(req, input.error === "too_large" ? 413 : 400, input.error === "too_large" ? "Request is too large" : "Invalid request", input.error === "too_large" ? "too_long" : "bad_request");
+    if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return fail(req, 400, "Invalid request", "bad_request");
+    const body: any = input.body;
     const message = typeof body?.message === "string" ? body.message.trim() : "";
     if (!message) return fail(req, 400, "Message is required");
     if (message.length > o.maxMessageLength) return fail(req, 413, `Message exceeds ${o.maxMessageLength} characters`, "too_long");
@@ -979,17 +992,25 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       throw e;
     }
 
-    if (ccp) return ccpChat(req, claims, { message: pageBlock + message, rawMessage: message, conversationId, agent, actionsHash });
+    if (body?.page_context != null) {
+      if (typeof body.page_context === "object" && Number.isInteger(body.page_context.version) && body.page_context.version !== 1) return fail(req, 400, "Page context is not supported", "page_context_unsupported");
+      if (!validPageContext(body.page_context)) return fail(req, 400, "Invalid page context", "page_context_invalid");
+    }
+    if (ccp) return ccpChat(req, claims, { message: pageBlock + message, rawMessage: message, conversationId, agent, actionsHash, pageContext: body?.page_context });
     if (!creds) return fail(req, 500, "Gateway is not configured", "not_configured"); // narrowing only: checked above
 
     // A signed-in user's session is checked before streaming starts, so an expired or revoked
     // session answers with a typed HTTP error the widget can act on (re-request /session).
     let connection: GatewayConnection | undefined;
-    if (claims.ids) {
+    if (claims.ids || body?.page_context != null) {
       try {
-        connection = await GatewayConnection.connect(creds, { identitySession: claims.ids });
+        connection = await GatewayConnection.connect(creds, claims.ids ? { identitySession: claims.ids } : o.userIdPrefix + visitorId);
       } catch (e) {
         return gatewayFail(req, e, claims.ids);
+      }
+      if (body?.page_context != null && !connection.pageContextVersions.includes(1)) {
+        connection.close();
+        return fail(req, 400, "Page context is not supported", "page_context_unsupported");
       }
     }
 
@@ -1009,7 +1030,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       try {
         await send(actionsHash ? { type: "start", conversationId, agent, actionsHash } : { type: "start", conversationId, agent });
         const who = connection ? { connection } : { userId: o.userIdPrefix + visitorId };
-        for await (const ev of streamChat({ creds, ...who, agent, sessionKey, message: pageBlock + message, signal: abort.signal, timeoutMs: o.timeoutMs })) {
+        for await (const ev of streamChat({ creds, ...who, agent, sessionKey, message: pageBlock + message, pageContext: body?.page_context ?? undefined, signal: abort.signal, timeoutMs: o.timeoutMs })) {
           if (ev.type === "start") continue; // already announced with the conversation id
           if (ev.type === "done") reply = ev.content;
           if (ev.type === "error") {
@@ -1060,7 +1081,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   async function ccpChat(
     req: Request,
     claims: VisitorClaims,
-    turn: { message: string; rawMessage: string; conversationId: string; agent: string; actionsHash?: string },
+    turn: { message: string; rawMessage: string; conversationId: string; agent: string; actionsHash?: string; pageContext?: unknown },
   ): Promise<Response> {
     const ctx = visitorContext(req);
     const visitorId = claims.v;
@@ -1080,6 +1101,15 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     let upstream: Response;
     try {
       cfg = await ccp!.config();
+      if (turn.pageContext != null) {
+        if (!cfg.pageContextVersions.includes(1)) { cleanup(); return fail(req, 400, "Page context is not supported", "page_context_unsupported"); }
+        if (typeof turn.pageContext === "object" && "version" in turn.pageContext && Number.isInteger((turn.pageContext as { version?: unknown }).version) && (turn.pageContext as { version?: unknown }).version !== 1) {
+          cleanup(); return fail(req, 400, "Page context is not supported", "page_context_unsupported");
+        }
+        if (!validPageContext(turn.pageContext)) {
+          cleanup(); return fail(req, 400, "Invalid page context", "page_context_invalid");
+        }
+      }
       if (turn.rawMessage.length > cfg.maxMessageChars) {
         cleanup();
         return fail(req, 413, `Message exceeds ${cfg.maxMessageChars} characters`, "too_long");
@@ -1089,6 +1119,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
         conversationId: turn.conversationId,
         agent: turn.agent || undefined,
         identitySession: claims.ids,
+        pageContext: turn.pageContext ?? undefined,
         signal: abort.signal,
       });
     } catch (e) {

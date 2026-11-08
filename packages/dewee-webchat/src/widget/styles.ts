@@ -244,6 +244,9 @@ details > summary svg.ic { width: 14px; height: 14px; flex: none; }
 
 /* ---------- composer ---------- */
 .composer { padding: 10px 12px 12px; border-top: 1px solid var(--dw-border); background: var(--dw-bg); }
+.page-context { font-size: 12px; margin-bottom: 8px; }
+.page-context label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.page-preview { max-height: 96px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 6px; margin: 6px 0; border: 1px solid var(--dw-border); border-radius: 6px; font: inherit; }
 .box {
   display: flex; align-items: flex-end; gap: 8px; border: 1px solid var(--dw-border); border-radius: 14px;
   padding: 6px 6px 6px 12px; background: var(--dw-bg); transition: border-color .15s, box-shadow .15s;

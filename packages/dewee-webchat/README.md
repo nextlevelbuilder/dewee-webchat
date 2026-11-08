@@ -368,6 +368,16 @@ used), `allowInsecureHttp` does not apply, a user switch under `rebindEachReques
 previous user's session at CCP, and logout revokes it through [`handler.revoke`](#signed-in-users).
 The integration's sign-in mode must allow signed-in users.
 
+### Hosted credential requests
+
+Credential requests are off by default and require CCP transport, signed-in identity, and Gateway/CCP
+support enabled for the agent. To opt in, add `credentialRequests: { formOrigin: "https://app.example.com" }`
+to the server handler options, using the exact HTTPS origin of your Dewee-hosted form. Use the ASCII
+punycode form for an internationalized domain. The form is
+opened only after the visitor chooses it; a workspace approval administrator must authenticate there.
+The widget never collects the credential value. Anonymous sessions, direct Gateway transport, and
+an untrusted form origin cannot use this flow. See the [HTTP contract](../../docs/http-contract.md#hosted-credential-requests).
+
 ```ts
 import { createDeweeHandler, optionsFromEnv } from "dewee-webchat/server";
 import { deweeIdentitySdk } from "dewee-webchat/server/identity";

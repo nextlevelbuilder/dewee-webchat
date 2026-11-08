@@ -94,10 +94,14 @@ Each SSE frame is `data: <json>\n\n`; `: ping` comments keep the connection aliv
 | `delta`       | `text` (answer delta)                    |
 | `tool_call`   | `id`, `name`, `arguments`                |
 | `tool_result` | `id`, `name`, `isError`, `result`        |
+| `credential_request` | `credentialRequest` (CCP signed-in hosted flow only) |
 | `done`        | `content` (full answer), `usage?`        |
 | `error`       | `message`, `code?`, `remediation?`, `retryAfterMs?` |
 
 Every run ends with `done` or `error`, after which the server closes the stream.
+Direct Gateway transport omits `request_credentials` tool calls and their results, and omits
+unmatched or malformed tool results, so credential handoffs cannot appear as tool output. CCP
+continues to expose tool names and statuses only.
 
 ### Admission errors
 
@@ -338,6 +342,27 @@ Headers: `Authorization: Bearer <visitor token>`. Returns the visitor's own conv
     "toolCalls": [{ "id": "t1", "name": "search", "arguments": {}, "result": "…", "status": "done" }] }
 ] }
 ```
+
+## Hosted credential requests
+
+CCP transport with identity and the backend's explicit `credentialRequests.formOrigin` opt-in can
+forward the Gateway's `credential_request` SSE event as `{type: "credential_request", credentialRequest}`.
+History adds `credentialRequests` when the verified visitor has requests. Each card contains only
+the value-free `webchat-credential-request.v1` metadata; the widget does not persist it.
+
+`POST {base}/credential-request`, `/credential-request-handoff` and `/credential-request-cancel`
+accept `{agent, conversationId, credentialRequestId}` and a verified visitor bearer. They require an
+HTTPS Origin and reauthenticate the current host user. Status and cancel return `{credentialRequest}`;
+handoff returns `{credential_request_id, url, expires_at}` with `Cache-Control: no-store`. The URL
+must use the configured HTTPS origin and the Dewee hosted-form route. It contains a short-lived token;
+do not log, cache, publish, or add it to chat messages. The hosted form independently requires a
+workspace approval administrator.
+
+After completion, `POST /chat` with an empty `message` and `credentialRequestId` resumes the bound
+conversation. Gateway enforces one continuation; `credential_request_not_ready` and
+`credential_request_resumed` are 409, `credential_request_not_found` is 404, and
+`credential_requests_unavailable` is 403. Anonymous sessions and unconfigured backends cannot use
+these routes. The request and SSE responses use `no-store`.
 
 ## Extra request headers
 

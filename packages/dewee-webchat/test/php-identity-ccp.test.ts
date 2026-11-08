@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,23 +15,24 @@ const source = resolve(__dirname, "../../../php/dewee-webchat.php");
 const secret = "fixture-visitor-secret-at-least-32-bytes";
 
 describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
-  let ccp: FakeCcp, server: ChildProcess, base: string;
+  let ccp: FakeCcp, server: ChildProcess, base: string, temp: string;
   beforeAll(async () => {
     ccp = await startFakeCcp();
     const dir = mkdtempSync(join(tmpdir(), "webchat-identity-"));
+    temp = join(dir, "tmp"); mkdirSync(temp);
     const options = { ccp: { chatUrl: ccp.url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET }, secret, rateLimit: false, allowedOrigins: '*', identity: { appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, rebindEachRequest: true } };
     writeFileSync(join(dir, "options.json"), JSON.stringify(options));
-    writeFileSync(join(dir, "router.php"), `<?php\nrequire ${JSON.stringify(source)};\n$o=json_decode(file_get_contents(__DIR__.'/options.json'),true);\n$o['identity']['authenticate']=static function(){ $u=$_COOKIE['uid'] ?? null; if ($u === 'boom') throw new RuntimeException('private login error'); return $u ? ['subject'=>$u] : null; };\nif (str_ends_with($_SERVER['REQUEST_URI'], '/logout')) { $body=json_decode(file_get_contents('php://input'),true); DeweeWebchat::revoke($_COOKIE['uid'] ?? '', $body['token'] ?? '', $o); echo '{}'; return; }\nDeweeWebchat::handle($o);\n`);
+    writeFileSync(join(dir, "router.php"), `<?php\nrequire ${JSON.stringify(source)};\n$o=json_decode(file_get_contents(__DIR__.'/options.json'),true);\nif (in_array(($_SERVER['HTTP_X_TEST_FEATURE'] ?? ''), ['on','support'], true)) $o['credentialRequests']=['formOrigin'=>'https://app.example'];\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'support') $o['identity']['agent']='support';\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'unicode') $o['credentialRequests']=['formOrigin'=>'https://bücher.example'];\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'punycode') $o['credentialRequests']=['formOrigin'=>'https://xn--bcher-kva.example'];\n$o['identity']['authenticate']=static function(){ $u=$_COOKIE['uid'] ?? null; if ($u === 'boom') throw new RuntimeException('private login error'); return $u ? ['subject'=>$u] : null; };\nif (str_ends_with($_SERVER['REQUEST_URI'], '/logout')) { $body=json_decode(file_get_contents('php://input'),true); DeweeWebchat::revoke($_COOKIE['uid'] ?? '', $body['token'] ?? '', $o); echo '{}'; return; }\nDeweeWebchat::handle($o);\n`);
     const port = await new Promise<number>((done) => { const s = createServer().listen(0, "127.0.0.1", () => { const p = (s.address() as { port: number }).port; s.close(() => done(p)); }); });
     base = `http://127.0.0.1:${port}/api/dewee`;
-    server = spawn(php, ["-S", `127.0.0.1:${port}`, join(dir, "router.php")], { stdio: "ignore" });
+    server = spawn(php, ["-d", `sys_temp_dir=${temp}`, "-S", `127.0.0.1:${port}`, join(dir, "router.php")], { stdio: "ignore" });
     for (let i = 0; i < 100; i++) {
       try { await fetch(`${base}/config`); return; } catch { await new Promise((r) => setTimeout(r, 100)); }
     }
     throw new Error("PHP server did not start");
   }, 30000);
   afterAll(async () => { server?.kill("SIGTERM"); await ccp?.close(); });
-  beforeEach(() => { ccp.reset(); ccp.state.config = { ...ccp.state.config, mode: "signed_in_optional", identity_enabled: true }; });
+  beforeEach(() => { ccp.reset(); ccp.state.config = { ...ccp.state.config, mode: "signed_in_optional", identity_enabled: true }; for (const name of readdirSync(temp).filter(x => /^dewee-webchat-\d+$/.test(x))) for (const file of readdirSync(join(temp,name)).filter(x=>x.startsWith("ccp-config-"))) rmSync(join(temp,name,file),{force:true}); });
   const session = (uid?: string) => fetch(`${base}/session`, { method: "POST", headers: uid ? { cookie: `uid=${uid}` } : {}, body: "{}" });
 
   it("exchanges a signed-in host user and keeps other users isolated", async () => {
@@ -49,6 +50,11 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     expect(ca?.v).not.toBe(cb?.v);
     expect(ccp.routes("identity/exchange")).toHaveLength(2);
     expect(JSON.stringify(a)).not.toContain(ca!.ids!);
+  });
+
+  it("requires an ASCII credential form origin and accepts punycode", async () => {
+    expect((await fetch(`${base}/config`, {headers:{"x-test-feature":"unicode"}})).status).toBe(500);
+    expect((await fetch(`${base}/config`, {headers:{"x-test-feature":"punycode"}})).status).toBe(200);
   });
 
   it("fails closed when the host login check throws", async () => {
@@ -86,6 +92,46 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     expect(ccp.routes("history").at(-1)?.body.identity_session).toBe(claims?.ids);
     expect((await send("user-b")).status).toBe(401);
     expect(ccp.routes("identity/revoke")).toHaveLength(1);
+  });
+
+  it("mirrors the hosted credential request contract without exposing values", async () => {
+    ccp.state.config = { ...ccp.state.config, credential_requests: true };
+    const id = "0b7e4c1e-2f6a-4d1b-9c3e-5a8f7d6e4b21";
+    const card = { id, schema_version: "webchat-credential-request.v1", status: "pending", title: "Connect", purpose: "Provide key", target: { type: "provider", mode: "create" }, fields: [{ key: "api_key", label: "Key", kind: "secret", required: true, value: "never-forward" }], expires_at: new Date(Date.now()+3600000).toISOString(), agent_key: "shop", completion: "hosted", resumable: false };
+    ccp.state.credentialCard = card;
+    const issued = await (await session("user-a")).json();
+    const headers = { cookie: "uid=user-a", origin: "https://shop.example", authorization: `Bearer ${issued.token}`, "x-test-feature": "on" };
+    const chat = await fetch(`${base}/chat`, { method: "POST", headers, body: JSON.stringify({ message: "hello", conversationId: "conv_php_cred_1", agent: "shop" }) });
+    expect(chat.headers.get("cache-control")).toContain("no-store");
+    const text = await chat.text(); expect(text).toContain('"type":"credential_request"'); expect(text).not.toContain("never-forward");
+    const history = await fetch(`${base}/history?agent=shop&conversationId=conv_php_cred_1`, { headers });
+    const stored = await history.json(); expect(stored.credentialRequests[0].id).toBe(id); expect(JSON.stringify(stored)).not.toContain("never-forward");
+    const body = JSON.stringify({ agent: "shop", conversationId: "conv_php_cred_1", credentialRequestId: id });
+    const status = await fetch(`${base}/credential-request`, { method: "POST", headers, body });
+    expect(status.status).toBe(200); expect((await status.json()).credentialRequest.id).toBe(id);
+    const foreign = await fetch(`${base}/credential-request`, { method: "POST", headers, body: JSON.stringify({ agent: "shop", conversationId: "foreign_conv_1", credentialRequestId: id }) });
+    expect(foreign.status).toBe(404); expect((await foreign.json()).error.code).toBe("credential_request_not_found");
+    const handoff = await fetch(`${base}/credential-request-handoff`, { method: "POST", headers, body });
+    expect(handoff.status).toBe(200); expect(handoff.headers.get("cache-control")).toBe("no-store"); expect((await handoff.json()).url).toBe("https://app.example/credential-requests/open?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    const resume = await fetch(`${base}/chat`, { method: "POST", headers, body: JSON.stringify({ agent: "shop", conversationId: "conv_php_cred_1", message: "", credentialRequestId: id }) });
+    expect(resume.status).toBe(200); await resume.text(); expect(ccp.routes("chat").at(-1)?.body).toMatchObject({ message: "", credential_request_id: id });
+    expect((await fetch(`${base}/chat`, { method: "POST", headers, body: JSON.stringify({ agent: "shop", conversationId: "conv_php_cred_1", message: "do not accept", credentialRequestId: id }) })).status).toBe(400);
+    ccp.state.credentialHandoffUrl = "https://evil.example/credential-requests/open?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    expect((await fetch(`${base}/credential-request-handoff`, { method: "POST", headers, body })).status).toBe(502);
+    expect((await fetch(`${base}/credential-request`, { method: "POST", headers: { ...headers, cookie: "uid=user-b" }, body })).status).toBe(401);
+  });
+
+  it.each([false, true])("defers selected-agent credential policy to the runtime when default capability is %s", async (defaultEnabled) => {
+    ccp.state.config = { ...ccp.state.config, credential_requests: defaultEnabled };
+    const id = "0b7e4c1e-2f6a-4d1b-9c3e-5a8f7d6e4b21";
+    ccp.state.credentialCard = { id, schema_version:"webchat-credential-request.v1", status:"pending", title:"Connect", purpose:"Key", target:{type:"provider",mode:"create"}, fields:[], expires_at:new Date(Date.now()+3600000).toISOString(), agent_key:"support", completion:"hosted", resumable:false };
+    const issued = await (await fetch(`${base}/session`, { method:"POST", headers:{cookie:"uid=user-a", "x-test-feature":"support"}, body:"{}" })).json();
+    const headers = {cookie:"uid=user-a", origin:"https://shop.example", authorization:`Bearer ${issued.token}`, "x-test-feature":"support"};
+    const chat = await fetch(`${base}/chat`, {method:"POST",headers,body:JSON.stringify({agent:"support",conversationId:"conv_php_agent_1",message:"hi"})});
+    expect(await chat.text()).toContain('"type":"credential_request"');
+    if (defaultEnabled) ccp.state.failNext.set("credential-request", {status:403,code:"credential_requests_unavailable"});
+    const status = await fetch(`${base}/credential-request`, {method:"POST",headers,body:JSON.stringify({agent:"support",conversationId:"conv_php_agent_1",credentialRequestId:id})});
+    expect(status.status).toBe(defaultEnabled ? 403 : 200);
   });
 
   it("starts account linking only for the authenticated session", async () => {

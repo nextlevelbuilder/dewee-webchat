@@ -1,5 +1,6 @@
 // Browser client for the dewee-webchat backend HTTP contract.
 import { parseJobAccessLaunch, type JobAccessLaunch } from "../job-access";
+import { parseCredentialHandoff, parseCredentialRequest, type CredentialHandoff, type CredentialRequestView } from "../credential-request";
 import {
   HEADER_GATEWAY_TOKEN,
   HEADER_GATEWAY_URL,
@@ -345,10 +346,37 @@ export class ApiClient {
   }
 
   async history(agent: string, conversationId: string): Promise<HistoryMessage[]> {
+    return (await this.historyDetails(agent, conversationId)).messages;
+  }
+
+  async historyDetails(agent: string, conversationId: string): Promise<{ messages: HistoryMessage[]; credentialRequests: CredentialRequestView[] }> {
     const res = await this.signedInRequest(async () =>
       this.request(this.url("history", { agent, conversationId }), { headers: await this.headers(true) }),
     );
-    return (await this.parse<{ messages: HistoryMessage[] }>(res)).messages;
+    const data = await this.parse<{ messages: HistoryMessage[]; credentialRequests?: unknown[] }>(res);
+    const cards = this.session?.verified && this.config?.credentialFormOrigin && Array.isArray(data.credentialRequests)
+      ? data.credentialRequests.slice(0, 100).map((v) => parseCredentialRequest(v, agent)).filter((v): v is CredentialRequestView => v !== null) : [];
+    return { messages: data.messages, credentialRequests: cards };
+  }
+
+  /** Never retry a credential action under a newly authenticated identity. */
+  async credentialRequest(route: "credential-request" | "credential-request-handoff" | "credential-request-cancel", agent: string, conversationId: string, credentialRequestId: string, signal?: AbortSignal): Promise<CredentialRequestView | CredentialHandoff> {
+    const session = await this.ensureSession();
+    const origin = (await this.getConfig()).credentialFormOrigin;
+    if (!session.verified || !origin) throw new ApiError("Credential request is unavailable", 403, "credential_request_unavailable");
+    try {
+      const headers = await this.headers(true);
+      if (this.session !== session) throw new Error("identity changed");
+      const response = await this.request(this.url(route), { method: "POST", headers, body: JSON.stringify({ agent, conversationId, credentialRequestId }), redirect: "error", signal });
+      const data = await this.parse<{ credentialRequest?: unknown }>(response);
+      if (this.session !== session) throw new Error("identity changed");
+      const result = route === "credential-request-handoff" ? parseCredentialHandoff(data, credentialRequestId, origin) : parseCredentialRequest(data.credentialRequest, agent);
+      if (!result || ("id" in result && result.id !== credentialRequestId)) throw new Error("invalid credential request");
+      return result;
+    } catch (error) {
+      const code = error instanceof ApiError && ["credential_requests_unavailable", "credential_request_not_found", "credential_request_not_ready", "credential_request_resumed"].includes(error.code ?? "") ? error.code : "credential_request_unavailable";
+      throw new ApiError("Credential request is unavailable", error instanceof ApiError ? error.status : 0, code);
+    }
   }
 
   /**
@@ -373,7 +401,7 @@ export class ApiClient {
   ): Promise<void> {
     await this.ensureSession();
     let res = await this.request(this.url("chat"), { method: "POST", headers: await this.headers(true), body: JSON.stringify(input), signal });
-    if (res.status === 401) {
+    if (res.status === 401 && !input.credentialRequestId) {
       const before = this.visitorId();
       this.forgetSession();
       await this.ensureSession();
@@ -398,6 +426,11 @@ export class ApiClient {
         if (!data) continue;
         let event: ChatStreamEvent;
         try { event = JSON.parse(data) as ChatStreamEvent; } catch { continue; /* malformed frame */ }
+        if (event.type === "credential_request") {
+          const view = this.session?.verified && this.config?.credentialFormOrigin ? parseCredentialRequest(event.credentialRequest, input.agent) : null;
+          if (!view) continue;
+          event = { type: "credential_request", credentialRequest: view };
+        }
         if (event.type === "error" && event.code && RENEW_CODES.has(event.code)) renew = true;
         try { onEvent(event); } catch { /* a failing listener never breaks the stream */ }
       }

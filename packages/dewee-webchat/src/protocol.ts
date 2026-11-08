@@ -8,6 +8,7 @@ export type ChatStreamEvent =
   | { type: "delta"; text: string }
   | { type: "tool_call"; id: string; name: string; arguments?: unknown }
   | { type: "tool_result"; id: string; name: string; isError: boolean; result?: string }
+  | { type: "credential_request"; credentialRequest: import("./credential-request").CredentialRequestView }
   | { type: "done"; content: string; usage?: Record<string, number> }
   | { type: "error"; message: string; code?: string; remediation?: Remediation; retryAfterMs?: number };
 
@@ -75,6 +76,8 @@ export interface PublicConfig {
   pageContextVersions?: number[];
   /** Present (true) when the backend signs users in through Dewee: the widget then asks `/session` on every page load. */
   identity?: boolean;
+  /** Trusted origin of the hosted credential form, present only when explicitly enabled. */
+  credentialFormOrigin?: string;
   /**
    * Present (true) when a returning visitor's `/session` refresh (a valid anonymous `token` in the
    * body) needs no Turnstile token (ccp transport); only new visitors are challenged then. With
@@ -181,6 +184,7 @@ export interface ChatRequestBody {
   pageContext?: unknown;
   /** Ephemeral, untrusted content for this turn; distinct from the legacy page-action context. */
   page_context?: import("./widget/page-context").PageContextAttachment;
+  credentialRequestId?: string;
 }
 
 export const HEADER_GATEWAY_URL = "x-dewee-gateway-url";

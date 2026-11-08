@@ -7,7 +7,7 @@
 // another origin. Nothing a visitor sends ever becomes part of a URL.
 
 /** Routes of the public ingress this client calls. Fixed names: callers cannot inject path segments. */
-export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "link" | "job-access";
+export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "link" | "job-access" | "credential-request" | "credential-request-handoff" | "credential-request-cancel";
 
 /** Validated CCP endpoint options (see {@link parseCcpOptions}). */
 export interface CcpOptions {
@@ -133,6 +133,7 @@ export interface CcpRequest {
   idempotencyKey?: string;
   accept?: string;
   signal?: AbortSignal;
+  credentialRequests?: boolean;
 }
 
 /** Thin client bound to one validated ingress base. */
@@ -161,6 +162,7 @@ export class CcpClient {
     if (req.visitorIp && VISITOR_IP_RE.test(req.visitorIp)) headers["x-dewee-visitor-ip"] = req.visitorIp;
     if (req.requestId) headers["x-request-id"] = req.requestId;
     if (req.idempotencyKey) headers["idempotency-key"] = req.idempotencyKey;
+    if (req.credentialRequests) headers["x-dewee-webchat-features"] = "credential-requests";
     let res: Response;
     try {
       // "manual" instead of "error": Cloudflare Workers reject redirect "error"; a 3xx (or an opaque

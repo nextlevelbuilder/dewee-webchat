@@ -7,6 +7,7 @@
 // shown, quotas, and every authorization of the visitor. Nothing CCP says is passed to a browser
 // verbatim: events and errors are rebuilt from known fields with this module's own messages.
 import { stripPageBlock } from "../actions/page-block";
+import { parseCredentialRequest, type CredentialRequestView } from "../credential-request";
 import { parseJobAccessLaunch, type JobAccessLaunch } from "../job-access";
 import { isAdmissionErrorCode, isIdentityErrorCode, type AdmissionErrorCode, type AgentInfo, type ChatStreamEvent, type HistoryMessage, type IdentityErrorCode, type LinkResponse, type Remediation, type ToolCallView } from "../protocol";
 import { CcpClient, CcpError, knownRemediation, readSseJson, type CcpRequest, type CcpRoute } from "./ccp-client";
@@ -113,6 +114,13 @@ export function browserErrorFor(e: unknown, route: CcpRoute): BrowserError {
     if (e.code === "rate_limited" || e.code === "concurrency_limited" || e.status === 429) return { status: 429, code: "RATE_LIMITED", message: "", admission: "RATE_LIMITED", retryAfterMs };
   }
   switch (e.code) {
+    case "credential_requests_unavailable":
+      return { status: 403, code: e.code, message: "Credential requests are unavailable" };
+    case "credential_request_not_found":
+      return { status: 404, code: e.code, message: "Credential request not found" };
+    case "credential_request_not_ready":
+    case "credential_request_resumed":
+      return { status: 409, code: e.code, message: "Credential request cannot be resumed" };
     case "page_context_invalid":
       return { status: 400, code: e.code, message: "Invalid page context" };
     case "page_context_unsupported":
@@ -231,7 +239,7 @@ export interface CcpExchangeResult {
 
 export type CcpTransport = ReturnType<typeof createCcpTransport>;
 
-export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps) {
+export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps, credentialRequests = false) {
   let config: { value: CcpConfig; at: number } | undefined;
   let pendingConfig: Promise<CcpConfig> | undefined;
   const edges = new Map<string, EdgeSession>();
@@ -330,7 +338,7 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
       ctx: VisitorContext,
       visitorId: string,
       sealed: EdgeSession | undefined,
-      input: { message: string; conversationId: string; agent?: string; identitySession?: string; pageContext?: unknown; signal: AbortSignal },
+      input: { message: string; conversationId: string; agent?: string; identitySession?: string; pageContext?: unknown; credentialRequestId?: string; signal: AbortSignal },
     ): Promise<Response> {
       const body = {
         message: input.message,
@@ -338,8 +346,9 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
         ...withAgent(input.agent),
         ...(input.identitySession ? { identity_session: input.identitySession } : {}),
         ...(input.pageContext !== undefined ? { page_context: input.pageContext } : {}),
+        ...(input.credentialRequestId ? { credential_request_id: input.credentialRequestId } : {}),
       };
-      return withEdge(ctx, visitorId, sealed, (edge) => client.send("chat", { ...base(ctx), body, session: edge.token, accept: "text/event-stream", signal: input.signal }));
+      return withEdge(ctx, visitorId, sealed, (edge) => client.send("chat", { ...base(ctx), body, session: edge.token, accept: "text/event-stream", signal: input.signal, credentialRequests: credentialRequests && !!input.identitySession }));
     },
 
     /**
@@ -347,7 +356,7 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
      * (`done` or `error`) last. Reasoning and tool frames pass only when the integration shows them,
      * tool arguments and results never; unknown frames are dropped.
      */
-    async *chatEvents(res: Response, cfg: CcpConfig, conversationId: string, requestedAgent: string): AsyncGenerator<ChatStreamEvent> {
+    async *chatEvents(res: Response, cfg: CcpConfig, conversationId: string, requestedAgent: string, verified = false): AsyncGenerator<ChatStreamEvent> {
       let started = false;
       const start = (f?: any): ChatStreamEvent => {
         started = true;
@@ -380,6 +389,11 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
           case "tool_result":
             if (cfg.showToolActivity && typeof f.id === "string" && typeof f.name === "string") yield { type: "tool_result", id: f.id.slice(0, 128), name: f.name.slice(0, 128), isError: f.isError === true };
             break;
+          case "credential_request": {
+            const view = credentialRequests && verified ? parseCredentialRequest(f.credential_request, requestedAgent) : null;
+            if (view) yield { type: "credential_request", credentialRequest: view };
+            break;
+          }
           case "done": {
             const usage = numericUsage(f.usage);
             yield { type: "done", content: typeof f.content === "string" ? f.content : "", ...(usage ? { usage } : {}) };
@@ -408,7 +422,7 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
     },
 
     /** The visitor's own conversation, folded for the widget. An unknown or foreign conversation is empty. */
-    async history(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { conversationId: string; agent?: string; identitySession?: string }): Promise<HistoryMessage[]> {
+    async history(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { conversationId: string; agent?: string; identitySession?: string }): Promise<{ messages: HistoryMessage[]; credentialRequests?: CredentialRequestView[] }> {
       const cfg = await getConfig();
       const body = {
         conversation_id: input.conversationId,
@@ -418,9 +432,9 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
       };
       let data: Record<string, any>;
       try {
-        data = await withEdge(ctx, visitorId, sealed, (edge) => client.json("history", { ...base(ctx), body, session: edge.token }));
+        data = await withEdge(ctx, visitorId, sealed, (edge) => client.json("history", { ...base(ctx), body, session: edge.token, credentialRequests: credentialRequests && !!input.identitySession }));
       } catch (e) {
-        if (e instanceof CcpError && e.code === "not_found") return [];
+        if (e instanceof CcpError && e.code === "not_found") return { messages: [] };
         throw e;
       }
       const out: HistoryMessage[] = [];
@@ -442,7 +456,15 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
         if (!msg.content && !msg.thinking && !msg.toolCalls) continue;
         out.push(msg);
       }
-      return out;
+      const cards = credentialRequests && input.identitySession && Array.isArray(data.credential_requests)
+        ? data.credential_requests.slice(0, 100).map((view: unknown) => parseCredentialRequest(view, input.agent || cfg.defaultAgent)).filter((view: CredentialRequestView | null): view is CredentialRequestView => view !== null)
+        : [];
+      return { messages: out, ...(cards.length ? { credentialRequests: cards } : {}) };
+    },
+
+    async credentialRequest(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, route: "credential-request" | "credential-request-handoff" | "credential-request-cancel", input: { conversationId: string; requestId: string; agent: string; identitySession: string }): Promise<unknown> {
+      return withEdge(ctx, visitorId, sealed, (edge) => client.json(route, { ...base(ctx), session: edge.token, credentialRequests: true,
+        body: { conversation_id: input.conversationId, credential_request_id: input.requestId, identity_session: input.identitySession, agent: input.agent } }));
     },
 
     /**

@@ -126,6 +126,7 @@ final class DeweeWebchat
     private ?DeweeCcpClient $ccp = null;
     private ?array $identity = null;
     private string $identityAgent = '';
+    private ?string $credentialFormOrigin = null;
 
     /**
      * Handles the current request and writes the response.
@@ -312,6 +313,13 @@ final class DeweeWebchat
             $this->identity = $identity;
             $this->identityAgent = $agent;
         }
+        if (isset($this->o['credentialRequests'])) {
+            $options = $this->o['credentialRequests'];
+            $origin = is_array($options) ? ($options['formOrigin'] ?? null) : null;
+            $u = is_string($origin) ? parse_url($origin) : false;
+            if ($this->ccp === null || $this->identity === null || !is_string($origin) || preg_match('/[^\x21-\x7e]|[\\\\%]/', $origin) || !is_array($u) || strtolower($u['scheme'] ?? '') !== 'https' || empty($u['host']) || isset($u['user']) || isset($u['pass']) || isset($u['query']) || isset($u['fragment']) || !in_array($u['path'] ?? '', ['', '/'], true)) throw new DeweeConfigError('[dewee-webchat] credentialRequests requires CCP identity and an ASCII HTTPS form origin (use punycode for internationalized domains)');
+            $this->credentialFormOrigin = 'https://' . strtolower($u['host']) . (isset($u['port']) && $u['port'] !== 443 ? ':' . $u['port'] : '');
+        }
     }
 
     /**
@@ -427,6 +435,7 @@ final class DeweeWebchat
                 $method === 'GET' && $action === 'image' && !empty($this->o['imageSources']) => $this->handleImage(),
                 $method === 'POST' && $action === 'link' && $this->identity !== null => $this->handleLink(),
                 $method === 'POST' && $action === 'job-access' && $this->identity !== null => $this->handleJobAccess(),
+                $method === 'POST' && in_array($action, ['credential-request', 'credential-request-handoff', 'credential-request-cancel'], true) => $this->handleCredentialRequest($action),
                 default => $this->fail(404, 'Not found', 'not_found'),
             };
         } catch (DeweeRateLimitUnavailable) {
@@ -935,6 +944,38 @@ final class DeweeWebchat
         catch (Throwable) { $this->fail(502, 'Job access is unavailable. Try again later.', 'job_access_unavailable'); }
     }
 
+    private function handleCredentialRequest(string $route): void
+    {
+        if ($this->ccp === null || $this->identity === null || $this->credentialFormOrigin === null) { $this->fail(404, 'Not found', 'not_found'); return; }
+        $origin = self::header('origin') ?? '';
+        $parsed = parse_url($origin);
+        if (!is_array($parsed) || ($parsed['scheme'] ?? '') !== 'https' || empty($parsed['host']) || isset($parsed['user']) || isset($parsed['pass']) || isset($parsed['path']) || isset($parsed['query']) || isset($parsed['fragment']) || (isset($parsed['port']) && $parsed['port'] === 443) || $origin !== 'https://' . strtolower($parsed['host']) . (isset($parsed['port']) ? ':' . $parsed['port'] : '')) { $this->fail(403, 'Origin not allowed', 'forbidden_origin'); return; }
+        $claims = $this->claimsFromRequest();
+        if (!isset($claims['ids'], $claims['ida'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims, true)) return;
+        if (!$this->rateLimit('credential:' . $claims['v'], $route === 'credential-request-handoff' ? 'link' : 'preauth')) { $this->fail(429, 'Too many requests', 'rate_limited'); return; }
+        $raw = file_get_contents('php://input', false, null, 0, 8193);
+        $body = is_string($raw) && strlen($raw) <= 8192 ? json_decode($raw, true) : null;
+        if (!is_array($body) || array_diff(array_keys($body), ['agent', 'conversationId', 'credentialRequestId']) || !is_string($body['conversationId'] ?? null) || !preg_match(self::CCP_ID_RE, $body['conversationId']) || !is_string($body['credentialRequestId'] ?? null) || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iD', $body['credentialRequestId'])) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
+        $asked = self::ccpAgentFor($body['agent'] ?? null);
+        if ($asked === null) { $this->fail(400, 'Invalid agent'); return; }
+        if ($asked !== '' && $asked !== $claims['ida']) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+        $agent = $claims['ida'];
+        try {
+            $ctx = $this->visitorContext();
+            $input = ['conversation_id' => $body['conversationId'], 'credential_request_id' => $body['credentialRequestId'], 'identity_session' => $claims['ids'], 'agent' => $agent];
+            $result = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json($route, $ctx + ['body' => $input, 'session' => $edge['token'], 'credentialRequests' => true]));
+            if ($route === 'credential-request-handoff') {
+                $handoff = self::parseCredentialHandoff($result, $body['credentialRequestId'], $this->credentialFormOrigin);
+                if ($handoff === null) { $this->fail(502, 'Credential request is unavailable', 'credential_request_unavailable'); return; }
+                $this->json($handoff); return;
+            }
+            $view = self::parseCredentialRequest($result['credential_request'] ?? null, $agent);
+            if ($view === null || $view['id'] !== $body['credentialRequestId']) { $this->fail(502, 'Credential request is unavailable', 'credential_request_unavailable'); return; }
+            $this->json(['credentialRequest' => $view]);
+        } catch (DeweeCcpError $e) { $this->ccpFail($e, $route); }
+    }
+
     private function handleLink(): void
     {
         $claims = $this->claimsFromRequest();
@@ -1025,7 +1066,14 @@ final class DeweeWebchat
         $body = is_string($raw) ? json_decode($raw, true) : null;
         if (!$rawBody instanceof stdClass || !is_array($body)) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
         $message = is_string($body['message'] ?? null) ? self::jsTrim($body['message']) : '';
-        if ($message === '') {
+        $resume = $body['credentialRequestId'] ?? null;
+        if (array_key_exists('credentialRequestId', $body) && $resume === null) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
+        if ($resume !== null) {
+            $origin = self::header('origin') ?? ''; $parsed = parse_url($origin);
+            if ($this->ccp === null || $this->credentialFormOrigin === null || !isset($claims['ids']) || !is_string($resume) || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iD', $resume) || (array_key_exists('message', $body) && !is_string($body['message'])) || $message !== '' || isset($body['actions']) || isset($body['pageContext']) || isset($body['page_context']) || !is_string($body['conversationId'] ?? null) || !preg_match(self::CCP_ID_RE, $body['conversationId'])) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
+            if (!is_array($parsed) || ($parsed['scheme'] ?? '') !== 'https' || empty($parsed['host']) || isset($parsed['user']) || isset($parsed['pass']) || isset($parsed['path']) || isset($parsed['query']) || isset($parsed['fragment']) || (isset($parsed['port']) && $parsed['port'] === 443) || $origin !== 'https://' . strtolower($parsed['host']) . (isset($parsed['port']) ? ':' . $parsed['port'] : '')) { $this->fail(403, 'Origin not allowed', 'forbidden_origin'); return; }
+            if (!$this->identityRebind($claims, true)) return;
+        } elseif ($message === '') {
             $this->fail(400, 'Message is required');
             return;
         }
@@ -1074,7 +1122,7 @@ final class DeweeWebchat
             if (!self::validPageContext($context)) { $this->fail(400, 'Invalid page context', 'page_context_invalid'); return; }
         }
         if ($this->ccp !== null) {
-            $this->ccpChat($claims, $pageBlock . $message, $message, $conversationId, $agent, $actionsHash, $context);
+            $this->ccpChat($claims, $pageBlock . $message, $message, $conversationId, $agent, $actionsHash, $context, $resume);
             return;
         }
         if ($creds === null) {
@@ -1256,6 +1304,7 @@ final class DeweeWebchat
             'refreshWithoutTurnstile' => !empty($this->o['turnstile']) ? true : null,
             'maxMessageLength' => min((int) $this->o['maxMessageLength'], $cfg['maxMessageChars']),
             'pageContextVersions' => !empty($cfg['pageContextVersions']) ? $cfg['pageContextVersions'] : null,
+            'credentialFormOrigin' => $this->credentialFormOrigin,
             'version' => self::VERSION,
         ]));
     }
@@ -1278,7 +1327,7 @@ final class DeweeWebchat
      *
      * @param array{v: string, es?: string, ese?: int|float} $claims
      */
-    private function ccpChat(array $claims, string $message, string $rawMessage, string $conversationId, string $agent, ?string $actionsHash, mixed $context): void
+    private function ccpChat(array $claims, string $message, string $rawMessage, string $conversationId, string $agent, ?string $actionsHash, mixed $context, ?string $resume = null): void
     {
         $visitorId = $claims['v'];
         $ctx = $this->visitorContext();
@@ -1297,19 +1346,19 @@ final class DeweeWebchat
             $this->fail(413, "Message exceeds {$cfg['maxMessageChars']} characters", 'too_long');
             return;
         }
-        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []) + ($context !== null ? ['page_context' => $context] : []);
+        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []) + ($context !== null ? ['page_context' => $context] : []) + ($resume !== null ? ['credential_request_id' => $resume] : []);
         $edge = null;
         try {
-            $fp = $this->withEdge($ctx, $visitorId, self::sealedEdge($claims), function (array $e) use ($ctx, $body, &$edge) {
+            $fp = $this->withEdge($ctx, $visitorId, self::sealedEdge($claims), function (array $e) use ($ctx, $body, $claims, &$edge) {
                 $edge = $e;
-                return $this->ccp->open('chat', $ctx + ['body' => $body, 'session' => $e['token'], 'accept' => 'text/event-stream']);
+                return $this->ccp->open('chat', $ctx + ['body' => $body, 'session' => $e['token'], 'accept' => 'text/event-stream', 'credentialRequests' => $this->credentialFormOrigin !== null && isset($claims['ids'])]);
             });
         } catch (DeweeCcpError $e) {
             $this->ccpFail($e, 'chat');
             return;
         }
 
-        $this->beginEventStream();
+        $this->beginEventStream(true);
         $lastWrite = microtime(true);
         $aborted = false;
         $write = static function (string $chunk) use (&$lastWrite, &$aborted): bool {
@@ -1366,7 +1415,7 @@ final class DeweeWebchat
                 if (!$started) {
                     $start(null);
                 }
-                $ev = self::ccpStreamEvent($f, $cfg);
+                $ev = self::ccpStreamEvent($f, $cfg, $this->credentialFormOrigin !== null && isset($claims['ids']) ? ($agent !== '' ? $agent : $cfg['defaultAgent']) : null);
                 if ($ev === null) {
                     continue;
                 }
@@ -1427,11 +1476,14 @@ final class DeweeWebchat
      * @param array{showThinking: bool, showToolActivity: bool} $cfg
      * @return array<string, mixed>|null
      */
-    public static function ccpStreamEvent(array $f, array $cfg): ?array
+    public static function ccpStreamEvent(array $f, array $cfg, ?string $credentialAgent = null): ?array
     {
         $id = is_string($f['id'] ?? null) ? substr($f['id'], 0, 128) : null;
         $name = is_string($f['name'] ?? null) ? substr($f['name'], 0, 128) : null;
         switch ($f['type'] ?? null) {
+            case 'credential_request':
+                $view = $credentialAgent !== null ? self::parseCredentialRequest($f['credential_request'] ?? null, $credentialAgent) : null;
+                return $view !== null ? ['type' => 'credential_request', 'credentialRequest' => $view] : null;
             case 'delta':
                 return is_string($f['text'] ?? null) ? ['type' => 'delta', 'text' => $f['text']] : null;
             case 'thinking':
@@ -1519,7 +1571,7 @@ final class DeweeWebchat
         $body = ['conversation_id' => $conversationId, 'limit' => 50] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
         try {
             $cfg = $this->ccpConfig();
-            $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $e) => $this->ccp->json('history', $ctx + ['body' => $body, 'session' => $e['token']]));
+            $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $e) => $this->ccp->json('history', $ctx + ['body' => $body, 'session' => $e['token'], 'credentialRequests' => $this->credentialFormOrigin !== null && isset($claims['ids'])]));
         } catch (DeweeCcpError $e) {
             if ($e->ccpCode === 'not_found') {
                 $this->json(['messages' => []]);
@@ -1528,7 +1580,16 @@ final class DeweeWebchat
             $this->ccpFail($e, 'history');
             return;
         }
-        $this->json(['messages' => self::ccpHistoryMessages(is_array($data['messages'] ?? null) ? $data['messages'] : [], $cfg)]);
+        $out = ['messages' => self::ccpHistoryMessages(is_array($data['messages'] ?? null) ? $data['messages'] : [], $cfg)];
+        if ($this->credentialFormOrigin !== null && isset($claims['ids']) && is_array($data['credential_requests'] ?? null)) {
+            $cards = [];
+            foreach (array_slice($data['credential_requests'], 0, 100) as $raw) {
+                $view = self::parseCredentialRequest($raw, $agent !== '' ? $agent : $cfg['defaultAgent']);
+                if ($view !== null) $cards[] = $view;
+            }
+            if ($cards) $out['credentialRequests'] = $cards;
+        }
+        $this->json($out);
     }
 
     /**
@@ -1695,6 +1756,31 @@ final class DeweeWebchat
         ];
     }
 
+    /** Rebuild only value-free fields of a typed, actor-bound request. */
+    public static function parseCredentialRequest(mixed $raw, string $agent): ?array
+    {
+        if (!is_array($raw) || !is_string($raw['id'] ?? null) || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iD', $raw['id']) || ($raw['schema_version'] ?? null) !== 'webchat-credential-request.v1' || !in_array($raw['status'] ?? null, ['pending','applying','resolved','cancelled','expired','failed'], true) || !is_array($raw['target'] ?? null) || !is_array($raw['fields'] ?? null) || !array_is_list($raw['fields']) || count($raw['fields']) > 32 || ($raw['agent_key'] ?? null) !== $agent || ($raw['completion'] ?? null) !== 'hosted' || !is_bool($raw['resumable'] ?? null)) return null;
+        foreach (['title' => 300, 'purpose' => 4000, 'expires_at' => 64] as $key => $max) if (!is_string($raw[$key] ?? null) || self::utf16Length($raw[$key]) > $max) return null;
+        if (strtotime($raw['expires_at']) === false) return null;
+        foreach (['type', 'mode'] as $key) if (!is_string($raw['target'][$key] ?? null) || self::utf16Length($raw['target'][$key]) > 100) return null;
+        $fields = [];
+        foreach ($raw['fields'] as $field) {
+            if (!is_array($field) || !is_string($field['key'] ?? null) || !preg_match('/^[A-Za-z0-9_.-]{1,100}$/D', $field['key']) || !is_string($field['label'] ?? null) || self::utf16Length($field['label']) > 300 || !is_string($field['kind'] ?? null) || self::utf16Length($field['kind']) > 100 || !is_bool($field['required'] ?? null)) return null;
+            $fields[] = ['key' => $field['key'], 'label' => $field['label'], 'kind' => $field['kind'], 'required' => $field['required']];
+        }
+        return ['id' => $raw['id'], 'schema_version' => $raw['schema_version'], 'status' => $raw['status'], 'title' => $raw['title'], 'purpose' => $raw['purpose'], 'target' => ['type' => $raw['target']['type'], 'mode' => $raw['target']['mode']], 'fields' => $fields, 'expires_at' => $raw['expires_at'], 'agent_key' => $agent, 'completion' => 'hosted', 'resumable' => $raw['resumable']];
+    }
+
+    public static function parseCredentialHandoff(mixed $raw, string $id, string $origin): ?array
+    {
+        if (!is_array($raw) || ($raw['credential_request_id'] ?? null) !== $id || !is_string($raw['url'] ?? null) || strlen($raw['url']) > 4096 || preg_match('/[\x00-\x20\x7f\\\\]/', $raw['url']) || !is_string($raw['expires_at'] ?? null) || strlen($raw['expires_at']) > 64 || ($expires = strtotime($raw['expires_at'])) === false || $expires <= time()) return null;
+        $u = parse_url($raw['url']);
+        if (!is_array($u) || strtolower($u['scheme'] ?? '') !== 'https' || empty($u['host']) || isset($u['user']) || isset($u['pass']) || isset($u['fragment']) || ($u['path'] ?? '') !== '/credential-requests/open' || !is_string($u['query'] ?? null) || !preg_match('/^token=[A-Za-z0-9_-]{43}$/D', $u['query'])) return null;
+        $actual = 'https://' . strtolower($u['host']) . (isset($u['port']) && $u['port'] !== 443 ? ':' . $u['port'] : '');
+        if ($actual !== $origin) return null;
+        return ['credential_request_id' => $id, 'url' => $raw['url'], 'expires_at' => $raw['expires_at']];
+    }
+
     /** Validate the v1 attachment without logging or altering its content. */
     private static function validPageContext(mixed $value): bool
     {
@@ -1853,6 +1939,13 @@ final class DeweeWebchat
         }
         $limited = ['status' => 429, 'code' => 'rate_limited', 'message' => 'Too many messages, please wait a moment'] + ($e->retryAfterSeconds ? ['retryAfterSeconds' => $e->retryAfterSeconds] : []);
         switch ($e->ccpCode) {
+            case 'credential_requests_unavailable':
+                return ['status' => 403, 'code' => $e->ccpCode, 'message' => 'Credential requests are unavailable'];
+            case 'credential_request_not_found':
+                return ['status' => 404, 'code' => $e->ccpCode, 'message' => 'Credential request not found'];
+            case 'credential_request_not_ready':
+            case 'credential_request_resumed':
+                return ['status' => 409, 'code' => $e->ccpCode, 'message' => 'Credential request cannot be resumed'];
             case 'idempotency_key_reused':
                 return ['status' => 409, 'code' => 'idempotency_key_reused', 'message' => 'This idempotency key was already used for a different link request'];
             case 'link_in_progress':
@@ -2579,7 +2672,7 @@ final class DeweeWebchat
         $this->json(['error' => ['message' => $message, 'code' => $code]], $status);
     }
 
-    private function beginEventStream(): void
+    private function beginEventStream(bool $noStore = false): void
     {
         @set_time_limit(0);
         ignore_user_abort(true); // keep running after a disconnect so the gateway run can be aborted
@@ -2595,7 +2688,7 @@ final class DeweeWebchat
         http_response_code(200);
         $this->sendHeaders([
             'Content-Type' => 'text/event-stream; charset=utf-8',
-            'Cache-Control' => 'no-cache, no-transform',
+            'Cache-Control' => $noStore ? 'no-store, no-transform' : 'no-cache, no-transform',
             'X-Accel-Buffering' => 'no',
         ] + $this->corsHeaders());
         @flush();
@@ -2856,7 +2949,7 @@ final class DeweeWebchat
  */
 final class DeweeCcpClient
 {
-    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'link', 'job-access'];
+    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'link', 'job-access', 'credential-request', 'credential-request-handoff', 'credential-request-cancel'];
     private const INTEGRATION_ID_RE = '/^wci_[a-z2-7]{26}$/';
     private const SECRET_RE = '/^dwc_[A-Za-z0-9_-]{16,256}$/';
     private const INGRESS_PATH_RE = '#/api/public/webchat/v1/(wci_[a-z2-7]{26})$#';
@@ -2944,6 +3037,7 @@ final class DeweeCcpClient
             'User-Agent: dewee-webchat-php/' . DeweeWebchat::VERSION,
             'Connection: close',
         ];
+        if (($req['credentialRequests'] ?? false) === true) $headers[] = 'X-Dewee-Webchat-Features: credential-requests';
         $body = null;
         if (isset($req['body'])) {
             $body = (string) json_encode((object) $req['body'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_LINE_TERMINATORS | JSON_INVALID_UTF8_SUBSTITUTE);
@@ -3216,6 +3310,8 @@ final class DeweeGatewayConnection
     {
         $conn = $connection ?? self::connect($creds, $userId);
         $aborted = false;
+        $toolNames = [];
+        $sensitiveToolIds = [];
         try {
             $id = $conn->send('chat.send', ['agentId' => $agent, 'sessionKey' => $sessionKey, 'message' => $message, 'stream' => true] + ($pageContext !== null ? ['pageContext' => $pageContext] : []));
             $deadline = microtime(true) + $timeoutMs / 1000;
@@ -3256,6 +3352,21 @@ final class DeweeGatewayConnection
                     continue;
                 }
                 [$event, $end] = self::mapAgentEvent($frame->payload, $sessionKey);
+                if (is_array($event) && in_array($event['type'] ?? null, ['tool_call', 'tool_result'], true)) {
+                    $raw = $frame->payload->payload ?? null;
+                    $name = is_object($raw) && is_string($raw->name ?? null) ? $raw->name : '';
+                    $toolId = $event['id'] ?? '';
+                    if ($event['type'] === 'tool_call') {
+                        if ($toolId !== '' && self::credentialTool($name)) $sensitiveToolIds[$toolId] = true;
+                        if ($toolId !== '' && $name !== '') $toolNames[$toolId] = $name;
+                        if ($name === '' || isset($sensitiveToolIds[$toolId]) || self::credentialTool($name)) $event = null;
+                    } else {
+                        $known = $toolNames[$toolId] ?? '';
+                        $name = $name !== '' ? $name : $known;
+                        if ($toolId === '' || $known === '' || $name !== $known || isset($sensitiveToolIds[$toolId]) || self::credentialTool($name)) $event = null;
+                        else $event['name'] = $name;
+                    }
+                }
                 if ($event !== null && !$emit($event)) {
                     $aborted = true;
                     break;
@@ -3316,6 +3427,11 @@ final class DeweeGatewayConnection
         };
     }
 
+    private static function credentialTool(mixed $name): bool
+    {
+        return is_string($name) && preg_match('/(?:^|__)request_credentials$/iD', $name) === 1;
+    }
+
     /**
      * Fetches a session transcript and folds tool calls/results into assistant turns.
      *
@@ -3343,6 +3459,14 @@ final class DeweeGatewayConnection
     public static function foldHistory(array $raw): array
     {
         $out = [];
+        $sensitiveIds = [];
+        foreach ($raw as $message) {
+            $calls = self::prop($message, 'tool_calls');
+            foreach (is_array($calls) ? $calls : [] as $call) {
+                $fn = self::prop($call, 'function'); $name = self::prop($call, 'name') ?? self::prop($fn, 'name'); $id = self::prop($call, 'id');
+                if (self::credentialTool($name) && is_string($id)) $sensitiveIds[$id] = true;
+            }
+        }
         $cur = null; // index into $out of the open assistant turn
         foreach ($raw as $m) {
             $role = self::prop($m, 'role');
@@ -3365,16 +3489,20 @@ final class DeweeGatewayConnection
                 $toolCalls = self::prop($m, 'tool_calls');
                 foreach (is_array($toolCalls) ? $toolCalls : [] as $tc) {
                     $fn = self::prop($tc, 'function');
+                    $name = self::prop($tc, 'name') ?? self::prop($fn, 'name');
+                    $toolId = self::prop($tc, 'id');
+                    if (!is_string($toolId) || $toolId === '' || !is_string($name) || $name === '' || isset($sensitiveIds[$toolId]) || self::credentialTool($name)) continue;
                     $out[$cur]['toolCalls'] ??= [];
                     $out[$cur]['toolCalls'][] = DeweeWebchat::withoutNulls([
                         'id' => self::prop($tc, 'id'),
-                        'name' => self::prop($tc, 'name') ?? self::prop($fn, 'name') ?? 'tool',
+                        'name' => $name,
                         'arguments' => self::prop($tc, 'arguments') ?? self::prop($fn, 'arguments'),
                         'status' => 'done',
                     ]);
                 }
             } elseif ($role === 'tool' && $cur !== null && isset($out[$cur]['toolCalls'])) {
                 $callId = self::prop($m, 'tool_call_id');
+                if (!is_string($callId) || $callId === '' || isset($sensitiveIds[$callId])) continue;
                 foreach ($out[$cur]['toolCalls'] as $i => $tc) {
                     if (($tc['id'] ?? null) === $callId) {
                         $result = DeweeWebchat::clip(self::prop($m, 'content'));

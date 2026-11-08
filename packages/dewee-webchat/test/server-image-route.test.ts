@@ -130,6 +130,65 @@ describe("image proxy route", () => {
     }
   });
 
+  it("uses an explicitly public service for an allowed sibling origin without forwarding credentials", async () => {
+    const workerFetch = vi.fn();
+    const binding = { fetch: vi.fn().mockImplementation(async () => png()) };
+    vi.stubGlobal("navigator", { userAgent: "Cloudflare-Workers" });
+    vi.stubGlobal("fetch", workerFetch);
+    const options = { gatewayUrl: "https://gateway.example", token: "server-only", secret, agents: ["support"], rateLimit: false as const,
+      imageSources: ["https://cdn.chat.example/public/", "https://cdn.chat.example/private/"],
+      cloudflarePublicImageServices: [{ id: "catalog-v1", binding, prefixes: ["https://cdn.chat.example/public/"] }] };
+    const h = createDeweeHandler(options);
+    expect((await h(await ticketRequest("https://cdn.chat.example/private/a.png"))).status).toBe(403);
+    expect((await h(await ticketRequest("https://other.chat.example/public/a.png"))).status).toBe(403);
+    expect((await h(await ticketRequest("https://cdn.chat.example/public/%2fprivate/a.png"))).status).toBe(403);
+    const legacy = await issueImageTicket(secret, "https://gateway.example\n", "visitor_0123456789", "https://cdn.chat.example/public/a.png");
+    expect((await h(imageRequest(legacy))).status).toBe(403);
+    const { ticket } = await (await h(await ticketRequest("https://cdn.chat.example/public/a.png?secret=discarded"))).json();
+    expect(ticket.startsWith("s.catalog-v1.")).toBe(true);
+    expect((await h(new Request(`https://other.example/api/dewee/image?ticket=${ticket}`))).status).toBe(401);
+    expect((await createDeweeHandler({ ...options, cloudflarePublicImageServices: [] })(imageRequest(ticket))).status).toBe(401);
+    expect((await createDeweeHandler({ ...options, cloudflarePublicImageServices: [{ ...options.cloudflarePublicImageServices[0], id: "catalog-v2" }] })(imageRequest(ticket))).status).toBe(401);
+    expect((await createDeweeHandler({ ...options, imageSources: ["https://cdn.chat.example/private/"] })(imageRequest(ticket))).status).toBe(403);
+    expect((await h(imageRequest(ticket))).status).toBe(200);
+    const request = binding.fetch.mock.calls[0][0] as Request;
+    expect(request.url).toBe("https://public-images.invalid/public/a.png");
+    expect(request.method).toBe("GET");
+    expect(request.headers.get("cookie")).toBeNull();
+    expect(request.headers.get("authorization")).toBeNull();
+    expect(workerFetch).not.toHaveBeenCalled();
+    expect(network).not.toHaveBeenCalled();
+    binding.fetch.mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: "https://evil.example" } }));
+    expect((await h(imageRequest(ticket))).status).toBe(502);
+    binding.fetch.mockResolvedValueOnce(new Response("not an image", { headers: { "content-type": "image/png" } }));
+    expect((await h(imageRequest(ticket))).status).toBe(502);
+  });
+
+  it("rejects malformed or broad public service prefixes", () => {
+    for (const prefix of ["https://cdn.example/", "https://cdn.example/public/../private/", "https://cdn.example/public/%2f/", "http://cdn.example/public/", "https://cdn.example/public/?secret=x"]) {
+      expect(() => createDeweeHandler({ gatewayUrl: "https://gateway.example", token: "server-only", secret,
+        cloudflarePublicImageServices: [{ id: "public", binding: { fetch: async () => png() }, prefixes: [prefix] }] })).toThrow();
+    }
+    const binding = { fetch: async () => png() };
+    expect(() => createDeweeHandler({ gatewayUrl: "https://gateway.example", token: "server-only", secret,
+      cloudflarePublicImageServices: [{ id: "a", binding, prefixes: ["https://cdn.example/public/"] }, { id: "b", binding, prefixes: ["https://cdn.example/public/products/"] }] })).toThrow();
+    expect(() => createDeweeHandler({ gatewayUrl: "https://gateway.example", token: "server-only", secret,
+      cloudflarePublicImageServices: [{ id: "a", binding, prefixes: ["https://cdn.example/public/"] }, { id: "a", binding, prefixes: ["https://cdn.example/other/"] }] })).toThrow();
+  });
+
+  it("checks only the named service namespace for an invalid ticket", async () => {
+    const binding = { fetch: async () => png() };
+    const services = Array.from({ length: 16 }, (_, i) => ({ id: `service-${i}`, binding, prefixes: [`https://cdn.example/path-${i}/`] }));
+    const h = createDeweeHandler({ gatewayUrl: "https://gateway.example", token: "server-only", secret,
+      imageSources: ["https://cdn.example/path-0/"], cloudflarePublicImageServices: services });
+    const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+    try {
+      const invalid = Buffer.alloc(32).toString("base64url");
+      expect((await h(imageRequest(`s.service-0.${invalid}`))).status).toBe(401);
+      expect(decrypt).toHaveBeenCalledTimes(1);
+    } finally { decrypt.mockRestore(); }
+  });
+
   it("uses an explicit asset binding even without a Workers user agent", async () => {
     const binding = { fetch: vi.fn().mockImplementation(async () => png()) };
     const h = createDeweeHandler({ gatewayUrl: "https://gateway.example", token: "server-only", secret, agents: ["support"], rateLimit: false,

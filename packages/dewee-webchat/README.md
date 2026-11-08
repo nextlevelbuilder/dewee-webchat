@@ -217,7 +217,30 @@ Only exact same-origin paths in both lists use the binding. This reads the Asset
 **bypassing Worker middleware, Cloudflare Access, and cookie-based authorization**. Every file under
 the configured prefixes must be public to any valid chat visitor; keep private files elsewhere,
 inspect the build output, and exclude sensitive files using `.assetsignore`. The URL query is not
-passed to the binding. Sibling domains still require a separate approved image domain.
+passed to the binding.
+
+For a sibling hostname in the same zone, a host can instead configure a service binding to a Worker
+that serves public images from the listed directories:
+
+```ts
+createDeweeHandler({
+  // ... other handler options
+  imageSources: ["https://images.example.com/products/"],
+  cloudflarePublicImageServices: [
+    { id: "catalog-v1", binding: env.PUBLIC_IMAGES, prefixes: ["https://images.example.com/products/"] },
+  ],
+});
+```
+
+Both lists must allow the source. Each service needs a unique ID and non-overlapping prefixes; change
+the ID whenever you repoint the binding so existing short-lived tickets cannot reach the new service.
+The service ID is visible in the image ticket, but the source URL remains encrypted. The binding
+calls the configured Worker directly, bypassing the
+source hostname's Cloudflare security rules. Every configured prefix must be public to all chat
+visitors; do not bind private services or paths. The Worker receives a GET with the approved path on
+`https://public-images.invalid`, without the original query, cookies or authorization headers. It
+must serve that path without relying on its hostname or a signed query string. A missing or invalid
+response fails closed and never falls back to a network request.
 
 Files are limited to 2 MiB and 4096
 pixels per edge, and responses are not cached. Animated GIF/PNG/WebP are refused. Raw HTML,

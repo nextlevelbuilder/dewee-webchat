@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { signVisitorToken, verifyVisitorToken } from "../src/server";
+import { forgeToken } from "./helpers/forge-token";
 
 const php = process.env.PHP_BIN || "php";
 const available = spawnSync(php, ["-v"]).status === 0;
@@ -17,7 +18,7 @@ describe.skipIf(!available)("PHP signed-in visitor token parity", () => {
     expect(call("echo json_encode(DeweeWebchat::verifyVisitorToken($in['secret'], $in['token'], true));", { secret, token: ts })).toEqual(claims);
     const fromPhp = call("echo json_encode(DeweeWebchat::signVisitorToken($in['secret'], $in['claims']));", { secret, claims });
     expect(await verifyVisitorToken(secret, fromPhp)).toEqual(claims);
-    expect(await verifyVisitorToken(secret, fromPhp.slice(0, -2) + "aa")).toBeNull();
+    expect(await verifyVisitorToken(secret, forgeToken(fromPhp))).toBeNull();
     expect(Buffer.from(fromPhp.split(".")[0], "base64url").toString()).not.toContain(claims.ids);
     expect(Buffer.from(fromPhp.split(".")[0], "base64url").toString()).not.toContain(claims.sub);
   });

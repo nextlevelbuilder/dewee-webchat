@@ -3,7 +3,7 @@
 // contract next to the TS handler's answers, error mapping and redaction, redirect refusal, timeout
 // abort. Runs when a PHP 8.1+ binary is available (PHP_BIN or `php` on PATH); skipped otherwise.
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,6 +16,7 @@ const PHP = process.env.PHP_BIN || "php";
 const hasPhp = spawnSync(PHP, ["-v"]).status === 0;
 const phpFile = resolve(__dirname, "../../../php/dewee-webchat.php");
 const VISITOR_SECRET = "visitor-secret-NEVER-IN-BROWSER-00000000001";
+const packageVersion = JSON.parse(readFileSync(resolve(__dirname, "../package.json"), "utf8")).version;
 
 /** Runs a PHP snippet with the backend loaded; stdin is JSON, stdout is parsed as JSON. */
 function php(code: string, input: unknown = null): any {
@@ -198,7 +199,7 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     const tsJson = async (path: string, init?: RequestInit) => (await ts(new Request(`https://shop.example/api/dewee${path}`, init))).json();
 
     const { version: _v, ...tsConfig } = await tsJson("/config");
-    expect((await call("/config")).json()).toEqual({ ...tsConfig, version: "0.5.0-beta.1" });
+    expect((await call("/config")).json()).toEqual({ ...tsConfig, version: packageVersion });
 
     const s = await session();
     expect(s.visitorId).toMatch(/^[A-Za-z0-9_-]{22}$/);

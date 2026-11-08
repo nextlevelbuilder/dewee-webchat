@@ -149,6 +149,7 @@ button { font: inherit; color: inherit; background: none; border: 0; cursor: poi
 .md li { margin: 3px 0; }
 .md h3, .md h4, .md h5, .md h6 { margin: 14px 0 6px; font-size: 15px; line-height: 1.35; }
 .md a { color: var(--dw-accent); text-decoration: underline; text-underline-offset: 2px; }
+.md .md-image { display: block; max-width: 100%; max-height: 320px; min-height: 48px; width: auto; height: auto; object-fit: contain; border-radius: 8px; }
 .md code { font-family: var(--dw-mono); font-size: .86em; background: var(--dw-surface); padding: 1.5px 5px; border-radius: 5px; }
 .md pre { background: #12132a; color: #e6e6f5; padding: 12px 14px; border-radius: 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; }
 .md pre code { background: none; padding: 0; color: inherit; font-size: inherit; }

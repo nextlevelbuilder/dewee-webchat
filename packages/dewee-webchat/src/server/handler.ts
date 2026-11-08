@@ -52,6 +52,8 @@ import { resolveTransport } from "./transport-selection";
 import { JobAccessRefusal, mintJobAccess } from "./job-access";
 import { CCP_AGENT_RE, CCP_ID_RE, EDGE_RESEAL_MS, browserErrorFor, createCcpTransport, type BrowserError, type CcpConfig, type EdgeSession, type VisitorContext } from "./ccp-transport";
 import { memoryIdentitySessionStore, type IdentitySessionStore, type StoredIdentitySession } from "./identity-session-store";
+import { allowedImageSource, fetchRasterImage, issueImageTicket, readImageTicketBody, verifyImageTicket } from "./image-proxy";
+import { publicImageFetchNode } from "./public-image-fetch-node";
 
 class IdentityStoreError extends Error {}
 
@@ -204,6 +206,8 @@ export interface DeweeHandlerOptions {
   allowedOrigins?: string[] | "*";
   /** Additional header names allowed in cross-origin requests. */
   allowedHeaders?: string[];
+  /** HTTPS directory prefixes from which the backend may proxy images; disabled when unset. */
+  imageSources?: string[];
   /**
    * Legacy gateway transport: let visitors bring their own gateway URL + token (sent per request, never stored).
    * Meant for playgrounds. `allowedHosts` restricts which gateways may be targeted.
@@ -313,6 +317,15 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     ...options,
   };
   const transport = resolveTransport(o);
+  if (o.imageSources !== undefined && !Array.isArray(o.imageSources)) throw new Error("[dewee-webchat] imageSources must be an array");
+  const imageSources = (o.imageSources ?? []).map((origin) => {
+    let url: URL;
+    try { url = new URL(origin); } catch { throw new Error("[dewee-webchat] Invalid image origin"); }
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || url.port || !url.pathname.endsWith("/") || /%(?:2f|5c|25|2e|0[0-9a-f]|1[0-9a-f]|7f)/i.test(url.pathname)) throw new Error("[dewee-webchat] Image sources must be HTTPS directory prefixes on the default port");
+    return url;
+  });
+  let activeImages = 0;
+  const imageNamespace = `${o.ccp?.chatUrl ?? o.gatewayUrl ?? ""}\n${o.ccp?.integrationId ?? o.tenantId ?? ""}`;
   if (o.allowedHeaders !== undefined && (!Array.isArray(o.allowedHeaders) || o.allowedHeaders.some((name) => typeof name !== "string" || !/^[A-Za-z0-9-]+$/.test(name)))) {
     throw new Error("[dewee-webchat] allowedHeaders must contain valid header names (letters, digits and hyphens)");
   }
@@ -1303,6 +1316,38 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     if (!originAllowed(req)) return fail(req, 403, "Origin not allowed", "forbidden_origin");
     const action = new URL(req.url).pathname.replace(/\/+$/, "").split("/").pop();
     try {
+      if (req.method === "POST" && action === "image-ticket" && imageSources.length) {
+        const claims = await visitorFrom(req);
+        if (!claims) return fail(req, 401, "Missing or expired visitor session", "unauthorized");
+        if (idn?.required && !claims.ids) return identityFail(req, "IDENTITY_REQUIRED");
+        const refused = await rebindRefusal(req, claims);
+        if (refused) return refused;
+        if (limiter && !(await limiter(`image-ticket:${claims.v}`, "preauth"))) return fail(req, 429, "Too many requests, try again later", "rate_limited");
+        const body = await readImageTicketBody(req);
+        if (body === null) return fail(req, 413, "Invalid image", "invalid_request");
+        let parsed: unknown;
+        try { parsed = JSON.parse(body); } catch { return fail(req, 400, "Invalid image", "invalid_request"); }
+        const raw = (parsed as { url?: unknown } | null)?.url;
+        const worker = globalThis.navigator?.userAgent === "Cloudflare-Workers";
+        const source = typeof raw === "string" ? allowedImageSource(raw, imageSources, new URL(req.url), worker) : null;
+        if (!source) return fail(req, 403, "Image not allowed", "forbidden_image");
+        return json(req, { ticket: await issueImageTicket(secret!, imageNamespace, claims.v, source.href) });
+      }
+      if (req.method === "GET" && action === "image" && imageSources.length) {
+        const ticket = new URL(req.url).searchParams.get("ticket") ?? "";
+        const claims = await verifyImageTicket(secret!, imageNamespace, ticket);
+        if (!claims) return fail(req, 401, "Image ticket expired", "unauthorized");
+        const worker = globalThis.navigator?.userAgent === "Cloudflare-Workers";
+        const source = allowedImageSource(claims.source, imageSources, new URL(req.url), worker);
+        if (!source) return fail(req, 403, "Image not allowed", "forbidden_image");
+        if (limiter && !(await limiter(`image:${claims.visitor}`, "preauth"))) return fail(req, 429, "Too many requests, try again later", "rate_limited");
+        if (activeImages >= 8) return fail(req, 429, "Too many requests, try again later", "rate_limited");
+        activeImages++;
+        try {
+          const result = await fetchRasterImage(source.href, worker ? globalThis.fetch : publicImageFetchNode, worker ? "manual" : "error");
+          return result ?? fail(req, 502, "Image unavailable", "image_unavailable");
+        } finally { activeImages--; }
+      }
       if (req.method === "GET" && action === "config") return await handleConfig(req);
       if (req.method === "POST" && action === "session") return await handleSession(req);
       if (req.method === "POST" && action === "chat") return await handleChat(req);
@@ -1345,6 +1390,7 @@ export function optionsFromEnv(env: Record<string, string | undefined>, override
     agents,
     defaultAgent: env.DEWEE_DEFAULT_AGENT,
     allowedOrigins: origins,
+    imageSources: list(env.DEEWEE_IMAGE_SOURCES),
     allowClientCredentials: env.DEWEE_ALLOW_CLIENT_CREDENTIALS === "true" ? (byoHosts?.length ? { allowedHosts: byoHosts } : true) : false,
     turnstile: env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY ? { siteKey: env.TURNSTILE_SITE_KEY, secretKey: env.TURNSTILE_SECRET_KEY } : undefined,
     // undefined overrides must not erase env-derived values

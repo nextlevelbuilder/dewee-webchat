@@ -64,6 +64,7 @@ CCP and copy its values (agents, allowed sites and limits are set there):
 | `DEWEE_WEBCHAT_SECRET` | HMAC secret for visitor tokens (at least 32 random bytes; required with either transport) |
 | `DEWEE_WEBCHAT_TRANSPORT` | Optional `ccp` or `legacy-gateway`; otherwise the variables set decide |
 | `DEWEE_ALLOWED_ORIGINS` (csv or `*`) | Optional |
+| `DEWEE_IMAGE_SOURCES` | Comma-separated trusted HTTPS directory prefixes for the image proxy; disabled when unset |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Require Cloudflare Turnstile for new sessions |
 
 Deprecated `legacy-gateway` transport (direct Gateway URL and token, see
@@ -107,6 +108,10 @@ why). They are defense in depth: the Dewee gateway owns the shared message limit
 ([admission errors](../docs/http-contract.md#admission-errors)). Set `DEWEE_WEBCHAT_SECRET` for either transport;
 without a secret of at least 32 bytes, the backend refuses startup with `500 not_configured`. It does
 not generate or persist a fallback secret.
+
+The image proxy also needs the private temporary directory for its shared concurrency limit. If it
+cannot verify private storage (including on Windows hosts where POSIX ownership checks are unavailable),
+it returns `503 image_unavailable` instead of fetching. See [issue #33](https://github.com/nextlevelbuilder/dewee-webchat/issues/33).
 
 ## Streaming (SSE) behind a web server
 

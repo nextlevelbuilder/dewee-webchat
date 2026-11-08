@@ -28,13 +28,13 @@ type EventProp = keyof typeof EVENTS;
 
 export const DeweeChat = forwardRef<DeweeChatElement | null, DeweeChatProps>(function DeweeChat(props, ref) {
   const el = useRef<DeweeChatElement | null>(null);
-  const { className, style, onReady, onSend, onReply, onError, onOpen, onClose, onAction, actions, confirm, getPageContext, headers, fetch, domActionsRoot, ...config } = props;
+  const { className, style, onReady, onSend, onReply, onError, onOpen, onClose, onAction, actions, confirm, getPageContext, headers, fetch, domActionsRoot, imageOrigins, ...config } = props;
   const handlers: Partial<Record<EventProp, (e: CustomEvent<any>) => void>> = { onReady, onSend, onReply, onError, onOpen, onClose, onAction };
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
   useImperativeHandle(ref, () => el.current!, []);
 
-  const configKey = JSON.stringify(config);
+  const configKey = JSON.stringify({ ...config, imageOrigins: imageOrigins ?? [] });
   useEffect(() => {
     defineDeweeChat();
     el.current?.configure(JSON.parse(configKey));

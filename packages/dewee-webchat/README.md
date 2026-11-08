@@ -145,6 +145,7 @@ Attributes use kebab-case (`show-reasoning="false"`), `data-*` on the script tag
 | `title`, `subtitle`, `greeting`, `intro`, `placeholder` | | Texts |
 | `suggestions` | | Quick replies (`a|b` or JSON array as attribute) |
 | `avatar`, `launcherAvatar` | | Image URL; also use it on the launcher |
+| `imageOrigins` | `[]` | Additional trusted HTTPS origins for Markdown images |
 | `mode` | `floating` | `floating` (bubble + panel) or `inline` (fills its container) |
 | `position` | `bottom-right` | or `bottom-left` |
 | `theme` | `light` | `light`, `dark`, `auto` |
@@ -168,6 +169,33 @@ Methods: `open()`, `close()`, `toggle()`, `send(text)`, `stop()`, `newConversati
 `renewSession()` and `startLink()`.
 Events: `dewee:ready`, `dewee:open`, `dewee:close`, `dewee:send`, `dewee:reply`, `dewee:error`, `dewee:action`, `dewee:link`.
 CSS variables: `--dw-accent`, `--dw-font`, `--dw-radius`, `--dw-width`, `--dw-height`, `--dw-z`.
+
+## Markdown images
+
+Replies may include `![Product](https://cdn.example.com/photo.jpg)` or a same-origin relative image
+URL. Images are disabled until HTTPS directory prefixes are approved in the backend. Configure the backend
+with `imageSources: ["https://cdn.example.com/products/", "https://qr.example.com/images/"]` (or the comma-separated
+`DEWEE_IMAGE_SOURCES` environment variable). Include a safe image directory on your site's HTTPS origin for relative images.
+For external origins, also configure the widget:
+
+```html
+<dewee-chat image-origins='["https://cdn.example.com", "https://qr.example.com"]'></dewee-chat>
+```
+
+The script-tag equivalent is `data-image-origins`; vanilla JS uses
+`chat.configure({ imageOrigins: ["https://cdn.example.com"] })`, and React, Vue and Astro accept the
+`imageOrigins` prop. Unapproved or broken images fall back to alt text. The widget loads images from
+`{endpoint}/image` using a short-lived encrypted ticket issued to the visitor session; the backend makes the request without cookies or Gateway credentials, rejects
+redirects, and accepts PNG, JPEG, GIF and WebP only after validating the content type and file
+signature. Node and PHP pin a checked public DNS address; Cloudflare Workers use the platform's
+network boundary. Workers conservatively refuse sources sharing the endpoint's last two hostname
+labels (including sibling subdomains), to avoid bypassing Cloudflare's own-zone protections; host
+images on a separate approved domain there. Files are limited to 2 MiB and 4096
+pixels per edge, and responses are not cached. Animated GIF/PNG/WebP are refused. Raw HTML,
+SVG, unsafe schemes, credentials in URLs and unapproved origins are rejected.
+
+The proxy URL contains an encrypted, short-lived ticket, not the source URL or the visitor session.
+Avoid secrets in image URLs: the ticket request contains the source URL in its body.
 
 ## Custom headers and fetch
 

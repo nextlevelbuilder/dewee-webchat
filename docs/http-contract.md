@@ -7,6 +7,18 @@ implements these four routes works with the widget — the Node/Workers handler 
 Errors always use `{"error": {"message": string, "code": string}}` with a matching HTTP status.
 Identity errors of [signed-in users](#signed-in-users) add `remediation`.
 
+## Image proxy
+
+Optional and disabled by default. `POST {base}/image-ticket` accepts an authenticated visitor token
+and JSON `{ "url": "…" }`; the backend validates it against explicitly configured HTTPS directory
+prefixes and returns a short-lived encrypted ticket. `GET {base}/image?ticket=…` rechecks the ticket
+and current policy before fetching. The backend returns bounded PNG, JPEG, GIF or WebP after type,
+signature and dimension checks; animated files are refused. Redirects and private DNS destinations
+are refused, and visitor or Gateway credentials are never forwarded. The ticket is not the visitor
+bearer and does not reveal the source URL; responses are not cached. Node and PHP pin a public DNS
+address. Cloudflare Workers rely on their platform network policy and conservatively refuse sources
+sharing the endpoint's last two hostname labels.
+
 ## `GET {base}/config`
 
 Public, cacheable for a short time. Never contains secrets.

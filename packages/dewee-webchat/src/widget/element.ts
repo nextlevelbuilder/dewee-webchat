@@ -17,7 +17,7 @@ import { ApiClient, ApiError, type RequestHeadersOption } from "./api-client";
 import { JobAccessPopupError, openJobAccessTicket } from "./job-access";
 import { showConfirmDialog } from "./confirm-dialog";
 import { icons, pickStrings, type Strings } from "./i18n";
-import { renderMarkdown } from "./markdown";
+import { disposeMarkdownImages, renderMarkdown } from "./markdown";
 import { SendCooldown } from "./send-cooldown";
 import { styles } from "./styles";
 
@@ -39,6 +39,8 @@ export interface DeweeChatConfig {
   suggestions?: string[];
   /** Image URL used for the header avatar (and launcher when `launcherAvatar`). */
   avatar?: string;
+  /** HTTPS origins from which Markdown images may load, in addition to the page's own origin. */
+  imageOrigins?: string[];
   launcherAvatar?: boolean;
   position?: "bottom-right" | "bottom-left";
   /** "floating" (launcher + popup) or "inline" (fills its container). */
@@ -119,6 +121,7 @@ interface ViewRefs {
   root: HTMLElement;
   trace: HTMLElement;
   md: HTMLElement;
+  mdKey?: string;
   thinking?: HTMLDetailsElement;
   tools: Map<string, HTMLDetailsElement>;
   actions: HTMLElement;
@@ -144,7 +147,7 @@ interface ViewMessage extends HistoryMessage {
 const BOOL_ATTRS = ["show-reasoning", "show-tool-calls", "allow-agent-switch", "open", "persist", "hide-branding", "launcher-avatar", "dom-actions"];
 const ATTRS = [
   "endpoint", "agent", "title", "subtitle", "greeting", "intro", "placeholder", "suggestions", "avatar", "position",
-  "mode", "theme", "accent-color", "locale", "gateway-url", "gateway-token", "width", "height", "z-index", "dom-actions-root", ...BOOL_ATTRS,
+  "mode", "theme", "accent-color", "locale", "gateway-url", "gateway-token", "width", "height", "z-index", "dom-actions-root", "image-origins", ...BOOL_ATTRS,
 ];
 
 const camel = (s: string) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -220,6 +223,7 @@ export class DeweeChatElement extends ElementBase {
       if (v === null) continue;
       if (BOOL_ATTRS.includes(a)) c[camel(a)] = parseBool(v);
       else if (a === "suggestions") c.suggestions = v.trim().startsWith("[") ? safeJson(v, []) : v.split("|").map((s) => s.trim()).filter(Boolean);
+      else if (a === "image-origins") c.imageOrigins = v.trim().startsWith("[") ? safeJson(v, []) : v.split(",").map((s) => s.trim()).filter(Boolean);
       else if (a === "z-index") c.zIndex = Number(v);
       else c[camel(a)] = v;
     }
@@ -608,6 +612,8 @@ export class DeweeChatElement extends ElementBase {
   }
 
   disconnectedCallback(): void {
+    disposeMarkdownImages(this.root);
+    for (const message of this.messages) if (message.view) message.view.mdKey = undefined;
     this.jobAccessLaunch?.abort();
     this.stop();
     this.mql?.removeEventListener("change", this.onScheme);
@@ -711,7 +717,8 @@ export class DeweeChatElement extends ElementBase {
     } else if (this.activated && c.agent && c.agent !== this.agentId && this.server) {
       this.switchAgent(c.agent);
     } else if (this.activated) {
-      this.renderLog();
+      if (!this.messages.length) this.renderLog();
+      else for (const message of this.messages) this.updateMessage(message);
     }
   }
 
@@ -875,6 +882,7 @@ export class DeweeChatElement extends ElementBase {
 
   private renderLog() {
     const log = this.els.log;
+    disposeMarkdownImages(log);
     log.replaceChildren();
     if (!this.messages.length) log.appendChild(this.renderWelcome());
     for (const m of this.messages) log.appendChild(this.renderMessage(m));
@@ -987,10 +995,15 @@ export class DeweeChatElement extends ElementBase {
     const shown = this.actionRegistry().size || m.actions ? stripDirectives(m.content) : m.content;
     const typing = m.status === "streaming" && !shown;
     v.md.hidden = !typing && !shown && !!m.actions?.length;
-    if (typing) {
-      v.md.innerHTML = `<span class="typing" aria-label="${this.strings.thinking}"><i></i><i></i><i></i></span>`;
-    } else {
-      v.md.replaceChildren(renderMarkdown(document, shown));
+    const mdKey = JSON.stringify([shown, typing, m.status === "streaming", c.endpoint, c.imageOrigins, this.strings.thinking]);
+    if (v.mdKey !== mdKey) {
+      v.mdKey = mdKey;
+      disposeMarkdownImages(v.md);
+      if (typing) {
+        v.md.innerHTML = `<span class="typing" aria-label="${this.strings.thinking}"><i></i><i></i><i></i></span>`;
+      } else {
+        v.md.replaceChildren(renderMarkdown(document, shown, { imageOrigins: Array.isArray(c.imageOrigins) ? c.imageOrigins : [], imageProxy: (source, signal) => this.client().imageUrl(source, signal), deferImages: m.status === "streaming" }));
+      }
       v.md.classList.toggle("cursor", m.status === "streaming");
     }
     this.renderActions(v, m.actions ?? []);

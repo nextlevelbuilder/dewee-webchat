@@ -214,6 +214,8 @@ export interface DeweeHandlerOptions {
   credentialRequests?: { formOrigin: string };
   /** Explicitly public directories in this Worker's Assets binding. Bypasses site middleware. */
   cloudflarePublicImageAssets?: { binding: { fetch(request: Request): Promise<Response> }; prefixes: string[] };
+  /** Public-only service bindings for approved HTTPS image directory prefixes. Bypasses host security rules. */
+  cloudflarePublicImageServices?: Array<{ id: string; binding: { fetch(request: Request): Promise<Response> }; prefixes: string[] }>;
   /**
    * Legacy gateway transport: let visitors bring their own gateway URL + token (sent per request, never stored).
    * Meant for playgrounds. `allowedHosts` restricts which gateways may be targeted.
@@ -345,6 +347,31 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     throw new Error("[dewee-webchat] Public image asset prefixes must be explicit absolute directory paths");
   }
   const assetPrefixes = publicAssets?.prefixes ?? [];
+  if (o.cloudflarePublicImageServices !== undefined && (!Array.isArray(o.cloudflarePublicImageServices) || o.cloudflarePublicImageServices.length > 16)) {
+    throw new Error("[dewee-webchat] Public image services must be an array");
+  }
+  const publicServices = (o.cloudflarePublicImageServices ?? []).map((service) => {
+    if (!service || typeof service.id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(service.id) || typeof service.binding?.fetch !== "function" || !Array.isArray(service.prefixes) || !service.prefixes.length) {
+      throw new Error("[dewee-webchat] Public image services require a binding and directory prefixes");
+    }
+    const prefixes = service.prefixes.map((raw) => {
+      let url: URL;
+      if (typeof raw !== "string" || !/^https:\/\/[^/?#]+\/(?:[A-Za-z0-9_-]+\/)+$/.test(raw)) {
+        throw new Error("[dewee-webchat] Invalid public image service prefix");
+      }
+      try { url = new URL(raw); } catch { throw new Error("[dewee-webchat] Invalid public image service prefix"); }
+      if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash || !/^\/(?:[A-Za-z0-9_-]+\/)+$/.test(url.pathname)) {
+        throw new Error("[dewee-webchat] Public image service prefixes must be HTTPS origins with explicit directory paths");
+      }
+      return url;
+    });
+    return { id: service.id, binding: service.binding, prefixes };
+  });
+  const servicePrefixes = publicServices.flatMap((service) => service.prefixes);
+  if (new Set(publicServices.map((service) => service.id)).size !== publicServices.length || servicePrefixes.some((prefix, index) => servicePrefixes.slice(index + 1).some((other) => prefix.origin === other.origin && (prefix.pathname.startsWith(other.pathname) || other.pathname.startsWith(prefix.pathname))))) {
+    throw new Error("[dewee-webchat] Public image service ids and directory prefixes must not overlap");
+  }
+  const serviceFor = (source: URL) => publicServices.find((service) => service.prefixes.some((prefix) => prefix.origin === source.origin && source.pathname.startsWith(prefix.pathname)));
   let activeImages = 0;
   const imageNamespace = `${o.ccp?.chatUrl ?? o.gatewayUrl ?? ""}\n${o.ccp?.integrationId ?? o.tenantId ?? ""}`;
   if (o.allowedHeaders !== undefined && (!Array.isArray(o.allowedHeaders) || o.allowedHeaders.some((name) => typeof name !== "string" || !/^[A-Za-z0-9-]+$/.test(name)))) {
@@ -1419,30 +1446,39 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
         try { parsed = JSON.parse(body); } catch { return fail(req, 400, "Invalid image", "invalid_request"); }
         const raw = (parsed as { url?: unknown } | null)?.url;
         const worker = globalThis.navigator?.userAgent === "Cloudflare-Workers";
-        const source = typeof raw === "string" ? allowedImageSource(raw, imageSources, new URL(req.url), worker, worker ? assetPrefixes : []) : null;
+        const source = typeof raw === "string" ? allowedImageSource(raw, imageSources, new URL(req.url), worker, worker ? assetPrefixes : [], worker ? servicePrefixes : []) : null;
         if (!source) return fail(req, 403, "Image not allowed", "forbidden_image");
         const endpoint = new URL(req.url);
         const asset = publicAssets && source.origin === endpoint.origin && assetPrefixes.some((prefix) => source.pathname.startsWith(prefix));
-        const namespace = asset ? `${imageNamespace}\nassets:${endpoint.origin}` : imageNamespace;
-        return json(req, { ticket: await issueImageTicket(secret!, namespace, claims.v, source.href) });
+        const service = asset ? undefined : serviceFor(source);
+        const namespace = asset ? `${imageNamespace}\nassets:${endpoint.origin}` : service ? `${imageNamespace}\nservice:${endpoint.origin}:${service.id}` : imageNamespace;
+        const ticket = await issueImageTicket(secret!, namespace, claims.v, source.href);
+        return json(req, { ticket: service ? `s.${service.id}.${ticket}` : ticket });
       }
       if (req.method === "GET" && action === "image" && imageSources.length) {
         const ticket = new URL(req.url).searchParams.get("ticket") ?? "";
         const endpoint = new URL(req.url);
-        const assetClaims = await verifyImageTicket(secret!, `${imageNamespace}\nassets:${endpoint.origin}`, ticket);
-        const claims = assetClaims ?? await verifyImageTicket(secret!, imageNamespace, ticket);
+        const tagged = /^s\.([A-Za-z0-9_-]{1,64})\.([A-Za-z0-9_-]{1,8192})$/.exec(ticket);
+        const serviceId = tagged?.[1];
+        if (serviceId && !publicServices.some((service) => service.id === serviceId)) return fail(req, 401, "Image ticket expired", "unauthorized");
+        const serviceClaims = tagged ? await verifyImageTicket(secret!, `${imageNamespace}\nservice:${endpoint.origin}:${serviceId}`, tagged[2]) : null;
+        const assetClaims = tagged ? null : await verifyImageTicket(secret!, `${imageNamespace}\nassets:${endpoint.origin}`, ticket);
+        const claims = tagged ? serviceClaims : assetClaims ?? await verifyImageTicket(secret!, imageNamespace, ticket);
         if (!claims) return fail(req, 401, "Image ticket expired", "unauthorized");
         const worker = globalThis.navigator?.userAgent === "Cloudflare-Workers";
-        const source = allowedImageSource(claims.source, imageSources, endpoint, worker, worker ? assetPrefixes : []);
+        const source = allowedImageSource(claims.source, imageSources, endpoint, worker, worker ? assetPrefixes : [], worker ? servicePrefixes : []);
         if (!source) return fail(req, 403, "Image not allowed", "forbidden_image");
         const asset = publicAssets && source.origin === endpoint.origin && assetPrefixes.some((prefix) => source.pathname.startsWith(prefix));
         if (Boolean(asset) !== Boolean(assetClaims)) return fail(req, 403, "Image not allowed", "forbidden_image");
+        const service = asset ? undefined : serviceFor(source);
+        if (service?.id !== serviceId) return fail(req, 403, "Image not allowed", "forbidden_image");
         if (limiter && !(await limiter(`image:${claims.visitor}`, "preauth"))) return fail(req, 429, "Too many requests, try again later", "rate_limited");
         if (activeImages >= 8) return fail(req, 429, "Too many requests, try again later", "rate_limited");
         activeImages++;
         try {
           const assetFetch: typeof fetch = (input, init) => publicAssets!.binding.fetch(new Request(new URL(new URL(String(input)).pathname, "https://assets.invalid"), init));
-          const result = await fetchRasterImage(source.href, asset ? assetFetch : worker ? globalThis.fetch : publicImageFetchNode, worker ? "manual" : "error");
+          const serviceFetch: typeof fetch = (input, init) => service!.binding.fetch(new Request(new URL(new URL(String(input)).pathname, "https://public-images.invalid"), init));
+          const result = await fetchRasterImage(source.href, asset ? assetFetch : service ? serviceFetch : worker ? globalThis.fetch : publicImageFetchNode, worker || service ? "manual" : "error");
           return result ?? fail(req, 502, "Image unavailable", "image_unavailable");
         } finally { activeImages--; }
       }

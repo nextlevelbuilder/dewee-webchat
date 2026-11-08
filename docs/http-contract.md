@@ -18,7 +18,8 @@ signature and dimension checks; animated files are refused. Redirects and privat
 are refused, and visitor or Gateway credentials are never forwarded. The ticket is not the visitor
 bearer and does not reveal the source URL; responses are not cached. Node and PHP pin a public DNS
 address. Cloudflare Workers rely on their platform network policy and conservatively refuse sources
-sharing the endpoint's last two hostname labels.
+sharing the endpoint's last two hostname labels unless an explicitly configured public Assets or
+public service binding handles the approved directory; bindings bypass the hostname's security rules.
 
 ## `GET {base}/config`
 

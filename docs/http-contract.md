@@ -178,8 +178,8 @@ fail with `status: "error"`.
 
 ## Signed-in users
 
-Optional. A backend that signs users in through Dewee (the Node/Workers handler with the `identity`
-option; not the PHP backend yet) changes the routes below. Without it nothing here applies and every
+Optional. A backend that signs users in through Dewee (the Node/Workers or PHP handler with the `identity`
+option) changes the routes below. Without it nothing here applies and every
 request and response is exactly as described above.
 
 **`GET {base}/config`** adds `"identity": true`, sets `allowAgentSwitch` to `false` and `defaultAgent`

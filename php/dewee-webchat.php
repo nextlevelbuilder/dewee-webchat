@@ -12,7 +12,7 @@
  *
  * Transports: "ccp" (a CCP Website chat integration: DEWEE_CCP_CHAT_URL, DEWEE_WEBCHAT_INTEGRATION_ID,
  * DEWEE_WEBCHAT_INTEGRATION_SECRET) or the deprecated "legacy-gateway" (DEWEE_GATEWAY_URL + token).
- * Anonymous visitors only: there is no signed-in (identity) mode in PHP.
+ * Optional signed-in identity mode uses a host-provided authentication callback.
  */
 
 declare(strict_types=1);
@@ -20,7 +20,7 @@ declare(strict_types=1);
 final class DeweeGatewayError extends RuntimeException
 {
     /** $retryAfterMs is the gateway's raw value for retryable refusals (RATE_LIMITED), unvalidated. */
-    public function __construct(string $message, public readonly ?string $gatewayCode = null, public readonly mixed $retryAfterMs = null)
+    public function __construct(string $message, public readonly ?string $gatewayCode = null, public readonly mixed $retryAfterMs = null, public readonly mixed $remediation = null)
     {
         parent::__construct($message);
     }
@@ -76,11 +76,12 @@ final class DeweeWebchat
     private const CCP_AGENT_RE = '/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/D';
     private const VISITOR_RE = '/^[A-Za-z0-9_-]{8,64}$/';
     private const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
-    private const RATE_LIMITS = ['chat' => [20, 60_000], 'session' => [10, 600_000]];
+    private const RATE_LIMITS = ['chat' => [20, 60_000], 'session' => [10, 600_000], 'preauth' => [120, 60_000], 'verified' => [30, 600_000], 'link' => [5, 600_000]];
     /** Conversation and visitor ids as the CCP ingress accepts them. */
     private const CCP_ID_RE = '/^[A-Za-z0-9_-]{8,64}$/';
     private const EDGE_TOKEN_RE = '/^dws1\.[A-Za-z0-9_.-]{1,1019}$/';
     private const EDGE_SEAL_INFO = 'dewee-webchat:edge-session:aes-256-gcm:v1';
+    private const IDENTITY_SEAL_INFO = 'dewee-webchat:identity-session:aes-256-gcm:v1';
     private const MAX_EDGE_SESSION_LENGTH = 1024;
     private const CCP_CONFIG_TTL = 60;
     /** An edge session this close to expiry (ms) is refreshed before use. */
@@ -118,6 +119,8 @@ final class DeweeWebchat
     private ?array $byo;
     /** Set when the transport is "ccp" (the CCP-managed public webchat ingress). */
     private ?DeweeCcpClient $ccp = null;
+    private ?array $identity = null;
+    private string $identityAgent = '';
 
     /**
      * Handles the current request and writes the response.
@@ -138,6 +141,24 @@ final class DeweeWebchat
             return;
         }
         $handler->run();
+    }
+
+    /** Best-effort logout hook. Call on the host server with the former authenticated subject. */
+    public static function revoke(string $subject, string $token, ?array $options = null): void
+    {
+        if ($subject === '' || $token === '') return;
+        try {
+            $handler = new self($options ?? self::optionsFromEnv());
+            if ($handler->identity === null || $handler->ccp === null) return;
+            $claims = self::verifyVisitorToken($handler->secret, $token, true, 'reuse')
+                ?? self::verifyVisitorToken($handler->secret, $token, true);
+            $digest = self::b64url(hash_hmac('sha256', 'dewee-webchat:subject:' . $subject, $handler->secret, true));
+            if (!is_array($claims) || !isset($claims['ids'], $claims['ida'], $claims['sub']) || !hash_equals($claims['sub'], $digest)) return;
+            $ctx = $handler->visitorContext();
+            $handler->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $handler->ccp->json('identity/revoke', $ctx + ['body' => ['identity_session' => $claims['ids'], 'agent' => $claims['ida']], 'session' => $edge['token'], 'timeout' => 5.0]));
+        } catch (Throwable) {
+            error_log('[dewee-webchat] identity revoke failed');
+        }
     }
 
     /**
@@ -260,6 +281,21 @@ final class DeweeWebchat
         if (self::resolveTransport($this->o) === 'ccp') {
             $this->ccp = DeweeCcpClient::fromOptions($this->o['ccp'] ?? null);
         }
+        $identity = $this->o['identity'] ?? null;
+        if ($identity !== null) {
+            if (!is_array($identity) || !is_callable($identity['authenticate'] ?? null) || $this->byo !== null) throw new DeweeConfigError('[dewee-webchat] invalid identity configuration');
+            if ($this->ccp === null && (empty($this->o['gatewayUrl']) || empty($this->o['token']))) throw new DeweeConfigError('[dewee-webchat] identity needs gateway credentials');
+            try { self::createSessionAssertion($identity, 'configuration-check'); }
+            catch (Throwable) { throw new DeweeConfigError('[dewee-webchat] invalid identity signer'); }
+            $ttl = $identity['sessionTtlSeconds'] ?? 3600;
+            if (!is_int($ttl) || $ttl < 60 || $ttl > 43200) throw new DeweeConfigError('[dewee-webchat] invalid identity session lifetime');
+            if (isset($identity['audience']) && strtolower((string) $identity['audience']) !== 'dewee:' . strtolower($identity['appId'])) throw new DeweeConfigError('[dewee-webchat] invalid identity audience');
+            $agent = $identity['agent'] ?? ($this->ccp === null ? ($this->o['defaultAgent'] ?? ($this->staticAgents[0]['id'] ?? '')) : '');
+            if (!is_string($agent) || ($agent !== '' && !preg_match(self::AGENT_RE, $agent)) || ($this->ccp === null && $agent === '')) throw new DeweeConfigError('[dewee-webchat] invalid identity agent');
+            if ($this->ccp === null && $this->staticAgents && !in_array($agent, array_column($this->staticAgents, 'id'), true)) throw new DeweeConfigError('[dewee-webchat] identity agent is not allowed');
+            $this->identity = $identity;
+            $this->identityAgent = $agent;
+        }
     }
 
     /**
@@ -299,9 +335,6 @@ final class DeweeWebchat
             }
             if (!empty($o['defaultAgent'])) {
                 $refuse('defaultAgent does not apply to the ccp transport: choose the default agent on the CCP Website chat page');
-            }
-            if (!empty($o['identity'])) {
-                $refuse('the PHP backend has no signed-in (identity) mode; use the Node handler for signed-in users');
             }
             if (!is_string($o['secret'] ?? null) || strlen($o['secret']) < 32) {
                 $refuse('the ccp transport needs secret (DEWEE_WEBCHAT_SECRET), at least 32 bytes');
@@ -374,6 +407,8 @@ final class DeweeWebchat
                 $method === 'POST' && $action === 'session' => $this->handleSession(),
                 $method === 'POST' && $action === 'chat' => $this->handleChat(),
                 $method === 'GET' && $action === 'history' => $this->handleHistory(),
+                $method === 'POST' && $action === 'link' && $this->identity !== null => $this->handleLink(),
+                $method === 'POST' && $action === 'job-access' && $this->identity !== null => $this->handleJobAccess(),
                 default => $this->fail(404, 'Not found', 'not_found'),
             };
         } catch (Throwable $e) {
@@ -413,12 +448,29 @@ final class DeweeWebchat
             'maxMessageLength' => $this->o['maxMessageLength'],
             'version' => self::VERSION,
         ];
+        if ($this->identity !== null) {
+            $body['identity'] = true;
+            $body['defaultAgent'] = $this->identityAgent;
+            $body['allowAgentSwitch'] = false;
+        }
         $this->json(self::withoutNulls($body));
     }
 
     private function handleSession(): void
     {
         $ip = $this->clientIp();
+        if ($this->identity !== null) {
+            if (!$this->rateLimit($ip, 'preauth')) { $this->fail(429, 'Too many requests, slow down', 'rate_limited'); return; }
+            try { $user = ($this->identity['authenticate'])(); }
+            catch (Throwable) { $this->identityFail('SOURCE_UNAVAILABLE'); return; }
+            if ($user !== null) {
+                if (!is_array($user) || !is_string($user['subject'] ?? null) || trim($user['subject']) === '') { $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured'); return; }
+                if (!$this->rateLimit('subject:' . $user['subject'], 'verified')) { $this->fail(429, 'Too many sessions, slow down', 'rate_limited'); return; }
+                $this->handleIdentitySession($user['subject'], $ip);
+                return;
+            }
+            if (!empty($this->identity['required'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        }
         if ($this->ccp !== null) {
             $this->handleCcpSession($ip);
             return;
@@ -490,6 +542,194 @@ final class DeweeWebchat
         ]);
     }
 
+    private function identityFail(string $code, mixed $remediation = null): void
+    {
+        [$status, $message, $action] = self::IDENTITY_ERRORS[$code];
+        $this->json(['error' => ['message' => $message, 'code' => $code, 'remediation' => self::knownRemediation($remediation) ?? ['action' => $action, 'audience' => 'end_user']]], $status);
+    }
+
+    /** A signed-in host user gets an identity session or an error, never an anonymous fallback. */
+    private function handleIdentitySession(string $subject, string $ip): void
+    {
+        $body = $this->readJsonBody() ?? [];
+        if (!empty($this->o['turnstile'])) {
+            $token = $body['turnstileToken'] ?? null;
+            if (!is_string($token) || $token === '' || !self::verifyTurnstile((string) $this->o['turnstile']['secretKey'], $token, $ip)) {
+                $this->fail(403, 'Verification failed', 'turnstile_failed'); return;
+            }
+        }
+        try { $assertion = self::createSessionAssertion($this->identity, $subject); }
+        catch (Throwable) { $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured'); return; }
+        $ttl = $this->identity['sessionTtlSeconds'] ?? 3600;
+        $edge = null;
+        try {
+            if ($this->ccp !== null) {
+                $cfg = $this->ccpConfig();
+                $agent = $this->identityAgent !== '' ? $this->identityAgent : $cfg['defaultAgent'];
+                $visitor = self::b64url(substr(hash_hmac('sha256', 'dewee-webchat:visitor:subject:' . $subject, $this->secret, true), 0, 16));
+                $ctx = $this->visitorContext();
+                $digest = self::b64url(hash_hmac('sha256', 'dewee-webchat:subject:' . $subject, $this->secret, true));
+                $hint = is_string($body['reuseHint'] ?? null) ? self::verifyVisitorToken($this->secret, $body['reuseHint'], true, 'reuse') : null;
+                $reuse = is_array($hint) && isset($hint['ids'], $hint['ida'], $hint['sub']) && $hint['v'] === $visitor && $hint['ida'] === $agent && hash_equals($hint['sub'], $digest) && $hint['exp'] - self::nowMs() > 120000;
+                $edge = $this->edgeFor($ctx, $visitor, $reuse ? self::sealedEdge($hint) : null, null, self::EDGE_RESEAL_MS);
+                if ($reuse) {
+                    $session = $hint['ids'];
+                    $principal = 'reused';
+                    $exchange = ['expires_at' => gmdate('c', (int) floor($hint['exp'] / 1000))];
+                } else {
+                    $exchange = $this->withEdge($ctx, $visitor, $edge, function (array $current) use ($ctx, $assertion, $agent, $ttl, &$edge) {
+                        $edge = $current;
+                        return $this->ccp->json('identity/exchange', $ctx + ['body' => ['assertion' => $assertion, 'agent' => $agent, 'ttl_seconds' => $ttl], 'session' => $current['token']]);
+                    });
+                    $session = $exchange['identity_session'] ?? null;
+                    $principal = $exchange['principal_ref'] ?? null;
+                }
+            } else {
+                $agent = $this->identityAgent;
+                $base = self::identityGatewayBase((string) $this->o['gatewayUrl'], !empty($this->identity['allowInsecureHttp']));
+                [$status, $raw] = self::httpRequest('POST', $base . '/v1/identity/sessions/exchange', ['Accept: application/json', 'Content-Type: application/json', 'Authorization: Dewee-Assertion ' . $assertion], (string) json_encode(['agent_id' => $agent, 'ttl_seconds' => $ttl]));
+                $exchange = json_decode($raw, true);
+                if ($status < 200 || $status >= 300) {
+                    $code = is_array($exchange) ? ($exchange['error']['code'] ?? null) : null;
+                    $remediation = is_array($exchange) ? self::knownRemediation($exchange['error']['remediation'] ?? null) : null;
+                    if ($code === 'NOT_FOUND' || (is_string($code) && isset(self::IDENTITY_ERRORS[$code]) && $remediation !== null && $remediation['audience'] !== 'end_user')) $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured');
+                    elseif (is_string($code) && isset(self::IDENTITY_ERRORS[$code])) $this->identityFail($code, $remediation);
+                    elseif ($code === 'RESOURCE_EXHAUSTED') $this->fail(429, 'Too many sign-ins, slow down', 'rate_limited');
+                    elseif ($code === 'INVALID_ARGUMENT' || $code === 'SERVER_ONLY') $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured');
+                    else $this->fail(502, 'Dewee is unavailable, try again later', 'gateway_error');
+                    return;
+                }
+                $session = $exchange['session_token'] ?? null;
+                $principal = $exchange['principal_id'] ?? null;
+                if (!is_string($principal) || $principal === '') throw new RuntimeException('invalid identity exchange');
+                $visitor = self::b64url(substr(hash_hmac('sha256', 'dewee-webchat:visitor:principal:' . $principal, $this->secret, true), 0, 16));
+            }
+            if (!is_string($agent) || !preg_match(self::AGENT_RE, $agent) || !is_string($session) || $session === '' || strlen($session) > 512 || !is_string($principal) || $principal === '') throw new RuntimeException('invalid identity exchange');
+            $expires = strtotime((string) ($exchange['expires_at'] ?? ''));
+            if ($expires === false) throw new RuntimeException('invalid identity expiry');
+            $now = self::nowMs();
+            $lifetime = $expires * 1000 - $now;
+            if ($lifetime <= 0 || $lifetime > $ttl * 1000) $lifetime = $ttl * 1000;
+            $expiresAt = min($now + $lifetime, $now + (int) $this->o['sessionTtlMs']);
+            $sub = self::b64url(hash_hmac('sha256', 'dewee-webchat:subject:' . $subject, $this->secret, true));
+            $claims = ['v' => $visitor, 'exp' => $expiresAt, 'ids' => $session, 'ida' => $agent, 'sub' => $sub];
+            if ($edge !== null) { $claims['es'] = $edge['token']; $claims['ese'] = $edge['expiresAt']; }
+            $refresh = $edge !== null ? min($expiresAt, $edge['expiresAt']) : $expiresAt;
+            $answer = ['visitorId' => $visitor, 'token' => self::signVisitorToken($this->secret, $claims), 'expiresAt' => $refresh, 'expiresIn' => max(0, $refresh - self::nowMs()), 'verified' => true];
+            if ($edge !== null) $answer['reuseHint'] = self::signVisitorToken($this->secret, $claims, 'reuse');
+            $this->json($answer);
+        } catch (DeweeCcpError $e) {
+            if (isset(self::IDENTITY_ERRORS[$e->ccpCode]) && $e->remediation !== null && $e->remediation['audience'] !== 'end_user') $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured');
+            else $this->ccpFail($e, 'identity/exchange');
+        } catch (Throwable) {
+            $this->identityFail('SOURCE_UNAVAILABLE');
+        }
+    }
+
+    private function handleJobAccess(): void
+    {
+        $origin = self::header('origin') ?? '';
+        $parsed = parse_url($origin);
+        if (!is_array($parsed) || ($parsed['scheme'] ?? '') !== 'https' || empty($parsed['host']) || isset($parsed['user']) || isset($parsed['pass']) || isset($parsed['path']) || isset($parsed['query']) || isset($parsed['fragment']) || (isset($parsed['port']) && $parsed['port'] === 443) || $origin !== 'https://' . strtolower($parsed['host']) . (isset($parsed['port']) ? ':' . $parsed['port'] : '')) {
+            $this->fail(403, 'Open job access from your signed-in chat', 'forbidden_origin'); return;
+        }
+        $claims = $this->claimsFromRequest();
+        if (!isset($claims['ids'], $claims['ida'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims, true)) return;
+        if ($this->ccp === null && !$this->wildcardAgents && !in_array($claims['ida'], array_column($this->staticAgents, 'id'), true)) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+        if (!$this->rateLimit('visitor:' . $claims['v'], 'link')) { $this->fail(429, 'Too many requests, try again later', 'rate_limited'); return; }
+        $input = json_decode((string) file_get_contents('php://input'));
+        if (!$input instanceof stdClass || get_object_vars($input) !== []) { $this->fail(400, 'Invalid request', 'invalid_request'); return; }
+        try {
+            if ($this->ccp !== null) {
+                $ctx = $this->visitorContext();
+                $launch = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json('job-access', $ctx + ['body' => ['identity_session' => $claims['ids'], 'agent' => $claims['ida']], 'session' => $edge['token'], 'timeout' => 10.0]));
+            } else {
+                $base = self::identityGatewayBase((string) $this->o['gatewayUrl'], false);
+                $gateway = parse_url($base);
+                if (($gateway['scheme'] ?? '') !== 'https' || (($gateway['path'] ?? '') !== '' && $gateway['path'] !== '/')) throw new RuntimeException('invalid launch');
+                $gatewayOrigin = 'https://' . strtolower($gateway['host']) . (isset($gateway['port']) && $gateway['port'] !== 443 ? ':' . $gateway['port'] : '');
+                [$status, $raw] = self::httpRequest('POST', $base . '/v1/identity/job-access/launch', ['Content-Type: application/json', 'X-Dewee-Identity-Session: ' . $claims['ids']], (string) json_encode(['launch_origin' => $origin]), 10.0);
+                $launch = json_decode($raw, true);
+                if ($status < 200 || $status >= 300) {
+                    $code = is_array($launch) ? ($launch['error']['code'] ?? null) : null;
+                    if (is_string($code) && isset(self::IDENTITY_ERRORS[$code])) { $this->identityFail($code, $launch['error']['remediation'] ?? null); return; }
+                    throw new RuntimeException('launch refused');
+                }
+            }
+            if (!is_array($launch) || !is_string($launch['bootstrap_url'] ?? null) || !is_string($launch['launch_token'] ?? null) || !preg_match('/^[A-Za-z0-9_.-]{16,16384}$/D', $launch['launch_token']) || hash_equals($claims['ids'], $launch['launch_token'])) throw new RuntimeException('invalid launch');
+            $url = parse_url($launch['bootstrap_url']);
+            if (!is_array($url) || ($url['scheme'] ?? '') !== 'https' || empty($url['host']) || isset($url['user']) || isset($url['pass']) || isset($url['query']) || isset($url['fragment']) || ($url['path'] ?? '') !== '/identity/job-access/launch') throw new RuntimeException('invalid launch');
+            $launchOrigin = 'https://' . strtolower($url['host']) . (isset($url['port']) ? ':' . $url['port'] : '');
+            if ($launch['bootstrap_url'] !== $launchOrigin . '/identity/job-access/launch' || ($this->ccp === null && $launchOrigin !== $gatewayOrigin)) throw new RuntimeException('invalid launch');
+            $expires = strtotime((string) ($launch['expires_at'] ?? ''));
+            if ($expires === false || $expires * 1000 <= self::nowMs() || $expires * 1000 > self::nowMs() + 60000) throw new RuntimeException('invalid launch');
+            $this->json(['bootstrap_url' => $launch['bootstrap_url'], 'launch_token' => $launch['launch_token'], 'expires_at' => $launch['expires_at']]);
+        } catch (DeweeCcpError $e) { $this->ccpFail($e, 'job-access'); }
+        catch (Throwable) { $this->fail(502, 'Job access is unavailable. Try again later.', 'job_access_unavailable'); }
+    }
+
+    private function handleLink(): void
+    {
+        $claims = $this->claimsFromRequest();
+        if (!isset($claims['ids'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims)) return;
+        if (!$this->rateLimit('visitor:' . $claims['v'], 'link')) { $this->fail(429, 'Too many link requests, slow down', 'rate_limited'); return; }
+        $body = $this->readJsonBody() ?? [];
+        $idempotency = $body['idempotencyKey'] ?? null;
+        if ($idempotency !== null && (!is_string($idempotency) || !preg_match('/^[\x21-\x7e]{1,255}$/D', $idempotency))) { $this->fail(400, 'Invalid idempotency key'); return; }
+        try {
+            if ($this->ccp !== null) {
+                $ctx = $this->visitorContext();
+                $input = ['identity_session' => $claims['ids'], 'agent' => $claims['ida']];
+                $extra = $idempotency !== null ? ['idempotencyKey' => self::b64url(hash('sha256', $idempotency, true))] : [];
+                $link = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json('link', $ctx + ['body' => $input, 'session' => $edge['token']] + $extra));
+            } else {
+                $headers = ['Content-Type: application/json', 'Accept: application/json', 'X-Dewee-Identity-Session: ' . $claims['ids']];
+                if ($idempotency !== null) $headers[] = 'Idempotency-Key: ' . $idempotency;
+                [$status, $raw] = self::httpRequest('POST', self::identityGatewayBase((string) $this->o['gatewayUrl'], !empty($this->identity['allowInsecureHttp'])) . '/v1/identity/links', $headers, '{"kind":"web_first"}');
+                $link = json_decode($raw, true);
+                if ($status < 200 || $status >= 300) {
+                    $code = is_array($link) ? ($link['error']['code'] ?? null) : null;
+                    if (is_string($code) && isset(self::IDENTITY_ERRORS[$code])) $this->identityFail($code, $link['error']['remediation'] ?? null);
+                    elseif ($code === 'RESOURCE_EXHAUSTED') $this->fail(429, 'Too many sign-ins, slow down', 'rate_limited');
+                    elseif ($code === 'INVALID_ARGUMENT' || $code === 'SERVER_ONLY') $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured');
+                    elseif ($code === 'IDEMPOTENCY_KEY_REUSED') $this->fail(409, 'This idempotency key was already used for a different link request', 'idempotency_key_reused');
+                    elseif ($code === 'FAILED_PRECONDITION') $this->fail(409, 'A link is already in progress. Use its code or wait until it expires.', 'link_in_progress');
+                    elseif ($code === 'NOT_FOUND') $this->fail(503, 'Linking is not available right now', 'linking_unavailable');
+                    else $this->fail(502, 'Dewee is unavailable, try again later', 'gateway_error');
+                    return;
+                }
+            }
+            if (!is_array($link) || !is_string($link['proof_code'] ?? null) || $link['proof_code'] === '') throw new RuntimeException('invalid link response');
+            $expires = strtotime((string) ($link['expires_at'] ?? ''));
+            if ($expires === false) throw new RuntimeException('invalid link expiry');
+            $links = [];
+            foreach (array_slice(is_array($link['deep_links'] ?? null) ? $link['deep_links'] : [], 0, 20) as $target) {
+                if (!is_array($target)) continue;
+                if ($this->ccp !== null) {
+                    $channel = $target['channel'] ?? null;
+                    if (is_string($channel) && preg_match('/^[A-Za-z0-9_.-]{1,64}$/D', $channel)) $links[] = ['channelType' => $channel, 'channelInstanceId' => '', 'name' => $channel];
+                } else {
+                    $entry = ['channelType' => (string) ($target['channel_type'] ?? ''), 'channelInstanceId' => (string) ($target['channel_instance_id'] ?? ''), 'name' => (string) ($target['name'] ?? '')];
+                    if (is_string($target['display_name'] ?? null) && $target['display_name'] !== '') $entry['displayName'] = $target['display_name'];
+                    $links[] = $entry;
+                }
+            }
+            $this->json(['proofCode' => substr($link['proof_code'], 0, 64), 'expiresAt' => $expires * 1000, 'deepLinks' => $links]);
+        } catch (DeweeCcpError $e) { $this->ccpFail($e, 'link'); }
+        catch (Throwable) { $this->identityFail('SOURCE_UNAVAILABLE'); }
+    }
+
+    private static function identityGatewayBase(string $base, bool $allowInsecure): string
+    {
+        $url = parse_url($base);
+        if ($url === false || empty($url['scheme']) || empty($url['host']) || isset($url['user']) || isset($url['pass']) || isset($url['query']) || isset($url['fragment'])) throw new InvalidArgumentException('invalid gateway URL');
+        $scheme = strtolower($url['scheme']); $host = strtolower($url['host']);
+        if ($scheme !== 'https' && !($scheme === 'http' && ($allowInsecure || in_array($host, ['localhost', '127.0.0.1', '::1', '[::1]'], true)))) throw new InvalidArgumentException('invalid gateway URL');
+        return rtrim($base, '/');
+    }
+
     private function handleChat(): void
     {
         $claims = $this->claimsFromRequest();
@@ -498,6 +738,8 @@ final class DeweeWebchat
             $this->fail(401, 'Missing or expired visitor session', 'unauthorized');
             return;
         }
+        if (!empty($this->identity['required']) && !isset($claims['ids'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims)) return;
         if (!$this->rateLimit($visitorId . '|' . $this->clientIp(), 'chat')) {
             $this->fail(429, 'Too many messages, please wait a moment', 'rate_limited');
             return;
@@ -533,6 +775,11 @@ final class DeweeWebchat
         $agent = $this->ccp !== null
             ? self::ccpAgentFor($requested)
             : $this->pickAgent(is_string($requested) ? $requested : null, $creds, $isByo);
+        if (isset($claims['ids'])) {
+            if (is_string($requested) && $requested !== '' && $requested !== $claims['ida']) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+            if ($this->ccp === null && !$this->wildcardAgents && !in_array($claims['ida'], array_column($this->staticAgents, 'id'), true)) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+            $agent = $claims['ida'];
+        }
         if ($agent === null) {
             $this->fail(403, 'Agent not allowed', 'agent_not_allowed');
             return;
@@ -563,6 +810,16 @@ final class DeweeWebchat
 
         $sessionKey = self::buildSessionKey($agent, "webchat-{$visitorId}-{$conversationId}");
 
+        $connection = null;
+        if (isset($claims['ids'])) {
+            try { $connection = DeweeGatewayConnection::connect($creds, '', 15.0, $claims['ids']); }
+            catch (DeweeGatewayError $e) {
+                if (is_string($e->gatewayCode) && isset(self::IDENTITY_ERRORS[$e->gatewayCode])) $this->identityFail($e->gatewayCode, $e->remediation);
+                else $this->identityFail('SOURCE_UNAVAILABLE');
+                return;
+            }
+        }
+
         $this->beginEventStream();
         $lastWrite = microtime(true);
         $aborted = false;
@@ -588,12 +845,16 @@ final class DeweeWebchat
         try {
             $emit(['type' => 'start', 'conversationId' => $conversationId, 'agent' => $agent, 'actionsHash' => $actionsHash]);
             // $reason: the gateway's own text of a refusal, for onChat only (never sent to the browser).
-            $observe = static function (array $e, ?string $reason = null) use ($emit, &$reply, &$errMsg): bool {
+            $observe = static function (array $e, ?string $reason = null) use ($emit, &$reply, &$errMsg, $claims): bool {
                 if ($e['type'] === 'done') {
                     $reply = (string) $e['content'];
                 }
                 if ($e['type'] === 'error') {
-                    $errMsg = $reason ?? (string) $e['message'];
+                    if (isset($claims['ids'])) {
+                        $code = $e['code'] ?? null;
+                        if (!is_string($code) || (!isset(self::IDENTITY_ERRORS[$code]) && !in_array($code, self::ADMISSION_ERROR_CODES, true))) $e = ['type' => 'error', 'message' => 'Dewee is unavailable, try again later', 'code' => 'gateway_error'];
+                        $errMsg = (string) $e['message'];
+                    } else $errMsg = $reason ?? (string) $e['message'];
                 }
                 return $emit($e);
             };
@@ -606,13 +867,15 @@ final class DeweeWebchat
                 (int) $this->o['timeoutMs'],
                 $observe,
                 $idle,
+                $connection,
             );
         } catch (Throwable $e) {
             // A refused connect is still an admission refusal.
             $event = $e instanceof DeweeGatewayError && in_array($e->gatewayCode, self::ADMISSION_ERROR_CODES, true)
                 ? self::gatewayErrorEvent($e)
                 : ['type' => 'error', 'message' => $e->getMessage(), 'code' => 'gateway_error'];
-            $errMsg = $e->getMessage();
+            if (isset($claims['ids'])) $event = ['type' => 'error', 'message' => 'Dewee is unavailable, try again later', 'code' => 'gateway_error'];
+            $errMsg = isset($claims['ids']) ? 'Dewee is unavailable, try again later' : $e->getMessage();
             $emit($event);
         } finally {
             if (isset($this->o['onChat']) && is_callable($this->o['onChat'])) {
@@ -633,6 +896,8 @@ final class DeweeWebchat
             $this->fail(401, 'Missing or expired visitor session', 'unauthorized');
             return;
         }
+        if (!empty($this->identity['required']) && !isset($claims['ids'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims)) return;
         [$creds, $isByo, $error] = $this->resolveCreds();
         if ($error !== null) {
             $this->fail(400, $error, 'bad_credentials');
@@ -653,6 +918,11 @@ final class DeweeWebchat
         }
         $requested = $_GET['agent'] ?? null;
         $agent = $this->pickAgent(is_string($requested) && $requested !== '' ? $requested : null, $creds, $isByo);
+        if (isset($claims['ids'])) {
+            if (is_string($requested) && $requested !== '' && $requested !== $claims['ida']) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+            if (!$this->wildcardAgents && !in_array($claims['ida'], array_column($this->staticAgents, 'id'), true)) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+            $agent = $claims['ida'];
+        }
         if ($agent === null) {
             $this->fail(403, 'Agent not allowed', 'agent_not_allowed');
             return;
@@ -663,14 +933,16 @@ final class DeweeWebchat
                 $this->o['userIdPrefix'] . $visitorId,
                 $agent,
                 self::buildSessionKey($agent, "webchat-{$visitorId}-{$conversationId}"),
+                $claims['ids'] ?? null,
             );
         } catch (Throwable $e) {
+            if ($e instanceof DeweeGatewayError && is_string($e->gatewayCode) && isset(self::IDENTITY_ERRORS[$e->gatewayCode])) { $this->identityFail($e->gatewayCode, $e->remediation); return; }
             // A conversation that has not sent its first message yet does not exist on the gateway.
             if ($e instanceof DeweeGatewayError && $e->gatewayCode === 'NOT_FOUND') {
                 $this->json(['messages' => []]);
                 return;
             }
-            $this->fail(502, $e->getMessage(), 'gateway_error');
+            $this->fail(502, isset($claims['ids']) ? 'Dewee is unavailable, try again later' : $e->getMessage(), 'gateway_error');
             return;
         }
         $this->json(['messages' => $messages]);
@@ -698,8 +970,9 @@ final class DeweeWebchat
         }
         $this->json(self::withoutNulls([
             'agents' => $cfg['agents'],
-            'defaultAgent' => $cfg['defaultAgent'],
-            'allowAgentSwitch' => ($this->o['allowAgentSwitch'] ?? null) === false ? false : $cfg['allowAgentSwitch'],
+            'defaultAgent' => $this->identity !== null && $this->identityAgent !== '' ? $this->identityAgent : $cfg['defaultAgent'],
+            'allowAgentSwitch' => $this->identity !== null ? false : (($this->o['allowAgentSwitch'] ?? null) === false ? false : $cfg['allowAgentSwitch']),
+            'identity' => $this->identity !== null ? true : null,
             'allowClientCredentials' => false,
             'turnstileSiteKey' => $this->o['turnstile']['siteKey'] ?? null,
             // A returning visitor's refresh needs no challenge (see handleCcpSession).
@@ -741,7 +1014,7 @@ final class DeweeWebchat
             $this->fail(413, "Message exceeds {$cfg['maxMessageChars']} characters", 'too_long');
             return;
         }
-        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []);
+        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
         $edge = null;
         try {
             $fp = $this->withEdge($ctx, $visitorId, self::sealedEdge($claims), function (array $e) use ($ctx, $body, &$edge) {
@@ -946,6 +1219,10 @@ final class DeweeWebchat
             return;
         }
         $agent = self::ccpAgentFor($_GET['agent'] ?? null);
+        if (isset($claims['ids'])) {
+            if ($agent !== '' && $agent !== $claims['ida']) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+            $agent = $claims['ida'];
+        }
         if ($agent === null) {
             $this->fail(400, 'Invalid agent');
             return;
@@ -956,7 +1233,7 @@ final class DeweeWebchat
             return;
         }
         $ctx = $this->visitorContext();
-        $body = ['conversation_id' => $conversationId, 'limit' => 50] + ($agent !== '' ? ['agent' => $agent] : []);
+        $body = ['conversation_id' => $conversationId, 'limit' => 50] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
         try {
             $cfg = $this->ccpConfig();
             $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $e) => $this->ccp->json('history', $ctx + ['body' => $body, 'session' => $e['token']]));
@@ -1268,6 +1545,12 @@ final class DeweeWebchat
         }
         $limited = ['status' => 429, 'code' => 'rate_limited', 'message' => 'Too many messages, please wait a moment'] + ($e->retryAfterSeconds ? ['retryAfterSeconds' => $e->retryAfterSeconds] : []);
         switch ($e->ccpCode) {
+            case 'idempotency_key_reused':
+                return ['status' => 409, 'code' => 'idempotency_key_reused', 'message' => 'This idempotency key was already used for a different link request'];
+            case 'link_in_progress':
+                return ['status' => 409, 'code' => 'link_in_progress', 'message' => 'A link is already in progress. Use its code or wait until it expires.'];
+            case 'linking_unavailable':
+                return ['status' => 503, 'code' => 'linking_unavailable', 'message' => 'Linking is not available right now'];
             case 'invalid_request':
                 $log('- the ingress refused the request shape; check the dewee-webchat version');
                 return ['status' => 400, 'code' => 'bad_request', 'message' => 'Invalid request'];
@@ -1577,9 +1860,19 @@ final class DeweeWebchat
      *
      * @param array{v: string, exp: int|float, es?: string, ese?: int|float} $claims
      */
-    public static function signVisitorToken(string $secret, array $claims): string
+    public static function signVisitorToken(string $secret, array $claims, ?string $purpose = null): string
     {
         $wire = ['v' => $claims['v'], 'exp' => $claims['exp']];
+        if (isset($claims['ids']) || isset($claims['ida'])) {
+            if (!is_string($claims['ids'] ?? null) || $claims['ids'] === '' || strlen($claims['ids']) > 512 || !is_string($claims['ida'] ?? null) || !preg_match(self::AGENT_RE, $claims['ida'])) throw new InvalidArgumentException('invalid identity session');
+            $sealed = ['t' => $claims['ids']];
+            if (isset($claims['sub'])) {
+                if (!is_string($claims['sub'])) throw new InvalidArgumentException('invalid identity digest');
+                $sealed['h'] = $claims['sub'];
+            }
+            $wire['ids'] = self::sealIdentitySession($secret, $claims['v'], $claims['ida'], $sealed);
+            $wire['ida'] = $claims['ida'];
+        }
         if (isset($claims['es'])) {
             if (!is_string($claims['es']) || $claims['es'] === '' || strlen($claims['es']) > self::MAX_EDGE_SESSION_LENGTH) {
                 throw new InvalidArgumentException('edge session token is empty or too long');
@@ -1590,6 +1883,7 @@ final class DeweeWebchat
             $wire['es'] = self::sealEdgeSession($secret, $claims['v'], $claims['es']);
             $wire['ese'] = $claims['ese'];
         }
+        if ($purpose !== null) $wire['p'] = $purpose;
         $body = self::b64url((string) json_encode($wire, self::JSON_FLAGS));
         return $body . '.' . self::b64url(hash_hmac('sha256', $body, $secret, true));
     }
@@ -1601,7 +1895,7 @@ final class DeweeWebchat
      *
      * @return array{v: string, exp: int|float, es?: string, ese?: int|float}|null
      */
-    public static function verifyVisitorToken(string $secret, string $token): ?array
+    public static function verifyVisitorToken(string $secret, string $token, bool $allowIdentity = false, ?string $purpose = null): ?array
     {
         $parts = explode('.', $token);
         $body = $parts[0];
@@ -1623,10 +1917,18 @@ final class DeweeWebchat
             return null;
         }
         // Signed-in tokens and purpose-labelled tokens (a Node backend's reuse hint) are no visitor token here.
-        if (array_key_exists('ids', $claims) || array_key_exists('ida', $claims) || array_key_exists('p', $claims)) {
+        if (($purpose === null && array_key_exists('p', $claims)) || ($purpose !== null && ($claims['p'] ?? null) !== $purpose)) {
             return null;
         }
         $out = ['v' => $claims['v'], 'exp' => $exp];
+        if (array_key_exists('ids', $claims) || array_key_exists('ida', $claims)) {
+            if (!$allowIdentity || !is_string($claims['ids'] ?? null) || strlen($claims['ids']) > 4200 || !is_string($claims['ida'] ?? null) || !preg_match(self::AGENT_RE, $claims['ida']) || array_key_exists('sub', $claims)) return null;
+            $identity = self::openIdentitySession($secret, $claims['v'], $claims['ida'], $claims['ids']);
+            if ($identity === null) return null;
+            $out['ids'] = $identity['t'];
+            $out['ida'] = $claims['ida'];
+            if (isset($identity['h'])) $out['sub'] = $identity['h'];
+        }
         // An edge session claim is all or nothing: the sealed token always travels with its expiry.
         if (array_key_exists('es', $claims) || array_key_exists('ese', $claims)) {
             $ese = $claims['ese'] ?? null;
@@ -1648,6 +1950,24 @@ final class DeweeWebchat
     {
         static $cache = [];
         return $cache[$info . "\n" . $secret] ??= hash_hkdf('sha256', $secret, 32, $info, 'dewee-webchat');
+    }
+
+    private static function sealIdentitySession(string $secret, string $visitor, string $agent, array $identity): string
+    {
+        $iv = random_bytes(12); $tag = '';
+        $ct = openssl_encrypt((string) json_encode($identity, self::JSON_FLAGS), 'aes-256-gcm', self::sealKey($secret, self::IDENTITY_SEAL_INFO), OPENSSL_RAW_DATA, $iv, $tag, "dewee-webchat:ids:{$visitor}:{$agent}", 16);
+        if ($ct === false) throw new RuntimeException('could not seal identity session');
+        return self::b64url($iv . $ct . $tag);
+    }
+
+    private static function openIdentitySession(string $secret, string $visitor, string $agent, string $sealed): ?array
+    {
+        $raw = self::fromB64url($sealed);
+        if ($raw === null || strlen($raw) <= 28) return null;
+        $pt = openssl_decrypt(substr($raw, 12, -16), 'aes-256-gcm', self::sealKey($secret, self::IDENTITY_SEAL_INFO), OPENSSL_RAW_DATA, substr($raw, 0, 12), substr($raw, -16), "dewee-webchat:ids:{$visitor}:{$agent}");
+        $value = is_string($pt) ? json_decode($pt, true) : null;
+        if (!is_array($value) || !is_string($value['t'] ?? null) || $value['t'] === '' || strlen($value['t']) > 512 || (isset($value['h']) && !is_string($value['h']))) return null;
+        return $value;
     }
 
     private static function sealEdgeSession(string $secret, string $v, string $token): string
@@ -1688,7 +2008,26 @@ final class DeweeWebchat
     {
         $auth = self::header('authorization') ?? '';
         $token = str_starts_with($auth, 'Bearer ') ? substr($auth, 7) : '';
-        return $token !== '' ? self::verifyVisitorToken($this->secret, $token) : null;
+        return $token !== '' ? self::verifyVisitorToken($this->secret, $token, $this->identity !== null) : null;
+    }
+
+    private function identityRebind(array $claims, bool $required = false): bool
+    {
+        if (!isset($claims['ids']) || (!$required && empty($this->identity['rebindEachRequest']))) return true;
+        if (!$this->rateLimit($this->clientIp(), 'preauth')) { $this->fail(429, 'Too many requests, slow down', 'rate_limited'); return false; }
+        try { $user = ($this->identity['authenticate'])(); }
+        catch (Throwable) { $this->identityFail('SOURCE_UNAVAILABLE'); return false; }
+        $subject = is_array($user) && is_string($user['subject'] ?? null) ? $user['subject'] : '';
+        $digest = self::b64url(hash_hmac('sha256', 'dewee-webchat:subject:' . $subject, $this->secret, true));
+        if ($subject === '' || !isset($claims['sub']) || !hash_equals($claims['sub'], $digest)) {
+            if ($subject !== '' && isset($claims['sub']) && $this->ccp !== null) {
+                $ctx = $this->visitorContext();
+                try { $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json('identity/revoke', $ctx + ['body' => ['identity_session' => $claims['ids'], 'agent' => $claims['ida']], 'session' => $edge['token'], 'timeout' => 5.0])); }
+                catch (Throwable) { error_log('[dewee-webchat] identity revoke failed'); }
+            }
+            $this->identityFail('IDENTITY_REQUIRED'); return false;
+        }
+        return true;
     }
 
     // ---------------------------------------------------------------- security helpers
@@ -1959,6 +2298,121 @@ final class DeweeWebchat
 
     // ---------------------------------------------------------------- small utilities
 
+    /** Signs a short-lived partner assertion. The private key and subject never leave this server. */
+    private static function createSessionAssertion(array $identity, string $subject): string
+    {
+        $appId = $identity['appId'] ?? '';
+        $issuer = $identity['issuer'] ?? '';
+        if (!is_string($appId) || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iD', $appId) || $appId === '00000000-0000-0000-0000-000000000000') {
+            throw new InvalidArgumentException('invalid application id');
+        }
+        $appId = strtolower($appId);
+        if (!is_string($issuer) || !preg_match('//u', $issuer) || trim($issuer) === '' || strlen($issuer) > 255 || preg_match('/\s/', $issuer)) {
+            throw new InvalidArgumentException('invalid issuer');
+        }
+        if (!preg_match('//u', $subject) || trim($subject) === '' || strlen($subject) > 255 || str_contains($subject, '@')) {
+            throw new InvalidArgumentException('invalid subject');
+        }
+        $secret = $identity['assertionSecret'] ?? null;
+        $jwk = $identity['privateKeyJwk'] ?? null;
+        if (array_key_exists('assertionSecret', $identity) === array_key_exists('privateKeyJwk', $identity)) throw new InvalidArgumentException('configure exactly one assertion signer');
+        $header = ['alg' => 'HS256', 'typ' => 'dewee-session+jwt'];
+        $key = null;
+        if ($secret !== null) {
+            if (!is_string($secret) || strlen($secret) < 32) throw new InvalidArgumentException('invalid assertion signer');
+        } else {
+            if (!is_array($jwk) || !is_string($jwk['kid'] ?? null) || $jwk['kid'] === '' || !preg_match('//u', $jwk['kid'])) throw new InvalidArgumentException('invalid assertion signer');
+            $alg = $identity['algorithm'] ?? ($jwk['alg'] ?? null);
+            if (!in_array($alg, ['RS256', 'ES256', 'EdDSA'], true)) throw new InvalidArgumentException('unsupported assertion algorithm');
+            if (isset($jwk['alg']) && $jwk['alg'] !== $alg) throw new InvalidArgumentException('invalid assertion algorithm');
+            $header = ['alg' => $alg, 'typ' => 'dewee-session+jwt', 'kid' => $jwk['kid']];
+            if ($alg !== 'EdDSA') $key = self::jwkPrivateKey($jwk, $alg);
+        }
+        $now = time();
+        $id = random_bytes(16);
+        $id[6] = chr((ord($id[6]) & 0x0f) | 0x40);
+        $id[8] = chr((ord($id[8]) & 0x3f) | 0x80);
+        $hex = bin2hex($id);
+        $jti = substr($hex, 0, 8) . '-' . substr($hex, 8, 4) . '-' . substr($hex, 12, 4) . '-' . substr($hex, 16, 4) . '-' . substr($hex, 20);
+        $claims = ['iss' => $issuer, 'aud' => 'dewee:' . $appId, 'sub' => $subject, 'iat' => $now, 'exp' => $now + 60, 'jti' => $jti];
+        $input = self::b64url((string) json_encode($header, self::JSON_FLAGS)) . '.' . self::b64url((string) json_encode($claims, self::JSON_FLAGS));
+        if ($secret !== null) $signature = hash_hmac('sha256', $input, $secret, true);
+        elseif ($header['alg'] === 'EdDSA') {
+            if (!function_exists('sodium_crypto_sign_seed_keypair') || ($jwk['kty'] ?? '') !== 'OKP' || ($jwk['crv'] ?? '') !== 'Ed25519') throw new InvalidArgumentException('unsupported assertion key');
+            $seed = self::jwkBytes($jwk, 'd');
+            $public = self::jwkBytes($jwk, 'x');
+            if (strlen($seed) !== 32 || strlen($public) !== 32) throw new InvalidArgumentException('invalid assertion key');
+            $pair = sodium_crypto_sign_seed_keypair($seed);
+            if (!hash_equals($public, sodium_crypto_sign_publickey($pair))) throw new InvalidArgumentException('invalid assertion key');
+            $signature = sodium_crypto_sign_detached($input, sodium_crypto_sign_secretkey($pair));
+        } else {
+            $signature = '';
+            if (!openssl_sign($input, $signature, $key, OPENSSL_ALGO_SHA256)) throw new RuntimeException('assertion signing failed');
+            if ($header['alg'] === 'ES256') $signature = self::ecdsaJoseSignature($signature);
+        }
+        return $input . '.' . self::b64url($signature);
+    }
+
+    private static function jwkBytes(array $jwk, string $name): string
+    {
+        $value = $jwk[$name] ?? null;
+        if (!is_string($value) || strlen($value) > 4096 || !preg_match('/^[A-Za-z0-9_-]+$/D', $value)) throw new InvalidArgumentException('invalid assertion key');
+        $bytes = self::fromB64url($value);
+        if ($bytes === null || self::b64url($bytes) !== $value) throw new InvalidArgumentException('invalid assertion key');
+        return $bytes;
+    }
+
+    private static function der(int $tag, string $value): string
+    {
+        $n = strlen($value);
+        if ($n < 128) $length = chr($n);
+        else { $length = ''; while ($n > 0) { $length = chr($n & 255) . $length; $n >>= 8; } $length = chr(0x80 | strlen($length)) . $length; }
+        return chr($tag) . $length . $value;
+    }
+
+    private static function jwkPrivateKey(array $jwk, string $alg): OpenSSLAsymmetricKey
+    {
+        if ($alg === 'RS256' && ($jwk['kty'] ?? '') === 'RSA') {
+            $body = self::der(2, "\0");
+            foreach (['n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi'] as $name) {
+                $integer = ltrim(self::jwkBytes($jwk, $name), "\0");
+                if ($integer === '') throw new InvalidArgumentException('invalid assertion key');
+                if (ord($integer[0]) & 0x80) $integer = "\0" . $integer;
+                $body .= self::der(2, $integer);
+            }
+            $label = 'RSA PRIVATE KEY';
+            $der = self::der(0x30, $body);
+        } elseif ($alg === 'ES256' && ($jwk['kty'] ?? '') === 'EC' && ($jwk['crv'] ?? '') === 'P-256') {
+            $d = self::jwkBytes($jwk, 'd'); $x = self::jwkBytes($jwk, 'x'); $y = self::jwkBytes($jwk, 'y');
+            if (strlen($d) !== 32 || strlen($x) !== 32 || strlen($y) !== 32) throw new InvalidArgumentException('invalid assertion key');
+            $der = self::der(0x30, self::der(2, "\1") . self::der(4, $d) . self::der(0xa0, self::der(6, hex2bin('2a8648ce3d030107'))) . self::der(0xa1, self::der(3, "\0\4" . $x . $y)));
+            $label = 'EC PRIVATE KEY';
+        } else throw new InvalidArgumentException('invalid assertion key');
+        $key = openssl_pkey_get_private("-----BEGIN {$label}-----\n" . chunk_split(base64_encode($der), 64, "\n") . "-----END {$label}-----\n");
+        if ($key === false) throw new InvalidArgumentException('invalid assertion key');
+        $details = openssl_pkey_get_details($key);
+        if (!$details || ($alg === 'RS256' && ($details['type'] !== OPENSSL_KEYTYPE_RSA || $details['bits'] < 2048)) || ($alg === 'ES256' && ($details['type'] !== OPENSSL_KEYTYPE_EC || $details['bits'] !== 256))) throw new InvalidArgumentException('invalid assertion key');
+        $probe = '';
+        if (!openssl_sign('dewee-webchat-key-check', $probe, $key, OPENSSL_ALGO_SHA256) || openssl_verify('dewee-webchat-key-check', $probe, $details['key'], OPENSSL_ALGO_SHA256) !== 1) throw new InvalidArgumentException('invalid assertion key');
+        return $key;
+    }
+
+    private static function ecdsaJoseSignature(string $der): string
+    {
+        if (strlen($der) < 8 || ord($der[0]) !== 0x30 || ord($der[1]) !== strlen($der) - 2) throw new RuntimeException('invalid signature');
+        $pos = 2; $out = '';
+        for ($i = 0; $i < 2; $i++) {
+            if ($pos + 2 > strlen($der) || ord($der[$pos++]) !== 2) throw new RuntimeException('invalid signature');
+            $length = ord($der[$pos++]);
+            if ($length < 1 || $pos + $length > strlen($der)) throw new RuntimeException('invalid signature');
+            $part = ltrim(substr($der, $pos, $length), "\0"); $pos += $length;
+            if (strlen($part) > 32) throw new RuntimeException('invalid signature');
+            $out .= str_pad($part, 32, "\0", STR_PAD_LEFT);
+        }
+        if ($pos !== strlen($der)) throw new RuntimeException('invalid signature');
+        return $out;
+    }
+
     public static function b64url(string $bytes): string
     {
         return rtrim(strtr(base64_encode($bytes), '+/', '-_'), '=');
@@ -2005,6 +2459,7 @@ final class DeweeWebchat
     /** SSE error event of a failed gateway request: admission refusals typed, anything else as reported. */
     public static function gatewayErrorEvent(DeweeGatewayError $e): array
     {
+        if (is_string($e->gatewayCode) && isset(self::IDENTITY_ERRORS[$e->gatewayCode])) return self::ccpStreamError($e->gatewayCode, $e->remediation);
         return in_array($e->gatewayCode, self::ADMISSION_ERROR_CODES, true)
             ? self::admissionErrorEvent($e->gatewayCode, $e->retryAfterMs)
             : ['type' => 'error', 'message' => $e->getMessage(), 'code' => $e->gatewayCode];
@@ -2066,7 +2521,7 @@ final class DeweeWebchat
  */
 final class DeweeCcpClient
 {
-    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort'];
+    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'link', 'job-access'];
     private const INTEGRATION_ID_RE = '/^wci_[a-z2-7]{26}$/';
     private const SECRET_RE = '/^dwc_[A-Za-z0-9_-]{16,256}$/';
     private const INGRESS_PATH_RE = '#/api/public/webchat/v1/(wci_[a-z2-7]{26})$#';
@@ -2325,15 +2780,18 @@ final class DeweeGatewayConnection
     }
 
     /** @param array{url: string, token: string, tenantId?: string} $creds */
-    public static function connect(array $creds, string $userId, float $timeout = 15.0): self
+    public static function connect(array $creds, string $userId, float $timeout = 15.0, ?string $identitySession = null): self
     {
         $conn = new self(DeweeWebSocket::open(self::wsUrl($creds['url']), $timeout));
-        $params = ['token' => $creds['token'], 'user_id' => $userId];
+        $params = ['token' => $creds['token']] + ($identitySession !== null ? ['identity_session' => $identitySession] : ['user_id' => $userId]);
         if (!empty($creds['tenantId'])) {
             $params['tenant_id'] = $creds['tenantId'];
         }
         try {
-            $conn->call('connect', $params, $timeout);
+            $result = $conn->call('connect', $params, $timeout);
+            if ($identitySession !== null && (!is_object($result) || !is_string($result->user_id ?? null) || !str_starts_with($result->user_id, 'tuc:') || strlen($result->user_id) <= 4)) {
+                throw new DeweeGatewayError('Gateway did not apply the identity session', 'SOURCE_UNAVAILABLE');
+            }
         } catch (Throwable $e) {
             $conn->close();
             throw $e;
@@ -2399,6 +2857,7 @@ final class DeweeGatewayConnection
             is_string($err->message ?? null) && $err->message !== '' ? $err->message : 'Gateway request failed',
             isset($err->code) && is_scalar($err->code) ? (string) $err->code : null,
             $err->retryAfterMs ?? null,
+            isset($err->remediation) && is_object($err->remediation) ? (array) $err->remediation : null,
         );
     }
 
@@ -2415,9 +2874,9 @@ final class DeweeGatewayConnection
      * @param callable(array<string, mixed>, ?string=): bool $emit second argument: the gateway's text of a refusal, for onChat only
      * @param callable(): bool $idle
      */
-    public static function streamChat(array $creds, string $userId, string $agent, string $sessionKey, string $message, int $timeoutMs, callable $emit, callable $idle): void
+    public static function streamChat(array $creds, string $userId, string $agent, string $sessionKey, string $message, int $timeoutMs, callable $emit, callable $idle, ?self $connection = null): void
     {
-        $conn = self::connect($creds, $userId);
+        $conn = $connection ?? self::connect($creds, $userId);
         $aborted = false;
         try {
             $id = $conn->send('chat.send', ['agentId' => $agent, 'sessionKey' => $sessionKey, 'message' => $message, 'stream' => true]);
@@ -2520,9 +2979,9 @@ final class DeweeGatewayConnection
      * @param array{url: string, token: string, tenantId?: string} $creds
      * @return list<array<string, mixed>>
      */
-    public static function fetchHistory(array $creds, string $userId, string $agent, string $sessionKey): array
+    public static function fetchHistory(array $creds, string $userId, string $agent, string $sessionKey, ?string $identitySession = null): array
     {
-        $conn = self::connect($creds, $userId);
+        $conn = self::connect($creds, $userId, 15.0, $identitySession);
         try {
             $res = $conn->call('chat.history', ['agentId' => $agent, 'sessionKey' => $sessionKey], 15.0);
             $messages = self::prop($res, 'messages');

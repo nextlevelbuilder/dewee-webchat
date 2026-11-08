@@ -149,7 +149,7 @@ echo json_encode($r);`,
     expect(out[4]).toMatch(/refused: .*needs ccp options/);
     expect(out[5]).toMatch(/refused: .*at least 32 bytes/);
     expect(out[6]).toMatch(/refused: .*agents does not apply/);
-    expect(out[7]).toMatch(/refused: .*no signed-in \(identity\) mode/);
+    expect(out[7]).toBe(`ccp|${url}`); // Transport selection accepts identity; the handler validates its configuration.
     expect(out[8]).toMatch(/refused: .*must use https/);
     expect(out[9]).toMatch(/refused: .*does not match/);
     expect(out[10]).toMatch(/refused: .*dwc_ secret/);

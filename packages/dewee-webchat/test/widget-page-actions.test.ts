@@ -5,14 +5,14 @@ import { defineDeweeChat, type DeweeChatElement } from "../src/index";
 
 type Reply = (body: any, n: number) => { content: string; actionsHash?: string };
 
-function mockBackend(reply: Reply) {
+function mockBackend(reply: Reply, history: unknown[] = []) {
   const chats: any[] = [];
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
     const path = new URL(url, "https://site.test").pathname;
     const json = (v: unknown) => new Response(JSON.stringify(v), { headers: { "content-type": "application/json" } });
     if (path.endsWith("/config")) return json({ agents: [{ id: "support" }], defaultAgent: "support", allowAgentSwitch: false, allowClientCredentials: false, maxMessageLength: 4000, version: "test" });
     if (path.endsWith("/session")) return json({ visitorId: "v1", token: "t", expiresAt: Date.now() + 7 * 86_400_000 });
-    if (path.endsWith("/history")) return json({ messages: [] });
+    if (path.endsWith("/history")) return json({ messages: history });
     const body = JSON.parse(String(init?.body));
     chats.push(body);
     const r = reply(body, chats.length);
@@ -41,6 +41,32 @@ afterEach(() => {
 });
 
 describe("<dewee-chat> page actions", () => {
+  it("hides a compact action result and restores the action chip after reload", async () => {
+    localStorage.clear();
+    const history = [
+      { role: "assistant", content: directive("navigate", { route: "/runs" }) },
+      { role: "user", content: '```dewee-action-result {"id":"c1","name":"navigate","status":"ok","result":{"route":"/runs"}} ```' },
+      { role: "assistant", content: "The runs page is open." },
+    ];
+    mockBackend(() => ({ content: "unused" }), history);
+    const create = async () => {
+      const el = document.createElement("dewee-chat") as DeweeChatElement;
+      el.setAttribute("endpoint", "/api/dewee");
+      el.setAttribute("mode", "inline");
+      document.body.appendChild(el);
+      await new Promise((r) => setTimeout(r, 0));
+      return el;
+    };
+    const first = await create();
+    first.remove();
+    const reloaded = await create();
+    const visible = [...reloaded.shadowRoot!.querySelectorAll(".msg:not([hidden])")].map((m) => m.textContent).join("\n");
+    expect(visible).not.toContain("dewee-action-result");
+    expect(visible).toContain("The runs page is open.");
+    expect(reloaded.shadowRoot!.querySelector(".actions")?.textContent).toContain("navigate");
+    expect(reloaded.shadowRoot!.querySelector(".actions")?.textContent).not.toContain("Not run");
+    localStorage.clear();
+  });
   it("stops automatic turns after maxActionRounds", async () => {
     const chats = mockBackend(() => ({ content: directive("navigate", { route: "/runs" }), actionsHash: "h1" }));
     const el = await mount();

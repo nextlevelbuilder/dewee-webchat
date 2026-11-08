@@ -202,8 +202,24 @@ The script-tag equivalent is `data-image-origins`; vanilla JS uses
 redirects, and accepts PNG, JPEG, GIF and WebP only after validating the content type and file
 signature. Node and PHP pin a checked public DNS address; Cloudflare Workers use the platform's
 network boundary. Workers conservatively refuse sources sharing the endpoint's last two hostname
-labels (including sibling subdomains), to avoid bypassing Cloudflare's own-zone protections; host
-images on a separate approved domain there. Files are limited to 2 MiB and 4096
+labels (including sibling subdomains), to avoid bypassing Cloudflare's own-zone protections. For
+same-origin static files in the Worker's own Assets binding, a host can explicitly opt in:
+
+```ts
+createDeweeHandler({
+  // ... other handler options
+  imageSources: ["https://chat.example.com/public-chat-images/"],
+  cloudflarePublicImageAssets: { binding: env.ASSETS, prefixes: ["/public-chat-images/"] },
+});
+```
+
+Only exact same-origin paths in both lists use the binding. This reads the Assets collection directly,
+**bypassing Worker middleware, Cloudflare Access, and cookie-based authorization**. Every file under
+the configured prefixes must be public to any valid chat visitor; keep private files elsewhere,
+inspect the build output, and exclude sensitive files using `.assetsignore`. The URL query is not
+passed to the binding. Sibling domains still require a separate approved image domain.
+
+Files are limited to 2 MiB and 4096
 pixels per edge, and responses are not cached. Animated GIF/PNG/WebP are refused. Raw HTML,
 SVG, unsafe schemes, credentials in URLs and unapproved origins are rejected.
 

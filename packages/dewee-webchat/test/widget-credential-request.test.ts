@@ -66,7 +66,10 @@ it("aborts a pending handoff and closes its popup when the conversation changes"
   const popup={closed:false,opener:window,document:document.implementation.createHTMLDocument("handoff"),location:{replace:vi.fn()},close:vi.fn()};
   vi.spyOn(window,"open").mockReturnValue(popup as unknown as Window);
   el.shadowRoot!.querySelector<HTMLButtonElement>(".credential-actions button")!.click();
-  await vi.waitFor(()=>expect(requestSignal).toBeDefined()); el.newConversation();
+  await vi.waitFor(()=>expect(requestSignal).toBeDefined());
+  expect(el.shadowRoot!.querySelector(".credential-request")?.getAttribute("aria-busy")).toBe("true");
+  expect(el.shadowRoot!.querySelector(".credential-request .spin")).not.toBeNull();
+  el.newConversation();
   expect(requestSignal!.aborted).toBe(true); expect(popup.close).toHaveBeenCalledOnce();
   finish(Response.json({credential_request_id:id,url:`https://app.example/credential-requests/open?token=${secret}`,expires_at:new Date(Date.now()+600000).toISOString()}));
   await new Promise(resolve=>setTimeout(resolve,0)); expect(popup.location.replace).not.toHaveBeenCalled();

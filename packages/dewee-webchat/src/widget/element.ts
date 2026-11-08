@@ -1069,7 +1069,11 @@ export class DeweeChatElement extends ElementBase {
     const destination = document.createElement("p"); destination.textContent = [card.target.type, card.target.mode].filter(Boolean).join(" · ");
     const status = document.createElement("p"); status.setAttribute("role", "status");
     const effective = card.status === "pending" && Date.parse(card.expires_at) <= Date.now() ? "expired" : card.status;
-    status.textContent = this.strings.credential.status[effective];
+    if (this.credentialBusy.has(card.id)) {
+      root.setAttribute("aria-busy", "true");
+      const spinner = document.createElement("span"); spinner.className = "spin"; spinner.setAttribute("aria-hidden", "true");
+      status.append(spinner, ` ${this.strings.credential.status.applying}`);
+    } else status.textContent = this.strings.credential.status[effective];
     const list = document.createElement("ul");
     for (const field of card.fields) { const li = document.createElement("li"); li.textContent = `${field.label} (${field.required ? this.strings.credential.required : this.strings.credential.optional})`; list.appendChild(li); }
     const expiry = document.createElement("p"); expiry.textContent = `${this.strings.credential.expires}: ${new Date(card.expires_at).toLocaleString()}`;

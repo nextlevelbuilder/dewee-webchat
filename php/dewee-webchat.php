@@ -196,6 +196,7 @@ final class DeweeWebchat
             'agents' => $agentsRaw !== null && trim($agentsRaw) === '*' ? '*' : $list($agentsRaw),
             'defaultAgent' => $get('DEWEE_DEFAULT_AGENT'),
             'allowedOrigins' => $originsRaw !== null && trim($originsRaw) === '*' ? '*' : $list($originsRaw),
+            'imageSources' => $list($get('DEWEE_IMAGE_SOURCES')),
             'allowClientCredentials' => $get('DEWEE_ALLOW_CLIENT_CREDENTIALS') === 'true'
                 ? ($byoHosts ? ['allowedHosts' => $byoHosts] : true)
                 : false,
@@ -258,6 +259,16 @@ final class DeweeWebchat
             if (!is_string($name) || !preg_match('/^[A-Za-z0-9-]+$/D', $name)) {
                 throw new DeweeConfigError('[dewee-webchat] allowedHeaders must contain valid header names (letters, digits and hyphens)');
             }
+        }
+
+        $origins = $this->o['imageSources'] ?? [];
+        if (!is_array($origins)) throw new DeweeConfigError('[dewee-webchat] imageSources must be an array of HTTPS directory prefixes');
+        $this->o['imageSources'] = [];
+        foreach ($origins as $origin) {
+            $parts = is_string($origin) ? parse_url($origin) : false;
+            $path = is_array($parts) ? ($parts['path'] ?? '/') : '';
+            if (!is_array($parts) || strtolower($parts['scheme'] ?? '') !== 'https' || empty($parts['host']) || isset($parts['user']) || isset($parts['pass']) || isset($parts['query']) || isset($parts['fragment']) || (isset($parts['port']) && $parts['port'] !== 443) || !str_ends_with($path, '/') || preg_match('/%(?:2f|5c|25|2e|0[0-9a-f]|1[0-9a-f]|7f)/i', $path)) throw new DeweeConfigError('[dewee-webchat] Invalid image source');
+            $this->o['imageSources'][] = ['origin' => 'https://' . strtolower($parts['host']), 'path' => $path];
         }
 
         $this->secret = is_string($this->o['secret'] ?? null) ? $this->o['secret'] : '';
@@ -407,6 +418,8 @@ final class DeweeWebchat
                 $method === 'POST' && $action === 'session' => $this->handleSession(),
                 $method === 'POST' && $action === 'chat' => $this->handleChat(),
                 $method === 'GET' && $action === 'history' => $this->handleHistory(),
+                $method === 'POST' && $action === 'image-ticket' && !empty($this->o['imageSources']) => $this->handleImageTicket(),
+                $method === 'GET' && $action === 'image' && !empty($this->o['imageSources']) => $this->handleImage(),
                 $method === 'POST' && $action === 'link' && $this->identity !== null => $this->handleLink(),
                 $method === 'POST' && $action === 'job-access' && $this->identity !== null => $this->handleJobAccess(),
                 default => $this->fail(404, 'Not found', 'not_found'),
@@ -418,6 +431,243 @@ final class DeweeWebchat
                 $this->fail(500, $this->ccp === null && $e->getMessage() !== '' ? $e->getMessage() : 'Internal error', 'internal');
             }
         }
+    }
+
+    /** Validates both issuance and redemption against the current source policy. */
+    private function allowedImageSource(string $raw): ?array
+    {
+        if ($raw === '' || strlen($raw) > 4096 || preg_match('/[\x00-\x20\x7f\\\\]/', $raw)) return null;
+        $url = parse_url($raw);
+        if (!is_array($url) || strtolower($url['scheme'] ?? '') !== 'https' || empty($url['host']) || isset($url['user']) || isset($url['pass']) || isset($url['fragment']) || (isset($url['port']) && $url['port'] !== 443)) return null;
+        $host = strtolower($url['host']);
+        $path = $url['path'] ?? '/';
+        if (self::isInternalHost($host) || filter_var(trim($host, '[]'), FILTER_VALIDATE_IP) || preg_match('/%(?:2f|5c|25|2e|0[0-9a-f]|1[0-9a-f]|7f)/i', $path) || preg_match('#(?:^|/)\.\.?(/|$)#', $path)) return null;
+        $requestPath = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH);
+        $base = preg_replace('#/(?:image|image-ticket)/?$#', '', $requestPath) ?? '';
+        if ($base !== '' && ($path === $base || str_starts_with($path, $base . '/'))) return null;
+        if ($base === '' && preg_match('#^/(?:image|image-ticket)(?:/|$)#', $path)) return null;
+        foreach ($this->o['imageSources'] as $prefix) if ($prefix['origin'] === 'https://' . $host && str_starts_with($path, $prefix['path'])) return $url;
+        return null;
+    }
+
+    private function handleImageTicket(): void
+    {
+        $claims = $this->claimsFromRequest();
+        if (!isset($claims['v'])) { $this->fail(401, 'Missing or expired visitor session', 'unauthorized'); return; }
+        if (!empty($this->identity['required']) && !isset($claims['ids'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims)) return;
+        if (!$this->rateLimit('image-ticket:' . $claims['v'], 'preauth')) { $this->fail(429, 'Too many requests, try again later', 'rate_limited'); return; }
+        $rawBody = file_get_contents('php://input', false, null, 0, 8193);
+        if (!is_string($rawBody) || strlen($rawBody) > 8192) { $this->fail(413, 'Invalid image', 'invalid_request'); return; }
+        $body = json_decode($rawBody, true);
+        $source = is_array($body) && is_string($body['url'] ?? null) ? $body['url'] : '';
+        if ($this->allowedImageSource($source) === null) { $this->fail(403, 'Image not allowed', 'forbidden_image'); return; }
+        $iv = random_bytes(12); $tag = '';
+        $plain = json_encode(['v' => $claims['v'], 'u' => $source, 'exp' => self::nowMs() + 60000], self::JSON_FLAGS);
+        $key = hash_hkdf('sha256', $this->secret, 32, 'dewee-webchat:image-ticket:aes-256-gcm:v1', 'dewee-webchat');
+        $namespace = ($this->o['ccp']['chatUrl'] ?? $this->o['gatewayUrl'] ?? '') . "\n" . ($this->o['ccp']['integrationId'] ?? $this->o['tenantId'] ?? '');
+        $encrypted = openssl_encrypt((string) $plain, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, 'dewee-image-v1:' . $namespace);
+        if (!is_string($encrypted) || strlen($tag) !== 16) { $this->fail(500, 'Image unavailable', 'image_unavailable'); return; }
+        $this->json(['ticket' => self::b64url($iv . $encrypted . $tag)]);
+    }
+
+    /** Fetch approved raster images through a DNS-pinned HTTPS connection. */
+    private function handleImage(): void
+    {
+        $ticket = $_GET['ticket'] ?? null;
+        $raw = is_string($ticket) && strlen($ticket) <= 8192 && preg_match('/^[A-Za-z0-9_-]+$/D', $ticket) ? self::fromB64url($ticket) : null;
+        $key = hash_hkdf('sha256', $this->secret, 32, 'dewee-webchat:image-ticket:aes-256-gcm:v1', 'dewee-webchat');
+        $namespace = ($this->o['ccp']['chatUrl'] ?? $this->o['gatewayUrl'] ?? '') . "\n" . ($this->o['ccp']['integrationId'] ?? $this->o['tenantId'] ?? '');
+        $plain = is_string($raw) && strlen($raw) > 28 ? openssl_decrypt(substr($raw, 12, -16), 'aes-256-gcm', $key, OPENSSL_RAW_DATA, substr($raw, 0, 12), substr($raw, -16), 'dewee-image-v1:' . $namespace) : false;
+        $claims = is_string($plain) ? json_decode($plain, true) : null;
+        if (!is_array($claims) || !is_string($claims['v'] ?? null) || !preg_match(self::VISITOR_RE, $claims['v']) || !is_string($claims['u'] ?? null) || !is_int($claims['exp'] ?? null) || $claims['exp'] <= self::nowMs() || $claims['exp'] > self::nowMs() + 60000) { $this->fail(401, 'Image ticket expired', 'unauthorized'); return; }
+        if (!$this->rateLimit('image:' . $claims['v'], 'preauth')) { $this->fail(429, 'Too many requests, try again later', 'rate_limited'); return; }
+        $url = $this->allowedImageSource($claims['u']);
+        if ($url === null) { $this->fail(403, 'Image not allowed', 'forbidden_image'); return; }
+        $dir = self::privateTempDir();
+        if ($dir === null) { $this->fail(503, 'Image unavailable', 'image_unavailable'); return; }
+        $slot = null;
+        for ($i = 0; $i < 8; $i++) {
+            $file = $dir . DIRECTORY_SEPARATOR . 'image-slot-' . $i;
+            $candidate = @fopen($file, 'x+');
+            if (is_resource($candidate)) @chmod($file, 0600);
+            elseif (self::ownedPrivateFile($file)) $candidate = @fopen($file, 'r+');
+            if (is_resource($candidate) && flock($candidate, LOCK_EX | LOCK_NB)) { $slot = $candidate; break; }
+            if (is_resource($candidate)) fclose($candidate);
+        }
+        if ($slot === null) { $this->fail(429, 'Too many requests, try again later', 'rate_limited'); return; }
+        try { $this->streamImage($url); }
+        finally { flock($slot, LOCK_UN); fclose($slot); }
+    }
+
+    private function streamImage(array $url): void
+    {
+        $host = strtolower($url['host']);
+        $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+        if (!is_array($records) || !$records) { $this->fail(502, 'Image unavailable', 'image_unavailable'); return; }
+        $ips = [];
+        foreach ($records as $record) {
+            $ip = $record['ip'] ?? $record['ipv6'] ?? null;
+            if (!is_string($ip) || !self::publicImageAddress($ip)) { $this->fail(502, 'Image unavailable', 'image_unavailable'); return; }
+            $ips[] = $ip;
+        }
+        if (!$ips) { $this->fail(502, 'Image unavailable', 'image_unavailable'); return; }
+        $path = $url['path'] ?? '/';
+        $path .= isset($url['query']) ? '?' . $url['query'] : '';
+        $address = str_contains($ips[0], ':') ? '[' . $ips[0] . ']' : $ips[0];
+        $ctx = stream_context_create([
+            'http' => ['method' => 'GET', 'header' => "Host: {$host}\r\nAccept: image/png,image/jpeg,image/gif,image/webp\r\nConnection: close\r\n", 'follow_location' => 0, 'ignore_errors' => true, 'timeout' => 10],
+            'ssl' => ['verify_peer' => true, 'verify_peer_name' => true, 'peer_name' => $host, 'SNI_enabled' => true, 'SNI_server_name' => $host],
+        ]);
+        $started = microtime(true);
+        $stream = @fopen('https://' . $address . $path, 'rb', false, $ctx);
+        if ($stream === false) { $this->fail(502, 'Image unavailable', 'image_unavailable'); return; }
+        try {
+            $meta = stream_get_meta_data($stream);
+            $headers = $meta['wrapper_data'] ?? [];
+            if (!is_array($headers) || !preg_match('/^HTTP\/\S+ 2\d\d\b/', $headers[0] ?? '')) throw new RuntimeException('invalid image response');
+            $type = '';
+            foreach ($headers as $header) if (stripos($header, 'content-type:') === 0) $type = strtolower(trim(explode(';', substr($header, 13), 2)[0]));
+            if (!in_array($type, ['image/png', 'image/jpeg', 'image/gif', 'image/webp'], true)) throw new RuntimeException('invalid image type');
+            $bytes = '';
+            while (!feof($stream)) {
+                $remaining = 10.0 - (microtime(true) - $started);
+                if ($remaining <= 0) throw new RuntimeException('image timed out');
+                stream_set_timeout($stream, (int) $remaining, (int) (($remaining - floor($remaining)) * 1000000));
+                $part = fread($stream, 8192);
+                if ($part === false || stream_get_meta_data($stream)['timed_out']) throw new RuntimeException('image read failed');
+                $bytes .= $part;
+                if (strlen($bytes) > 2097152) throw new RuntimeException('image too large');
+            }
+            $valid = match ($type) {
+                'image/png' => str_starts_with($bytes, "\x89PNG\r\n\x1a\n"),
+                'image/jpeg' => str_starts_with($bytes, "\xff\xd8\xff"),
+                'image/gif' => in_array(substr($bytes, 0, 6), ['GIF87a', 'GIF89a'], true),
+                'image/webp' => substr($bytes, 0, 4) === 'RIFF' && substr($bytes, 8, 4) === 'WEBP',
+            };
+            if (!$valid || !self::safeRasterDimensions($bytes, $type)) throw new RuntimeException('invalid image dimensions');
+            header('Content-Type: ' . $type);
+            header('X-Content-Type-Options: nosniff');
+            header('Content-Security-Policy: default-src \'none\'; sandbox');
+            header('Cache-Control: private, no-store');
+            echo $bytes;
+        } catch (Throwable) { $this->fail(502, 'Image unavailable', 'image_unavailable'); }
+        finally { fclose($stream); }
+    }
+
+    private static function safeRasterDimensions(string $bytes, string $type): bool
+    {
+        $info = @getimagesizefromstring($bytes);
+        if (!is_array($info) || ($info['mime'] ?? '') !== $type) return false;
+        [$width, $height] = [$info[0] ?? 0, $info[1] ?? 0];
+        if ($width < 1 || $height < 1 || $width > 4096 || $height > 4096 || $width * $height > 16000000) return false;
+        $n = strlen($bytes);
+        $u16 = static fn (int $at, bool $le = false): int => $le ? ord($bytes[$at]) + 256 * ord($bytes[$at + 1]) : 256 * ord($bytes[$at]) + ord($bytes[$at + 1]);
+        $u32 = static fn (int $at, bool $le = false): int => unpack($le ? 'V' : 'N', substr($bytes, $at, 4))[1];
+        if ($type === 'image/png') {
+            $pos = 8; $header = false; $data = false; $end = false;
+            while ($pos + 12 <= $n) {
+                $length = $u32($pos); $name = substr($bytes, $pos + 4, 4);
+                if ($length > $n - $pos - 12) return false;
+                if ($name === 'IHDR') { if ($header || $pos !== 8 || $length !== 13) return false; $header = true; }
+                elseif (in_array($name, ['acTL', 'fcTL', 'fdAT'], true)) return false;
+                elseif ($name === 'IDAT') $data = true;
+                elseif ($name === 'IEND') { $end = $length === 0; break; }
+                $pos += $length + 12;
+            }
+            return $header && $data && $end;
+        }
+        if ($type === 'image/gif') {
+            if ($n < 13) return false;
+            $flags = ord($bytes[10]); $pos = 13 + (($flags & 0x80) ? 3 * (1 << (($flags & 7) + 1)) : 0); $frames = 0; $end = false;
+            $blocks = static function () use (&$pos, $n, $bytes): bool {
+                while ($pos < $n) { $len = ord($bytes[$pos++]); if ($len === 0) return true; if ($len > $n - $pos) return false; $pos += $len; }
+                return false;
+            };
+            while ($pos < $n) {
+                $marker = ord($bytes[$pos++]);
+                if ($marker === 0x3b) { $end = true; break; }
+                if ($marker === 0x21) { if ($pos >= $n) return false; $pos++; if (!$blocks()) return false; continue; }
+                if ($marker !== 0x2c || $pos + 9 > $n || ++$frames > 1) return false;
+                $left = $u16($pos, true); $top = $u16($pos + 2, true); $w = $u16($pos + 4, true); $h = $u16($pos + 6, true); $flags = ord($bytes[$pos + 8]);
+                if ($w < 1 || $h < 1 || $w > 4096 || $h > 4096 || $w * $h > 16000000 || $left + $w > $width || $top + $h > $height) return false;
+                $pos += 9 + (($flags & 0x80) ? 3 * (1 << (($flags & 7) + 1)) : 0);
+                if ($pos >= $n) return false;
+                $pos++;
+                if (!$blocks()) return false;
+            }
+            return $frames === 1 && $end;
+        }
+        if ($type === 'image/jpeg') {
+            $pos = 2; $frames = 0; $end = false;
+            while ($pos + 1 < $n && ord($bytes[$pos]) === 0xff) {
+                while ($pos < $n && ord($bytes[$pos]) === 0xff) $pos++;
+                if ($pos >= $n) return false;
+                $marker = ord($bytes[$pos++]);
+                if ($marker === 0xd9) { $end = true; break; }
+                if ($marker === 0x01 || ($marker >= 0xd0 && $marker <= 0xd7)) continue;
+                if ($pos + 2 > $n) return false;
+                $length = $u16($pos);
+                if ($length < 2 || $pos + $length > $n) return false;
+                if (in_array($marker, [0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf], true)) {
+                    if (++$frames !== 1 || $length < 7 || $u16($pos + 3) !== $height || $u16($pos + 5) !== $width) return false;
+                }
+                $pos += $length;
+                if ($marker === 0xda) {
+                    while ($pos + 1 < $n) {
+                        if (ord($bytes[$pos]) !== 0xff) { $pos++; continue; }
+                        $next = ord($bytes[$pos + 1]);
+                        if ($next === 0 || ($next >= 0xd0 && $next <= 0xd7)) { $pos += 2; continue; }
+                        break;
+                    }
+                }
+            }
+            return $frames === 1 && $end;
+        }
+        if ($type === 'image/webp') {
+            if ($n < 20) return false;
+            $total = $u32(4, true) + 8;
+            if ($total > $n || $total < 20) return false;
+            $pos = 12; $images = 0; $canvasW = 0; $canvasH = 0;
+            while ($pos + 8 <= $total) {
+                $chunk = substr($bytes, $pos, 4); $length = $u32($pos + 4, true); $start = $pos + 8;
+                if ($length > $total - $start || $start + $length + ($length & 1) > $total || $chunk === 'ANIM' || $chunk === 'ANMF') return false;
+                if ($chunk === 'VP8X') {
+                    if ($length !== 10 || $canvasW || (ord($bytes[$start]) & 2)) return false;
+                    $canvasW = 1 + ord($bytes[$start + 4]) + (ord($bytes[$start + 5]) << 8) + (ord($bytes[$start + 6]) << 16);
+                    $canvasH = 1 + ord($bytes[$start + 7]) + (ord($bytes[$start + 8]) << 8) + (ord($bytes[$start + 9]) << 16);
+                } elseif ($chunk === 'VP8L' && $length >= 5 && ord($bytes[$start]) === 0x2f) {
+                    $images++; $w = 1 + ord($bytes[$start + 1]) + ((ord($bytes[$start + 2]) & 0x3f) << 8); $h = 1 + (ord($bytes[$start + 2]) >> 6) + (ord($bytes[$start + 3]) << 2) + ((ord($bytes[$start + 4]) & 15) << 10);
+                    if ($w !== $width || $h !== $height) return false;
+                } elseif ($chunk === 'VP8 ' && $length >= 10 && substr($bytes, $start + 3, 3) === "\x9d\x01\x2a") {
+                    $images++; if (($u16($start + 6, true) & 0x3fff) !== $width || ($u16($start + 8, true) & 0x3fff) !== $height) return false;
+                }
+                $pos = $start + $length + ($length & 1);
+            }
+            return $pos === $total && $images === 1 && (!$canvasW || ($canvasW === $width && $canvasH === $height));
+        }
+        return false;
+    }
+
+    /** All addresses returned for an image host must be globally routable. */
+    private static function publicImageAddress(string $ip): bool
+    {
+        $packed = @inet_pton($ip);
+        if ($packed === false) return false;
+        $within = static function (string $network, int $bits) use ($packed): bool {
+            $prefix = inet_pton($network);
+            if ($prefix === false || strlen($prefix) !== strlen($packed)) return false;
+            $whole = intdiv($bits, 8); $rest = $bits % 8;
+            if (substr($packed, 0, $whole) !== substr($prefix, 0, $whole)) return false;
+            return $rest === 0 || ((ord($packed[$whole]) ^ ord($prefix[$whole])) & (0xff << (8 - $rest))) === 0;
+        };
+        if (strlen($packed) === 4) {
+            foreach ([['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]] as [$network, $bits]) if ($within($network, $bits)) return false;
+            return true;
+        }
+        if (!$within('2000::', 3)) return false;
+        foreach ([['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]] as [$network, $bits]) if ($within($network, $bits)) return false;
+        return true;
     }
 
     // ---------------------------------------------------------------- handlers
@@ -1889,9 +2139,8 @@ final class DeweeWebchat
     }
 
     /**
-     * Verifies a visitor token. A token that carries a signed-in identity session (`ids`/`ida`, issued
-     * by a Node backend with identity mode) is refused: this backend cannot honour it and must not
-     * downgrade a signed-in user to an anonymous visitor.
+     * Verifies a visitor token. Identity claims are accepted only when identity mode is enabled;
+     * otherwise they are refused rather than downgraded to an anonymous visitor.
      *
      * @return array{v: string, exp: int|float, es?: string, ese?: int|float}|null
      */

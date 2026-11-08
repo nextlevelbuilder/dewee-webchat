@@ -57,4 +57,4 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -C packages/dewee-webchat exec vitest run test/php-parity.test.ts test/php-ccp-transport.test.ts test/php-identity-*.test.ts
+      - run: pnpm -C packages/dewee-webchat exec vitest run test/php-parity.test.ts test/php-ccp-transport.test.ts test/php-identity-*.test.ts test/php-image-proxy.test.ts

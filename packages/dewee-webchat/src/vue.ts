@@ -6,7 +6,7 @@ const keys = [
   "endpoint", "agent", "title", "subtitle", "greeting", "intro", "placeholder", "suggestions", "avatar", "launcherAvatar",
   "position", "mode", "theme", "accentColor", "locale", "showReasoning", "showToolCalls", "allowAgentSwitch", "open",
   "persist", "hideBranding", "gatewayUrl", "gatewayToken", "width", "height", "zIndex", "actions", "confirm", "getPageContext",
-  "maxActionRounds", "actionTimeoutMs", "headers", "fetch", "domActions", "domActionsRoot",
+  "maxActionRounds", "actionTimeoutMs", "headers", "fetch", "domActions", "domActionsRoot", "imageOrigins",
 ] as const;
 
 const props = Object.fromEntries(keys.map((k) => [k, { type: null as unknown as PropType<any>, default: undefined }])) as {
@@ -22,7 +22,7 @@ export const DeweeChat = defineComponent({
   setup(p, { emit, expose }) {
     const el = ref<DeweeChatElement | null>(null);
     const config = (): Partial<DeweeChatConfig> =>
-      Object.fromEntries(Object.entries(p).filter(([, v]) => v !== undefined)) as Partial<DeweeChatConfig>;
+      ({ ...Object.fromEntries(Object.entries(p).filter(([, v]) => v !== undefined)), imageOrigins: p.imageOrigins ?? [] }) as Partial<DeweeChatConfig>;
     onMounted(() => {
       defineDeweeChat();
       const node = el.value!;

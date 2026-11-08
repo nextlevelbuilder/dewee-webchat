@@ -706,6 +706,14 @@ final class DeweeWebchat
             'maxMessageLength' => $this->o['maxMessageLength'],
             'version' => self::VERSION,
         ];
+        if ($creds !== null && ($_GET['pageContext'] ?? null) === '1') {
+            if (!$this->rateLimit($this->clientIp(), 'preauth')) { $this->fail(429, 'Too many requests, slow down', 'rate_limited'); return; }
+            try {
+                $probe = DeweeGatewayConnection::connect($creds, $this->o['userIdPrefix'] . 'capability-probe');
+                if ($probe->pageContextVersions) $body['pageContextVersions'] = $probe->pageContextVersions;
+                $probe->close();
+            } catch (Throwable) { /* Optional discovery does not stop ordinary chat. */ }
+        }
         if ($this->identity !== null) {
             $body['identity'] = true;
             $body['defaultAgent'] = $this->identityAgent;
@@ -1011,7 +1019,11 @@ final class DeweeWebchat
             $this->fail(500, 'Gateway is not configured', 'not_configured');
             return;
         }
-        $body = $this->readJsonBody();
+        $raw = file_get_contents('php://input', false, null, 0, 131073);
+        if (is_string($raw) && strlen($raw) > 131072) { $this->fail(413, 'Request is too large', 'too_long'); return; }
+        $rawBody = is_string($raw) ? json_decode($raw) : null;
+        $body = is_string($raw) ? json_decode($raw, true) : null;
+        if (!$rawBody instanceof stdClass || !is_array($body)) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
         $message = is_string($body['message'] ?? null) ? self::jsTrim($body['message']) : '';
         if ($message === '') {
             $this->fail(400, 'Message is required');
@@ -1045,7 +1057,6 @@ final class DeweeWebchat
         // Page actions: the manifest (no handlers) and page context become a delimited block in front of
         // the visitor's message; the manifest is repeated only when its hash differs from the one the
         // widget reports as already delivered in this conversation. Decoded as objects so {} stays {}.
-        $rawBody = json_decode((string) file_get_contents('php://input'), false);
         try {
             $actionsIn = is_object($rawBody) ? ($rawBody->actions ?? null) : null;
             $manifest = $actionsIn !== null ? self::normalizeManifest($actionsIn) : null;
@@ -1057,8 +1068,13 @@ final class DeweeWebchat
         $actionsHash = $manifest ? self::hashManifest($manifest) : null;
         $pageBlock = self::buildPageBlock($manifest, $actionsHash, ($body['actionsHash'] ?? null) !== $actionsHash, $pageContext);
 
+        $context = $rawBody->page_context ?? null;
+        if ($context !== null) {
+            if (is_object($context) && is_int($context->version ?? null) && $context->version !== 1) { $this->fail(400, 'Page context is not supported', 'page_context_unsupported'); return; }
+            if (!self::validPageContext($context)) { $this->fail(400, 'Invalid page context', 'page_context_invalid'); return; }
+        }
         if ($this->ccp !== null) {
-            $this->ccpChat($claims, $pageBlock . $message, $message, $conversationId, $agent, $actionsHash);
+            $this->ccpChat($claims, $pageBlock . $message, $message, $conversationId, $agent, $actionsHash, $context);
             return;
         }
         if ($creds === null) {
@@ -1069,13 +1085,15 @@ final class DeweeWebchat
         $sessionKey = self::buildSessionKey($agent, "webchat-{$visitorId}-{$conversationId}");
 
         $connection = null;
-        if (isset($claims['ids'])) {
-            try { $connection = DeweeGatewayConnection::connect($creds, '', 15.0, $claims['ids']); }
+        if (isset($claims['ids']) || $context !== null) {
+            try { $connection = DeweeGatewayConnection::connect($creds, $this->o['userIdPrefix'] . $visitorId, 15.0, $claims['ids'] ?? null); }
             catch (DeweeGatewayError $e) {
-                if (is_string($e->gatewayCode) && isset(self::IDENTITY_ERRORS[$e->gatewayCode])) $this->identityFail($e->gatewayCode, $e->remediation);
-                else $this->identityFail('SOURCE_UNAVAILABLE');
+                if (isset($claims['ids']) && is_string($e->gatewayCode) && isset(self::IDENTITY_ERRORS[$e->gatewayCode])) $this->identityFail($e->gatewayCode, $e->remediation);
+                elseif (isset($claims['ids'])) $this->identityFail('SOURCE_UNAVAILABLE');
+                else $this->fail(502, 'Dewee is unavailable, try again later', 'gateway_error');
                 return;
             }
+            if ($context !== null && !in_array(1, $connection->pageContextVersions, true)) { $connection->close(); $this->fail(400, 'Page context is not supported', 'page_context_unsupported'); return; }
         }
 
         $this->beginEventStream();
@@ -1110,7 +1128,7 @@ final class DeweeWebchat
                 if ($e['type'] === 'error') {
                     if (isset($claims['ids'])) {
                         $code = $e['code'] ?? null;
-                        if (!is_string($code) || (!isset(self::IDENTITY_ERRORS[$code]) && !in_array($code, self::ADMISSION_ERROR_CODES, true))) $e = ['type' => 'error', 'message' => 'Dewee is unavailable, try again later', 'code' => 'gateway_error'];
+                        if (!is_string($code) || (!isset(self::IDENTITY_ERRORS[$code]) && !in_array($code, self::ADMISSION_ERROR_CODES, true) && !in_array($code, ['page_context_invalid', 'page_context_unsupported'], true))) $e = ['type' => 'error', 'message' => 'Dewee is unavailable, try again later', 'code' => 'gateway_error'];
                         $errMsg = (string) $e['message'];
                     } else $errMsg = $reason ?? (string) $e['message'];
                 }
@@ -1126,6 +1144,7 @@ final class DeweeWebchat
                 $observe,
                 $idle,
                 $connection,
+                $context,
             );
         } catch (Throwable $e) {
             // A refused connect is still an admission refusal.
@@ -1236,6 +1255,7 @@ final class DeweeWebchat
             // A returning visitor's refresh needs no challenge (see handleCcpSession).
             'refreshWithoutTurnstile' => !empty($this->o['turnstile']) ? true : null,
             'maxMessageLength' => min((int) $this->o['maxMessageLength'], $cfg['maxMessageChars']),
+            'pageContextVersions' => !empty($cfg['pageContextVersions']) ? $cfg['pageContextVersions'] : null,
             'version' => self::VERSION,
         ]));
     }
@@ -1258,7 +1278,7 @@ final class DeweeWebchat
      *
      * @param array{v: string, es?: string, ese?: int|float} $claims
      */
-    private function ccpChat(array $claims, string $message, string $rawMessage, string $conversationId, string $agent, ?string $actionsHash): void
+    private function ccpChat(array $claims, string $message, string $rawMessage, string $conversationId, string $agent, ?string $actionsHash, mixed $context): void
     {
         $visitorId = $claims['v'];
         $ctx = $this->visitorContext();
@@ -1268,11 +1288,16 @@ final class DeweeWebchat
             $this->ccpFail($e, 'config');
             return;
         }
+        if ($context !== null) {
+            if (!in_array(1, $cfg['pageContextVersions'] ?? [], true)) { $this->fail(400, 'Page context is not supported', 'page_context_unsupported'); return; }
+            if (is_object($context) && is_int($context->version ?? null) && $context->version !== 1) { $this->fail(400, 'Page context is not supported', 'page_context_unsupported'); return; }
+            if (!self::validPageContext($context)) { $this->fail(400, 'Invalid page context', 'page_context_invalid'); return; }
+        }
         if (self::utf16Length($rawMessage) > $cfg['maxMessageChars']) {
             $this->fail(413, "Message exceeds {$cfg['maxMessageChars']} characters", 'too_long');
             return;
         }
-        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
+        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []) + ($context !== null ? ['page_context' => $context] : []);
         $edge = null;
         try {
             $fp = $this->withEdge($ctx, $visitorId, self::sealedEdge($claims), function (array $e) use ($ctx, $body, &$edge) {
@@ -1666,7 +1691,32 @@ final class DeweeWebchat
             'showThinking' => ($data['show_thinking'] ?? null) === true,
             'showToolActivity' => ($data['show_tool_activity'] ?? null) === true,
             'maxMessageChars' => is_int($max) && $max > 0 ? $max : PHP_INT_MAX,
+            'pageContextVersions' => in_array(1, is_array($data['page_context']['versions'] ?? null) ? $data['page_context']['versions'] : [], true) ? [1] : [],
         ];
+    }
+
+    /** Validate the v1 attachment without logging or altering its content. */
+    private static function validPageContext(mixed $value): bool
+    {
+        if (!is_object($value)) return false;
+        $o = get_object_vars($value);
+        if (array_diff(array_keys($o), ['version', 'url', 'title', 'description', 'captured_at', 'selection', 'content', 'source', 'trust_level']) || ($o['version'] ?? null) !== 1 || !is_string($o['url'] ?? null)) return false;
+        $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_LINE_TERMINATORS);
+        if ($encoded === false || strlen($encoded) > 65536 || strlen($o['url']) > 2048) return false;
+        $url = parse_url($o['url']);
+        if (!is_array($url) || !in_array(strtolower($url['scheme'] ?? ''), ['http', 'https'], true) || empty($url['host']) || isset($url['user']) || isset($url['pass'])) return false;
+        foreach (['title' => 300, 'description' => 1000, 'selection' => 2000, 'captured_at' => 64] as $key => $max) {
+            if (isset($o[$key]) && (!is_string($o[$key]) || preg_match_all('/./us', $o[$key]) > $max)) return false;
+        }
+        if (isset($o['content'])) {
+            if (!is_object($o['content'])) return false;
+            $c = get_object_vars($o['content']);
+            if (array_diff(array_keys($c), ['format', 'text', 'truncated'])) return false;
+            if (isset($c['format']) && !in_array($c['format'], ['text', 'markdown'], true)) return false;
+            if (isset($c['text']) && (!is_string($c['text']) || preg_match_all('/./us', $c['text']) > 12000)) return false;
+            if (isset($c['truncated']) && !is_bool($c['truncated'])) return false;
+        }
+        return true;
     }
 
     /** What CCP is told about the browser request behind a call. @return array{visitorOrigin: string|null, visitorIp: string|null, requestId: string} */
@@ -1812,6 +1862,10 @@ final class DeweeWebchat
             case 'invalid_request':
                 $log('- the ingress refused the request shape; check the dewee-webchat version');
                 return ['status' => 400, 'code' => 'bad_request', 'message' => 'Invalid request'];
+            case 'page_context_invalid':
+                return ['status' => 400, 'code' => $e->ccpCode, 'message' => 'Invalid page context'];
+            case 'page_context_unsupported':
+                return ['status' => 400, 'code' => $e->ccpCode, 'message' => 'Page context is not supported'];
             case 'integration_unauthorized':
                 $log('- check DEWEE_WEBCHAT_INTEGRATION_SECRET (wrong, rotated past its overlap, or revoked) and DEWEE_CCP_CHAT_URL');
                 return ['status' => 500, 'code' => 'not_configured', 'message' => 'Chat is not configured on this server'];
@@ -2892,7 +2946,7 @@ final class DeweeCcpClient
         ];
         $body = null;
         if (isset($req['body'])) {
-            $body = (string) json_encode((object) $req['body'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            $body = (string) json_encode((object) $req['body'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_LINE_TERMINATORS | JSON_INVALID_UTF8_SUBSTITUTE);
             $headers[] = 'Content-Type: application/json';
         }
         // CR/LF in a value would inject headers; such a value is dropped (none of these are visitor-chosen text).
@@ -3055,6 +3109,8 @@ final class DeweeCcpClient
 final class DeweeGatewayConnection
 {
     private int $seq = 0;
+    /** @var list<int> */
+    public array $pageContextVersions = [];
 
     private function __construct(private DeweeWebSocket $ws)
     {
@@ -3070,6 +3126,7 @@ final class DeweeGatewayConnection
         }
         try {
             $result = $conn->call('connect', $params, $timeout);
+            if (is_object($result) && is_array($result->page_context_versions ?? null) && in_array(1, $result->page_context_versions, true)) $conn->pageContextVersions = [1];
             if ($identitySession !== null && (!is_object($result) || !is_string($result->user_id ?? null) || !str_starts_with($result->user_id, 'tuc:') || strlen($result->user_id) <= 4)) {
                 throw new DeweeGatewayError('Gateway did not apply the identity session', 'SOURCE_UNAVAILABLE');
             }
@@ -3096,7 +3153,7 @@ final class DeweeGatewayConnection
     public function send(string $method, mixed $params): string
     {
         $id = 'r' . (++$this->seq);
-        $this->ws->sendText((string) json_encode(['type' => 'req', 'id' => $id, 'method' => $method, 'params' => $params], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $this->ws->sendText((string) json_encode(['type' => 'req', 'id' => $id, 'method' => $method, 'params' => $params], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_LINE_TERMINATORS));
         return $id;
     }
 
@@ -3155,12 +3212,12 @@ final class DeweeGatewayConnection
      * @param callable(array<string, mixed>, ?string=): bool $emit second argument: the gateway's text of a refusal, for onChat only
      * @param callable(): bool $idle
      */
-    public static function streamChat(array $creds, string $userId, string $agent, string $sessionKey, string $message, int $timeoutMs, callable $emit, callable $idle, ?self $connection = null): void
+    public static function streamChat(array $creds, string $userId, string $agent, string $sessionKey, string $message, int $timeoutMs, callable $emit, callable $idle, ?self $connection = null, mixed $pageContext = null): void
     {
         $conn = $connection ?? self::connect($creds, $userId);
         $aborted = false;
         try {
-            $id = $conn->send('chat.send', ['agentId' => $agent, 'sessionKey' => $sessionKey, 'message' => $message, 'stream' => true]);
+            $id = $conn->send('chat.send', ['agentId' => $agent, 'sessionKey' => $sessionKey, 'message' => $message, 'stream' => true] + ($pageContext !== null ? ['pageContext' => $pageContext] : []));
             $deadline = microtime(true) + $timeoutMs / 1000;
             while (true) {
                 $remaining = $deadline - microtime(true);
@@ -3182,6 +3239,11 @@ final class DeweeGatewayConnection
                     continue;
                 }
                 if (($frame->type ?? null) === 'res' && ($frame->id ?? null) === $id) {
+                    $reason = $frame->error->details->reason ?? null;
+                    if (empty($frame->ok) && in_array($reason, ['page_context_invalid', 'page_context_unsupported'], true)) {
+                        $emit(['type' => 'error', 'code' => $reason, 'message' => $reason === 'page_context_invalid' ? 'Invalid page context' : 'Page context is not supported']);
+                        break;
+                    }
                     try {
                         $res = self::result($frame);
                         $emit(['type' => 'done', 'content' => (string) (self::prop($res, 'content') ?? ''), 'usage' => self::prop($res, 'usage')]);

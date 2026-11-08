@@ -147,9 +147,9 @@ export class ApiClient {
     return this.url("image", { ticket: data.ticket });
   }
 
-  async getConfig(force = false): Promise<PublicConfig> {
+  async getConfig(force = false, probePageContext = false): Promise<PublicConfig> {
     if (this.config && !force) return this.config;
-    this.config = await this.parse<PublicConfig>(await this.request(this.url("config"), { headers: await this.headers() }));
+    this.config = await this.parse<PublicConfig>(await this.request(this.url("config", probePageContext ? { pageContext: "1" } : undefined), { headers: await this.headers() }));
     return this.config;
   }
 

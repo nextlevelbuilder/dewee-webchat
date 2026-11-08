@@ -68,6 +68,19 @@ request and the gateway message are exactly as before.
 `conversationId` matches `^[A-Za-z0-9_-]{6,64}$`; when missing or invalid the server picks one and
 announces it in the `start` event.
 
+### Page context attachment
+
+`GET {base}/config` advertises `pageContextVersions` only when supported. A client requesting the
+legacy Gateway transport uses `?pageContext=1` to request capability discovery; the backend checks
+again on the actual authenticated connection. On a supported runtime the browser can send the optional
+`page_context` v1 object with one message, separate from the older page-action `pageContext` field.
+It is untrusted, transient data and is not added to the chat message or persisted by this adapter.
+The [Gateway contract](https://github.com/nextlevelbuilder/dewee/blob/dev/docs/page-context-contract.md)
+owns its schema and runtime handling. The attachment is limited to 64 KiB and the entire request to
+128 KiB. Invalid or unsupported attachments refuse the send with `page_context_invalid` or
+`page_context_unsupported`; retry without the attachment only when the visitor chooses to do so.
+For direct Gateway streams, a runtime refusal can also arrive as a typed SSE `error` event.
+
 > **Transport `ccp` only (additive).** `agent` (here and on `/history`) must be a key the ingress accepts,
 > `^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$` (up to 100 characters, no `:`); any other value is
 > `400 bad_request` and CCP is not asked.

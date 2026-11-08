@@ -10,6 +10,9 @@ import { createDeweeHandler, type DeweeHandlerOptions } from "../src/server";
 
 let wss: WebSocketServer;
 let gatewayUrl = "";
+let pageContextSupported = false;
+let lastChat: any;
+let pageContextRefusal = false;
 
 beforeAll(async () => {
   wss = new WebSocketServer({ port: 0 });
@@ -19,8 +22,10 @@ beforeAll(async () => {
     ws.on("message", (raw) => {
       const f = JSON.parse(String(raw));
       const res = (payload: unknown, ok = true) => ws.send(JSON.stringify({ type: "res", id: f.id, ok, payload, error: ok ? undefined : payload }));
-      if (f.method === "connect") return f.params.token === "good" ? res({ role: "operator" }) : res({ code: "unauthorized", message: "bad token" }, false);
+      if (f.method === "connect") return f.params.token === "good" ? res({ role: "operator", ...(pageContextSupported ? { page_context_versions: [1] } : {}) }) : res({ code: "unauthorized", message: "bad token" }, false);
       if (f.method === "chat.send") {
+        lastChat = f.params;
+        if (pageContextRefusal) return res({ code: "INVALID_REQUEST", message: "private page content", details: { reason: "page_context_invalid" } }, false);
         const base = { agentId: f.params.agentId, runId: "run-1", sessionKey: f.params.sessionKey };
         const ev = (type: string, payload: unknown) => ws.send(JSON.stringify({ type: "event", event: "agent", payload: { ...base, type, payload } }));
         if (f.params.message.endsWith("fail")) {
@@ -86,6 +91,32 @@ async function visitor(h: ReturnType<typeof createDeweeHandler>) {
 }
 
 describe("legacy-gateway transport: browser responses", () => {
+  it("negotiates and forwards page context only when the connected runtime supports it", async () => {
+    const h = createDeweeHandler(opts({ agents: [{ id: "support", name: "Support" }] }));
+    const context = { version: 1, url: "https://site.test/page", content: { format: "text", text: "A page", truncated: false } };
+    const s = await visitor(h);
+    const post = () => h(new Request(`${BASE}/chat`, { method: "POST", headers: { authorization: `Bearer ${s.token}` }, body: JSON.stringify({ message: "hello", page_context: context }) }));
+    try {
+      pageContextSupported = false;
+      expect((await (await h(new Request(`${BASE}/config?pageContext=1`))).json()).pageContextVersions).toBeUndefined();
+      const old = await post();
+      expect([old.status, (await old.json()).error.code]).toEqual([400, "page_context_unsupported"]);
+      pageContextSupported = true;
+      expect((await (await h(new Request(`${BASE}/config?pageContext=1`))).json()).pageContextVersions).toEqual([1]);
+      const ok = await post();
+      await ok.text();
+      expect(lastChat.message).toBe("hello");
+      expect(lastChat.pageContext).toEqual(context);
+      pageContextRefusal = true;
+      const refused = await (await post()).text();
+      expect(refused).toContain('"code":"page_context_invalid"');
+      expect(refused).not.toContain("private page content");
+      pageContextRefusal = false;
+      pageContextSupported = false;
+      const downgraded = await post();
+      expect([downgraded.status, (await downgraded.json()).error.code]).toEqual([400, "page_context_unsupported"]);
+    } finally { pageContextSupported = false; pageContextRefusal = false; }
+  });
   it("config", async () => {
     const h = createDeweeHandler(opts());
     expect(await capture(await h(new Request(`${BASE}/config`)))).toMatchSnapshot();

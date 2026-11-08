@@ -25,7 +25,7 @@ interface Frame {
   id?: string;
   ok?: boolean;
   payload?: any;
-  error?: { code?: string; message?: string; retryable?: boolean; retryAfterMs?: unknown; details?: { remediation?: unknown } };
+  error?: { code?: string; message?: string; retryable?: boolean; retryAfterMs?: unknown; details?: { remediation?: unknown; reason?: unknown } };
   event?: string;
 }
 
@@ -37,7 +37,7 @@ type SocketLike = {
 
 export class GatewayError extends Error {
   /** `retryAfterMs` is the gateway's raw value for retryable refusals (`RATE_LIMITED`), unvalidated. */
-  constructor(message: string, public code?: string, public remediation?: Remediation, public retryAfterMs?: unknown) {
+  constructor(message: string, public code?: string, public remediation?: Remediation, public retryAfterMs?: unknown, public reason?: unknown) {
     super(message);
   }
 }
@@ -87,6 +87,7 @@ export class GatewayConnection {
   private pending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private listeners = new Set<(event: string, payload: any) => void>();
   private closed = false;
+  pageContextVersions: number[] = [];
 
   private constructor(private ws: SocketLike) {
     ws.addEventListener("message", (ev: any) => this.onMessage(typeof ev.data === "string" ? ev.data : String(ev.data)));
@@ -100,7 +101,8 @@ export class GatewayConnection {
       typeof actor === "string" ? { token: creds.token, user_id: actor } : { token: creds.token, identity_session: actor.identitySession };
     if (creds.tenantId) params.tenant_id = creds.tenantId;
     try {
-      const res = await conn.call<{ user_id?: unknown } | undefined>("connect", params, timeoutMs);
+      const res = await conn.call<{ user_id?: unknown; page_context_versions?: unknown } | undefined>("connect", params, timeoutMs);
+      conn.pageContextVersions = Array.isArray(res?.page_context_versions) && res.page_context_versions.includes(1) ? [1] : [];
       // Fail closed: a gateway that did not apply the identity session (identity switched off, or a
       // replica that failed to start it) would otherwise run the turn as the operator token's own user.
       if (typeof actor !== "string" && !isIdentityUser(res?.user_id)) {
@@ -148,7 +150,7 @@ export class GatewayConnection {
       if (frame.ok) p.resolve(frame.payload);
       else {
         const e = frame.error;
-        p.reject(new GatewayError(e?.message || "Gateway request failed", e?.code, parseRemediation(e?.details?.remediation), e?.retryAfterMs));
+        p.reject(new GatewayError(e?.message || "Gateway request failed", e?.code, parseRemediation(e?.details?.remediation), e?.retryAfterMs, e?.details?.reason));
       }
     } else if (frame.type === "event" && frame.event) {
       for (const cb of this.listeners) cb(frame.event, frame.payload);
@@ -177,6 +179,7 @@ export interface StreamChatOptions {
   agent: string;
   sessionKey: string;
   message: string;
+  pageContext?: unknown;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -219,11 +222,12 @@ export async function* streamChat(opts: StreamChatOptions): AsyncGenerator<ChatS
   opts.signal?.addEventListener("abort", onAbort, { once: true });
 
   conn
-    .call("chat.send", { agentId: opts.agent, sessionKey: opts.sessionKey, message: opts.message, stream: true }, opts.timeoutMs ?? 180000)
+    .call("chat.send", { agentId: opts.agent, sessionKey: opts.sessionKey, message: opts.message, stream: true, ...(opts.pageContext !== undefined ? { pageContext: opts.pageContext } : {}) }, opts.timeoutMs ?? 180000)
     .then((res) => { push({ type: "done", content: res?.content ?? "", usage: res?.usage }); end(); })
     .catch((err: GatewayError) => {
       // Admission refusals get a fixed message: the gateway's text never reaches the browser.
-      if (!finished && isAdmissionErrorCode(err.code)) push(admissionErrorEvent(err.code, err.retryAfterMs, err.message));
+      if (!finished && (err.reason === "page_context_invalid" || err.reason === "page_context_unsupported")) push({ type: "error", code: err.reason, message: err.reason === "page_context_invalid" ? "Invalid page context" : "Page context is not supported" });
+      else if (!finished && isAdmissionErrorCode(err.code)) push(admissionErrorEvent(err.code, err.retryAfterMs, err.message));
       else if (!finished) push(err.remediation ? { type: "error", message: err.message, code: err.code, remediation: err.remediation } : { type: "error", message: err.message, code: err.code });
       end();
     });

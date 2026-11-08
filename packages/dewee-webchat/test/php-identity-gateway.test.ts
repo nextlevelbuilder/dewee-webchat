@@ -21,6 +21,9 @@ describe.skipIf(!available)("PHP signed-in Gateway sessions", () => {
   let gateway: Server, ws: WebSocketServer, phpServer: ChildProcess, base = "", optionsPath = "";
   let options: any;
   let applied = true;
+  let pageContextSupported = false;
+  let lastChat: any;
+  let pageContextRefusal = false;
   let wsFailure: { code: string; message: string; remediation: { action: string; audience: string } } | undefined;
   let failure: { route: string; code: string; remediation?: { action: string; audience: string } } | undefined;
   const connects: any[] = [];
@@ -42,8 +45,10 @@ describe.skipIf(!available)("PHP signed-in Gateway sessions", () => {
     ws.on("connection", (socket) => socket.on("message", (raw) => {
       const frame = JSON.parse(String(raw));
       if (frame.method === "connect") connects.push(frame.params);
+      if (frame.method === "chat.send") lastChat = frame.params;
+      if (frame.method === "chat.send" && pageContextRefusal) { socket.send(JSON.stringify({ type: "res", id: frame.id, ok: false, error: { code: "INVALID_REQUEST", message: "private page content", details: { reason: "page_context_invalid" } } })); return; }
       if (frame.method === "connect" && wsFailure) { socket.send(JSON.stringify({ type: "res", id: frame.id, ok: false, error: wsFailure })); return; }
-      const payload = frame.method === "connect" ? (applied ? { user_id: "tuc:principal-test" } : {}) : frame.method === "chat.history" ? { messages: [] } : { content: "hello" };
+      const payload = frame.method === "connect" ? (applied ? { user_id: "tuc:principal-test", ...(pageContextSupported ? { page_context_versions: [1] } : {}) } : {}) : frame.method === "chat.history" ? { messages: [] } : { content: "hello" };
       socket.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload }));
     }));
     await new Promise<void>((done) => gateway.listen(0, "127.0.0.1", done));
@@ -78,6 +83,28 @@ describe.skipIf(!available)("PHP signed-in Gateway sessions", () => {
     expect(history.status).toBe(200);
     const link = await fetch(`${base}/link`, { method: "POST", headers, body: "{}" });
     expect(await link.json()).toMatchObject({ proofCode: "123456", deepLinks: [{ channelType: "telegram" }] });
+  });
+
+  it("negotiates page context and binds it to the verified Gateway session", async () => {
+    const issued = await (await fetch(`${base}/session`, { method: "POST", headers: { cookie: "uid=user-a" }, body: "{}" })).json();
+    const headers = { cookie: "uid=user-a", authorization: `Bearer ${issued.token}` };
+    const page = { version: 1, url: "https://site.test/page", content: { format: "text", text: "A page", truncated: false } };
+    const send = () => fetch(`${base}/chat`, { method: "POST", headers, body: JSON.stringify({ message: "hi", conversationId: "conversation_123", page_context: page }) });
+    try {
+      pageContextSupported = false;
+      expect((await (await send()).json()).error.code).toBe("page_context_unsupported");
+      pageContextSupported = true;
+      expect((await (await fetch(`${base}/config?pageContext=1`)).json()).pageContextVersions).toEqual([1]);
+      const response = await send(); await response.text();
+      expect(response.status).toBe(200);
+      expect(lastChat.pageContext).toEqual(page);
+      expect(connects.at(-1)).toMatchObject({ identity_session: "identity-test" });
+      expect(connects.at(-1)).not.toHaveProperty("user_id");
+      pageContextRefusal = true;
+      const refusal = await (await send()).text();
+      expect(refusal).toContain('"code":"page_context_invalid"');
+      expect(refusal).not.toContain("private page content");
+    } finally { pageContextSupported = false; pageContextRefusal = false; }
   });
 
   it("refuses an existing token when its bound agent is removed", async () => {

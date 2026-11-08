@@ -121,6 +121,32 @@ describe("ccp transport: startup", () => {
 });
 
 describe("ccp transport: browser contract", () => {
+  it("forwards supported page context separately and rejects unsupported or oversized attachments", async () => {
+    const attachment = { version: 1, url: "https://shop.example/item", content: { format: "text", text: "A page", truncated: false } };
+    const old = makeHandler();
+    const oldSession = await session(old);
+    const refused = await chat(old, oldSession.token, { page_context: attachment });
+    expect([refused.status, refused.json().error.code]).toEqual([400, "page_context_unsupported"]);
+    expect(ccp.routes("chat")).toHaveLength(0);
+    ccp.reset();
+    ccp.state.config = { ...ccp.state.config, page_context: { versions: [1] } };
+    const h = makeHandler();
+    expect((await h(new Request(`${BASE}/config`))).json().pageContextVersions).toEqual([1]);
+    const s = await session(h);
+    const ok = await chat(h, s.token, { page_context: attachment });
+    expect(ok.status).toBe(200);
+    expect(ccp.routes("chat")[0].body).toMatchObject({ message: "hi", page_context: attachment });
+    const multibyte = { ...attachment, content: { format: "text", text: "\u2028\u2029".repeat(5500), truncated: false } };
+    expect((await chat(h, s.token, { page_context: multibyte })).status).toBe(200);
+    const big = await chat(h, s.token, { page_context: { ...attachment, title: "x".repeat(66000) } });
+    expect([big.status, big.json().error.code]).toEqual([400, "page_context_invalid"]);
+    const huge = await chat(h, s.token, { padding: "x".repeat(131072) });
+    expect([huge.status, huge.json().error.code]).toEqual([413, "too_long"]);
+    ccp.state.failNext.set("chat", { status: 400, code: "page_context_invalid", message: "secret page contents" });
+    const upstream = await chat(h, s.token, { page_context: attachment });
+    expect([upstream.status, upstream.json().error.code]).toEqual([400, "page_context_invalid"]);
+    expect(upstream.text).not.toContain("secret page contents");
+  });
   it("serves the integration's agents in the unchanged config shape, cached", async () => {
     const h = makeHandler({ maxMessageLength: 8000 });
     const cfg = (await h(new Request(`${BASE}/config`))).json();

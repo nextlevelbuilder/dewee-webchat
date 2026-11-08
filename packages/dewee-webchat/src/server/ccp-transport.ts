@@ -58,6 +58,7 @@ export interface CcpConfig {
   showThinking: boolean;
   showToolActivity: boolean;
   maxMessageChars: number;
+  pageContextVersions: number[];
 }
 
 /** Per browser request: what CCP is told about the visitor. */
@@ -112,6 +113,10 @@ export function browserErrorFor(e: unknown, route: CcpRoute): BrowserError {
     if (e.code === "rate_limited" || e.code === "concurrency_limited" || e.status === 429) return { status: 429, code: "RATE_LIMITED", message: "", admission: "RATE_LIMITED", retryAfterMs };
   }
   switch (e.code) {
+    case "page_context_invalid":
+      return { status: 400, code: e.code, message: "Invalid page context" };
+    case "page_context_unsupported":
+      return { status: 400, code: e.code, message: "Page context is not supported" };
     case "invalid_request":
       log("error", "- the ingress refused the request shape; check the dewee-webchat version");
       return { status: 400, code: "bad_request", message: "Invalid request" };
@@ -201,6 +206,7 @@ function parseConfig(data: Record<string, any>): CcpConfig {
     showThinking: data.show_thinking === true,
     showToolActivity: data.show_tool_activity === true,
     maxMessageChars: Number.isInteger(max) && max > 0 ? max : Number.POSITIVE_INFINITY,
+    pageContextVersions: Array.isArray(data.page_context?.versions) && data.page_context.versions.includes(1) ? [1] : [],
   };
 }
 
@@ -324,13 +330,14 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
       ctx: VisitorContext,
       visitorId: string,
       sealed: EdgeSession | undefined,
-      input: { message: string; conversationId: string; agent?: string; identitySession?: string; signal: AbortSignal },
+      input: { message: string; conversationId: string; agent?: string; identitySession?: string; pageContext?: unknown; signal: AbortSignal },
     ): Promise<Response> {
       const body = {
         message: input.message,
         conversation_id: input.conversationId,
         ...withAgent(input.agent),
         ...(input.identitySession ? { identity_session: input.identitySession } : {}),
+        ...(input.pageContext !== undefined ? { page_context: input.pageContext } : {}),
       };
       return withEdge(ctx, visitorId, sealed, (edge) => client.send("chat", { ...base(ctx), body, session: edge.token, accept: "text/event-stream", signal: input.signal }));
     },

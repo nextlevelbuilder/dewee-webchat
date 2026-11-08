@@ -48,6 +48,9 @@ export interface Strings {
   jobAccessUnavailable: string;
   jobAccessPopupBlocked: string;
   jobAccessPopupClosed: string;
+  pageShare: string;
+  pageChanged: string;
+  pageUnavailable: string;
 }
 
 const en: Strings = {
@@ -109,6 +112,9 @@ const en: Strings = {
   jobAccessUnavailable: "Job access could not be opened. Sign in again or retry.",
   jobAccessPopupBlocked: "Allow popups for this site, then choose Job access again.",
   jobAccessPopupClosed: "The window was closed. Choose Job access again to retry.",
+  pageShare: "Share this page with the assistant for this message",
+  pageChanged: "The page changed. Review it and choose to share again before sending.",
+  pageUnavailable: "Page details are unavailable. You can send without them.",
 };
 
 const vi: Strings = {
@@ -170,6 +176,9 @@ const vi: Strings = {
   jobAccessUnavailable: "Chưa mở được quyền công việc. Hãy đăng nhập lại hoặc thử lại.",
   jobAccessPopupBlocked: "Cho phép cửa sổ bật lên cho trang này rồi chọn Quyền công việc lần nữa.",
   jobAccessPopupClosed: "Cửa sổ đã đóng. Chọn Quyền công việc lần nữa để thử lại.",
+  pageShare: "Chia sẻ trang này với trợ lý trong tin nhắn này",
+  pageChanged: "Trang đã thay đổi. Hãy xem lại và chọn chia sẻ trước khi gửi.",
+  pageUnavailable: "Không thể đọc nội dung trang. Bạn vẫn có thể gửi tin nhắn.",
 };
 
 export const locales: Record<string, Strings> = { en, vi };

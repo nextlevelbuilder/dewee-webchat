@@ -51,7 +51,9 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
     writeFileSync(join(dir, optionsFile), JSON.stringify({ ccp: ccpOptions(), secret: VISITOR_SECRET, rateLimit: false, ...extra }));
   };
   /** The integration config is cached for a minute in a private temp dir; tests that change it drop the cache. */
-  const dropConfigCache = () => { for (const cacheDir of cacheDirs()) for (const name of readdirSync(cacheDir)) if (name.startsWith("ccp-config-")) rmSync(join(cacheDir, name), { force: true }); };
+  const dropConfigCache = () => {
+    for (const cacheDir of cacheDirs()) for (const name of readdirSync(cacheDir)) if (name.startsWith("ccp-config-")) rmSync(join(cacheDir, name), { force: true });
+  };
   /** The private cache directory (`dewee-webchat-<uid>`) the PHP server created, if any. */
   const cacheDirs = () => readdirSync(join(dir, "tmp")).filter((n) => /^dewee-webchat-\d+$/.test(n)).map((n) => join(dir, "tmp", n));
 
@@ -230,6 +232,30 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     expect((await call(`/history?agent=shop&conversationId=conv_php_0001`, { headers: { authorization: `Bearer ${other.token}` } })).json()).toEqual({ messages: [] });
     // A browser-valid id that CCP cannot hold has no conversation yet.
     expect((await call(`/history?conversationId=short1`, { headers: { authorization: `Bearer ${s.token}` } })).json()).toEqual({ messages: [] });
+  });
+
+  it("negotiates page context and forwards it separately without leaking refusal text", async () => {
+    const context = { version: 1, url: "https://shop.example/item", content: { format: "text", text: "Visible text", truncated: false } };
+    const s = await session();
+    const old = await chat(s.token, { page_context: context });
+    expect([old.status, old.json().error.code]).toEqual([400, "page_context_unsupported"]);
+    ccp.state.config = { ...ccp.state.config, page_context: { versions: [1] } };
+    dropConfigCache();
+    expect((await call("/config")).json().pageContextVersions).toEqual([1]);
+    const ok = await chat(s.token, { page_context: context });
+    expect(ok.status).toBe(200);
+    expect(ccp.routes("chat")[0].body).toMatchObject({ message: "hi", page_context: context });
+    const multibyte = { ...context, content: { format: "text", text: "\u2028\u2029".repeat(5500), truncated: false } };
+    expect((await chat(s.token, { page_context: multibyte })).status).toBe(200);
+    expect(ccp.routes("chat")[1].body.page_context).toEqual(multibyte);
+    const big = await chat(s.token, { page_context: { ...context, title: "x".repeat(66000) } });
+    expect([big.status, big.json().error.code]).toEqual([400, "page_context_invalid"]);
+    const huge = await chat(s.token, { padding: "x".repeat(131072) });
+    expect([huge.status, huge.json().error.code]).toEqual([413, "too_long"]);
+    ccp.state.failNext.set("chat", { status: 400, code: "page_context_invalid", message: "secret page contents" });
+    const invalid = await chat(s.token, { page_context: context });
+    expect([invalid.status, invalid.json().error.code]).toEqual([400, "page_context_invalid"]);
+    expect(invalid.text).not.toContain("secret page contents");
   });
 
   it("refuses an agent name the ingress would not accept locally, without asking CCP", async () => {

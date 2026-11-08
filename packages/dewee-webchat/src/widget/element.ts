@@ -20,6 +20,7 @@ import { icons, pickStrings, type Strings } from "./i18n";
 import { disposeMarkdownImages, renderMarkdown } from "./markdown";
 import { SendCooldown } from "./send-cooldown";
 import { styles } from "./styles";
+import type { PageContextAttachment } from "./page-context";
 
 /** Pause after a RATE_LIMITED refusal that says nothing about when to retry. */
 const DEFAULT_COOLDOWN_MS = 5_000;
@@ -41,6 +42,12 @@ export interface DeweeChatConfig {
   avatar?: string;
   /** HTTPS origins from which Markdown images may load, in addition to the page's own origin. */
   imageOrigins?: string[];
+  /** Explicit host opt-in; the visitor must also choose to share the current page. */
+  pageContext?: "off" | "metadata" | "content";
+  contextSelector?: string;
+  excludeSelectors?: string[];
+  /** Supplies host-filtered content. Visitors still preview and opt in on each message. */
+  contextProvider?: () => Promise<Partial<PageContextAttachment>>;
   launcherAvatar?: boolean;
   position?: "bottom-right" | "bottom-left";
   /** "floating" (launcher + popup) or "inline" (fills its container). */
@@ -115,7 +122,7 @@ export interface ActionEventDetail {
 }
 
 /** Option keys that hold functions/objects: applied without re-rendering the widget. */
-type BehaviorKey = "actions" | "confirm" | "getPageContext" | "headers" | "fetch" | "domActionsRoot";
+type BehaviorKey = "actions" | "confirm" | "getPageContext" | "headers" | "fetch" | "domActionsRoot" | "contextProvider";
 
 interface ViewRefs {
   root: HTMLElement;
@@ -147,7 +154,7 @@ interface ViewMessage extends HistoryMessage {
 const BOOL_ATTRS = ["show-reasoning", "show-tool-calls", "allow-agent-switch", "open", "persist", "hide-branding", "launcher-avatar", "dom-actions"];
 const ATTRS = [
   "endpoint", "agent", "title", "subtitle", "greeting", "intro", "placeholder", "suggestions", "avatar", "position",
-  "mode", "theme", "accent-color", "locale", "gateway-url", "gateway-token", "width", "height", "z-index", "dom-actions-root", "image-origins", ...BOOL_ATTRS,
+  "mode", "theme", "accent-color", "locale", "gateway-url", "gateway-token", "width", "height", "z-index", "dom-actions-root", "image-origins", "page-context", "context-selector", "exclude-selectors", ...BOOL_ATTRS,
 ];
 
 const camel = (s: string) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -186,17 +193,22 @@ export class DeweeChatElement extends ElementBase {
   private api: ApiClient | null = null;
   private apiKey = "";
   private server: PublicConfig | null = null;
+  private sharedPage?: PageContextAttachment;
+  private preparingPage = false;
+  private pagePending = false;
+  private pageGeneration = 0;
   private agentId = "";
   private conversationId = "";
   private messages: ViewMessage[] = [];
   private running: AbortController | null = null;
   private jobAccessLaunch: AbortController | null = null;
   private activated = false;
+  private probedPage = false;
   private strings: Strings = pickStrings();
   private mql: MediaQueryList | null = null;
   private registry = new ActionRegistry();
   private propActionNames = new Set<string>();
-  private hooks: Pick<DeweeChatConfig, "confirm" | "getPageContext" | "headers" | "fetch" | "domActionsRoot"> = {};
+  private hooks: Pick<DeweeChatConfig, "confirm" | "getPageContext" | "headers" | "fetch" | "domActionsRoot" | "contextProvider"> = {};
   /** Built-in DOM actions, created on first use when `domActions` is on (keeps the snapshot refs). */
   private dom: DomActions | null = null;
   private acks = new Map<string, string>();
@@ -206,6 +218,7 @@ export class DeweeChatElement extends ElementBase {
     launcher: HTMLButtonElement; panel: HTMLElement; log: HTMLElement; title: HTMLElement; subtitle: HTMLElement;
     status: HTMLElement; avatar: HTMLElement; select: HTMLSelectElement; input: HTMLTextAreaElement; send: HTMLButtonElement;
     newChat: HTMLButtonElement; jobAccess: HTMLButtonElement; close: HTMLButtonElement; foot: HTMLElement; cooldown: HTMLElement; announcer: HTMLElement;
+    pageChoice: HTMLInputElement; pageWrap: HTMLElement; pageLabel: HTMLElement; pagePreview: HTMLElement;
   };
 
   constructor() {
@@ -224,6 +237,7 @@ export class DeweeChatElement extends ElementBase {
       if (BOOL_ATTRS.includes(a)) c[camel(a)] = parseBool(v);
       else if (a === "suggestions") c.suggestions = v.trim().startsWith("[") ? safeJson(v, []) : v.split("|").map((s) => s.trim()).filter(Boolean);
       else if (a === "image-origins") c.imageOrigins = v.trim().startsWith("[") ? safeJson(v, []) : v.split(",").map((s) => s.trim()).filter(Boolean);
+      else if (a === "exclude-selectors") c.excludeSelectors = v.trim().startsWith("[") ? safeJson(v, []) : v.split(",").map((s) => s.trim()).filter(Boolean);
       else if (a === "z-index") c.zIndex = Number(v);
       else c[camel(a)] = v;
     }
@@ -232,13 +246,14 @@ export class DeweeChatElement extends ElementBase {
 
   /** Updates configuration at runtime (wins over attributes). */
   configure(partial: Partial<DeweeChatConfig>): void {
-    const { actions, confirm, getPageContext, headers, fetch, domActionsRoot, ...rest } = partial;
+    const { actions, confirm, getPageContext, headers, fetch, domActionsRoot, contextProvider, ...rest } = partial;
     const has = (k: BehaviorKey) => Object.prototype.hasOwnProperty.call(partial, k);
     if (has("actions")) this.setPropActions(actions ?? []);
     if (has("confirm")) this.hooks.confirm = confirm;
     if (has("getPageContext")) this.hooks.getPageContext = getPageContext;
     if (has("headers")) this.hooks.headers = headers;
     if (has("fetch")) this.hooks.fetch = fetch;
+    if (has("contextProvider")) this.hooks.contextProvider = contextProvider;
     if (has("domActionsRoot")) {
       if (domActionsRoot === undefined) delete this.hooks.domActionsRoot;
       else this.hooks.domActionsRoot = domActionsRoot;
@@ -318,16 +333,44 @@ export class DeweeChatElement extends ElementBase {
   /** Sends a message programmatically (opens the widget first). */
   async send(text: string): Promise<void> {
     const message = text.trim();
-    if (!message || this.running || this.cooldown.active) return;
+    if (!message || this.running || this.preparingPage || this.cooldown.active) return;
     if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.open();
     await this.activate();
+    let attachment: PageContextAttachment | undefined;
+    if (this.els.pageChoice.checked) {
+      if (this.pagePending) { this.showNotice(this.strings.pageUnavailable); return; }
+      this.preparingPage = true;
+      const generation = this.pageGeneration;
+      try {
+        const previous = this.sharedPage;
+        const current = await this.captureCurrentPage();
+        if (!this.els.pageChoice.checked || generation !== this.pageGeneration) return;
+        if (!previous || !current || this.pageFingerprint(previous) !== this.pageFingerprint(current)) {
+          this.sharedPage = current;
+          this.renderPagePreview();
+          this.els.pageChoice.checked = false;
+          this.showNotice(this.strings.pageChanged);
+          return;
+        }
+        attachment = current;
+      } catch {
+        this.sharedPage = undefined;
+        this.els.pageChoice.checked = false;
+        this.renderPagePreview();
+        this.showNotice(this.strings.pageUnavailable);
+        return;
+      } finally { this.preparingPage = false; }
+      this.els.pageChoice.checked = false;
+      this.sharedPage = undefined;
+      this.renderPagePreview();
+    }
     this.els.input.value = "";
     this.autosize();
     // Agent turn, then (when the answer calls page actions) run them and send the results back,
     // at most `maxActionRounds` times per visitor message.
     let next: { message: string; hidden: boolean } | null = { message, hidden: false };
     for (let round = 0; next; round++) {
-      const reply = await this.runTurn(next.message, next.hidden);
+      const reply = await this.runTurn(next.message, next.hidden, round === 0 ? attachment : undefined);
       next = null;
       if (reply.status !== "done" || reply.stopped || !this.actionRegistry().size) break;
       const { calls } = parseDirectives(reply.content);
@@ -347,7 +390,7 @@ export class DeweeChatElement extends ElementBase {
   }
 
   /** One request/response with the agent. */
-  private async runTurn(message: string, hidden: boolean): Promise<ViewMessage> {
+  private async runTurn(message: string, hidden: boolean, attachment?: PageContextAttachment): Promise<ViewMessage> {
     this.pushMessage({ role: "user", content: message, hidden });
     const reply: ViewMessage = { role: "assistant", content: "", status: "streaming", startedAt: Date.now() };
     this.pushMessage(reply);
@@ -356,7 +399,7 @@ export class DeweeChatElement extends ElementBase {
     try {
       // The session decides which backend conversation (visitor) the page-action ack belongs to.
       await this.client().ensureSession();
-      await this.client().chat(this.chatBody(message), (e) => this.onStreamEvent(reply, e), this.running!.signal);
+      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => this.onStreamEvent(reply, e), this.running!.signal);
       if (reply.status === "streaming") reply.status = "done";
     } catch (e) {
       if ((e as Error).name === "AbortError") {
@@ -612,6 +655,10 @@ export class DeweeChatElement extends ElementBase {
   }
 
   disconnectedCallback(): void {
+    this.pageGeneration++;
+    this.sharedPage = undefined;
+    this.els.pageChoice.checked = false;
+    this.renderPagePreview();
     disposeMarkdownImages(this.root);
     for (const message of this.messages) if (message.view) message.view.mdKey = undefined;
     this.jobAccessLaunch?.abort();
@@ -704,6 +751,8 @@ export class DeweeChatElement extends ElementBase {
     e.jobAccess.setAttribute("aria-label", s.jobAccess);
     e.jobAccess.title = s.jobAccess;
     e.input.placeholder = c.placeholder || s.placeholder;
+    e.pageLabel.textContent = s.pageShare;
+    this.updatePageChoice();
     e.foot.hidden = !!c.hideBranding;
     e.foot.querySelector(".by")!.textContent = s.poweredBy + " ";
     this.renderSubtitle();
@@ -713,6 +762,10 @@ export class DeweeChatElement extends ElementBase {
     if (this.activated && this.api && this.apiKey !== [c.endpoint, c.gatewayUrl, c.gatewayToken].join("|")) {
       this.activated = false;
       this.server = null;
+      this.probedPage = false;
+      this.activate();
+    } else if (this.activated && !this.probedPage && (c.pageContext === "metadata" || c.pageContext === "content")) {
+      this.activated = false;
       this.activate();
     } else if (this.activated && c.agent && c.agent !== this.agentId && this.server) {
       this.switchAgent(c.agent);
@@ -740,6 +793,7 @@ export class DeweeChatElement extends ElementBase {
         <div class="log" part="log" role="log" aria-live="polite"></div>
         <div class="challenge"><slot name="challenge"></slot></div>
         <form class="composer" part="composer">
+          <div class="page-context" hidden><label><input type="checkbox" class="page-choice"> <span class="page-label"></span></label><pre class="page-preview" hidden></pre></div>
           <div class="cooldown" part="cooldown" aria-hidden="true" hidden></div>
           <div class="sr-only announcer" role="status" aria-live="polite"></div>
           <div class="box">
@@ -754,6 +808,7 @@ export class DeweeChatElement extends ElementBase {
       launcher: $(".launcher"), panel: $(".panel"), log: $(".log"), title: $(".title"), subtitle: $(".subtitle"),
       status: $(".status"), avatar: $(".avatar"), select: $(".agent-select"), input: $("textarea"), send: $(".send"),
       newChat: $(".new"), jobAccess: $(".job-access"), close: $(".close"), foot: $(".foot"), cooldown: $(".cooldown"), announcer: $(".announcer"),
+      pageChoice: $(".page-choice"), pageWrap: $(".page-context"), pageLabel: $(".page-label"), pagePreview: $(".page-preview"),
     };
     const e = this.els;
     e.launcher.addEventListener("click", () => this.toggle());
@@ -762,6 +817,7 @@ export class DeweeChatElement extends ElementBase {
     e.log.addEventListener("scroll", () => { this.following = this.nearBottom(); }, { passive: true });
     e.newChat.addEventListener("click", () => this.newConversation());
     e.jobAccess.addEventListener("click", () => { void this.openJobAccess(); });
+    e.pageChoice.addEventListener("change", () => { void this.choosePage(); });
     e.select.addEventListener("change", () => this.switchAgent(e.select.value));
     $<HTMLFormElement>("form").addEventListener("submit", (ev) => {
       ev.preventDefault();
@@ -781,6 +837,68 @@ export class DeweeChatElement extends ElementBase {
     const t = this.els.input;
     t.style.height = "auto";
     t.style.height = Math.min(t.scrollHeight, 140) + "px";
+  }
+
+  private updatePageChoice() {
+    const mode = this.config.pageContext;
+    const available = (mode === "metadata" || mode === "content") && this.server?.pageContextVersions?.includes(1) === true;
+    this.els.pageWrap.hidden = !available;
+    if (!available) { this.pageGeneration++; this.pagePending = false; this.els.pageChoice.checked = false; this.sharedPage = undefined; this.renderPagePreview(); }
+  }
+
+  private async captureCurrentPage(): Promise<PageContextAttachment | undefined> {
+    const c = this.config;
+    if ((c.pageContext !== "metadata" && c.pageContext !== "content") || !this.server?.pageContextVersions?.includes(1)) return undefined;
+    const before = document.location.href;
+    const { capturePageContext, providedPageContext } = await import("./page-context");
+    const provider = this.hooks.contextProvider;
+    const configKey = JSON.stringify([c.pageContext, c.contextSelector, c.excludeSelectors]);
+    const base = capturePageContext(document, { mode: provider ? "metadata" : c.pageContext, selector: c.contextSelector, excludeSelectors: c.excludeSelectors });
+    let result = base;
+    if (base && provider) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const supplied = await Promise.race([provider(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Page context timed out")), 5000); })]);
+        result = providedPageContext(supplied, base, c.pageContext);
+      } finally { if (timer) clearTimeout(timer); }
+    }
+    const now = this.config;
+    if (!this.isConnected || before !== document.location.href || provider !== this.hooks.contextProvider || configKey !== JSON.stringify([now.pageContext, now.contextSelector, now.excludeSelectors])) return undefined;
+    return result;
+  }
+
+  private pageFingerprint(page: PageContextAttachment): string {
+    const { captured_at: _capturedAt, ...stable } = page;
+    return JSON.stringify(stable);
+  }
+
+  private renderPagePreview() {
+    const preview = this.els.pagePreview;
+    preview.hidden = !this.sharedPage;
+    preview.textContent = this.sharedPage ? [this.sharedPage.title, this.sharedPage.url, this.sharedPage.description, this.sharedPage.selection, this.sharedPage.content?.text].filter(Boolean).join("\n\n") : "";
+  }
+
+  private async choosePage() {
+    const generation = ++this.pageGeneration;
+    if (!this.els.pageChoice.checked) { this.pagePending = false; this.sharedPage = undefined; this.renderPagePreview(); return; }
+    this.sharedPage = undefined;
+    this.renderPagePreview();
+    this.pagePending = true;
+    try {
+      const page = await this.captureCurrentPage();
+      if (generation !== this.pageGeneration || !this.els.pageChoice.checked) return;
+      if (!page) throw new Error("Page unavailable");
+      this.sharedPage = page;
+      this.renderPagePreview();
+      this.emit("dewee:context-ready", { available: true });
+    } catch {
+      if (generation !== this.pageGeneration) return;
+      this.sharedPage = undefined;
+      this.els.pageChoice.checked = false;
+      this.renderPagePreview();
+      this.showNotice(this.strings.pageUnavailable);
+      this.emit("dewee:context-error", { code: "page_unavailable" });
+    } finally { if (generation === this.pageGeneration) this.pagePending = false; }
   }
 
   private updateSendButton() {
@@ -840,7 +958,8 @@ export class DeweeChatElement extends ElementBase {
     this.activated = true;
     this.renderLog();
     try {
-      this.server = await this.client().getConfig(true);
+      this.probedPage = this.config.pageContext === "metadata" || this.config.pageContext === "content";
+      this.server = await this.client().getConfig(true, this.probedPage);
       this.els.input.maxLength = this.server.maxMessageLength;
       const wanted = this.config.agent;
       const known = (id?: string) => !!id && (this.server!.agents.length === 0 || this.server!.agents.some((a: AgentInfo) => a.id === id));
@@ -852,6 +971,7 @@ export class DeweeChatElement extends ElementBase {
       this.showError(null, e as Error);
     }
     this.renderSubtitle();
+    this.updatePageChoice();
     this.emit("dewee:ready", { agent: this.agentId, config: this.server });
   }
 

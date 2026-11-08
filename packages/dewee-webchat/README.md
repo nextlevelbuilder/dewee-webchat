@@ -92,6 +92,19 @@ instance. CCP always requires a configured secret of at least 32 bytes.
 
 ## 2. Add the widget
 
+### Optional current-page context
+
+Page context is off by default. Set `page-context="metadata"` or `page-context="content"` on the
+widget (or `pageContext` in framework configuration) to offer it. The visitor previews the page
+and explicitly chooses whether to share it for each message. Only a supported Gateway/CCP version
+receives the attachment; ordinary chat continues when support is absent. For content, the default
+source is `main`, `article` or `[role=main]`; `contextSelector` and `excludeSelectors` narrow it.
+Form controls, editable areas and hidden content are excluded. Configure a client-side
+`contextProvider` for host-filtered data when needed; the host is responsible for excluding private
+data from its provider. In Astro, set that function with `element.configure()` in a client script,
+not as a serialized component prop. The preview contains the data to be sent: review it before
+sharing. See the [HTTP contract](https://github.com/nextlevelbuilder/dewee-webchat/blob/main/docs/http-contract.md#page-context-attachment).
+
 **Script tag** (no build step):
 
 ```html

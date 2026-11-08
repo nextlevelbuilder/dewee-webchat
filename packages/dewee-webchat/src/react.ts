@@ -13,6 +13,8 @@ export interface DeweeChatProps extends Partial<DeweeChatConfig> {
   onClose?: (e: CustomEvent) => void;
   /** Page action telemetry (`dewee:action`, detail: ActionEventDetail). */
   onAction?: (e: CustomEvent<ActionEventDetail>) => void;
+  onContextReady?: (e: CustomEvent) => void;
+  onContextError?: (e: CustomEvent) => void;
 }
 
 const EVENTS = {
@@ -23,13 +25,15 @@ const EVENTS = {
   onOpen: "dewee:open",
   onClose: "dewee:close",
   onAction: "dewee:action",
+  onContextReady: "dewee:context-ready",
+  onContextError: "dewee:context-error",
 } as const;
 type EventProp = keyof typeof EVENTS;
 
 export const DeweeChat = forwardRef<DeweeChatElement | null, DeweeChatProps>(function DeweeChat(props, ref) {
   const el = useRef<DeweeChatElement | null>(null);
-  const { className, style, onReady, onSend, onReply, onError, onOpen, onClose, onAction, actions, confirm, getPageContext, headers, fetch, domActionsRoot, imageOrigins, ...config } = props;
-  const handlers: Partial<Record<EventProp, (e: CustomEvent<any>) => void>> = { onReady, onSend, onReply, onError, onOpen, onClose, onAction };
+  const { className, style, onReady, onSend, onReply, onError, onOpen, onClose, onAction, onContextReady, onContextError, actions, confirm, getPageContext, headers, fetch, domActionsRoot, contextProvider, imageOrigins, ...config } = props;
+  const handlers: Partial<Record<EventProp, (e: CustomEvent<any>) => void>> = { onReady, onSend, onReply, onError, onOpen, onClose, onAction, onContextReady, onContextError };
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
   useImperativeHandle(ref, () => el.current!, []);
@@ -44,7 +48,7 @@ export const DeweeChat = forwardRef<DeweeChatElement | null, DeweeChatProps>(fun
   // without re-rendering the widget (inline `actions={[...]}` arrays are fine).
   useEffect(() => {
     defineDeweeChat();
-    el.current?.configure({ actions, confirm, getPageContext, headers, fetch, domActionsRoot });
+    el.current?.configure({ actions, confirm, getPageContext, headers, fetch, domActionsRoot, contextProvider });
   });
 
   useEffect(() => {

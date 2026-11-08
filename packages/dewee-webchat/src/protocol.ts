@@ -71,6 +71,8 @@ export interface PublicConfig {
   turnstileSiteKey?: string;
   maxMessageLength: number;
   version: string;
+  /** Attachment versions advertised by the connected runtime. */
+  pageContextVersions?: number[];
   /** Present (true) when the backend signs users in through Dewee: the widget then asks `/session` on every page load. */
   identity?: boolean;
   /**
@@ -177,6 +179,8 @@ export interface ChatRequestBody {
   /** Hash from the `start` event of the last completed turn; the manifest is re-sent to the agent only when it differs. */
   actionsHash?: string;
   pageContext?: unknown;
+  /** Ephemeral, untrusted content for this turn; distinct from the legacy page-action context. */
+  page_context?: import("./widget/page-context").PageContextAttachment;
 }
 
 export const HEADER_GATEWAY_URL = "x-dewee-gateway-url";

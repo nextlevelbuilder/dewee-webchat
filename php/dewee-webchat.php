@@ -39,6 +39,11 @@ final class DeweeConfigError extends RuntimeException
 {
 }
 
+/** The configured limiter could not make a reliable admission decision. */
+final class DeweeRateLimitUnavailable extends RuntimeException
+{
+}
+
 /**
  * A refusal or failure of the CCP ingress. `ccpCode` is the contract's public code, or a local one:
  * `ccp_unreachable` (network), `ccp_redirect` (a redirect was refused), `ccp_bad_response`. The
@@ -424,6 +429,9 @@ final class DeweeWebchat
                 $method === 'POST' && $action === 'job-access' && $this->identity !== null => $this->handleJobAccess(),
                 default => $this->fail(404, 'Not found', 'not_found'),
             };
+        } catch (DeweeRateLimitUnavailable) {
+            error_log('[dewee-webchat] Rate limiter storage unavailable; request refused');
+            if (!headers_sent()) $this->fail(503, 'Chat is temporarily unavailable, try again later', 'rate_limit_unavailable');
         } catch (Throwable $e) {
             // CCP's own text never reaches the log, only its code.
             error_log('[dewee-webchat] ' . ($e instanceof DeweeCcpError ? 'CCP error ' . $e->ccpCode : $e->getMessage()));
@@ -2292,52 +2300,76 @@ final class DeweeWebchat
             return true;
         }
         if (is_callable($custom)) {
-            return (bool) $custom($key, $bucket);
+            try {
+                $allowed = $custom($key, $bucket);
+                if (!is_bool($allowed)) throw new DeweeRateLimitUnavailable();
+                return $allowed;
+            } catch (Throwable) { throw new DeweeRateLimitUnavailable(); }
         }
         [$max, $windowMs] = self::RATE_LIMITS[$bucket];
         // A shared temp dir would let another account on the host reset, inflate or redirect the counters.
         $dir = self::privateTempDir();
         if ($dir === null) {
-            error_log('[dewee-webchat] Rate limiter storage unavailable; requests are not limited.');
-            return true;
+            throw new DeweeRateLimitUnavailable();
         }
-        $file = $dir . DIRECTORY_SEPARATOR . 'rl-' . hash('sha256', "{$bucket}:{$key}");
-        // Exclusive creation never follows a planted link; an existing file must be this user's own.
-        $fp = @fopen($file, 'x+');
-        if ($fp !== false) {
-            @chmod($file, 0600);
-        } elseif (self::ownedPrivateFile($file)) {
-            $fp = @fopen($file, 'r+');
-        }
-        if ($fp === false) {
-            error_log('[dewee-webchat] Rate limiter storage unavailable; requests are not limited.');
-            return true;
-        }
-        $now = self::nowMs();
+        // Serialize opening buckets and cleanup, so unlink cannot split active waiters across inodes.
+        $guardPath = $dir . DIRECTORY_SEPARATOR . 'rate-limiter-guard';
+        $guard = @fopen($guardPath, 'x+');
+        if ($guard !== false) @chmod($guardPath, 0600);
+        // The parent is already private: its owner may open the guard while another request is
+        // creating it, even before that request has tightened the file mode.
+        elseif (is_file($guardPath) && !is_link($guardPath) && @fileowner($guardPath) === self::processUid()) $guard = @fopen($guardPath, 'r+');
+        if ($guard === false) throw new DeweeRateLimitUnavailable();
         try {
-            flock($fp, LOCK_EX);
-            $w = json_decode((string) stream_get_contents($fp), true);
-            if (!is_array($w) || !is_int($w['start'] ?? null) || $now - $w['start'] >= $windowMs) {
-                $w = ['start' => $now, 'count' => 1];
-            } else {
-                $w['count'] = (int) ($w['count'] ?? 0) + 1;
+            if (!flock($guard, LOCK_EX)) throw new DeweeRateLimitUnavailable();
+            $file = $dir . DIRECTORY_SEPARATOR . 'rl-' . hash('sha256', "{$bucket}:{$key}");
+            // Exclusive creation never follows a planted link; an existing file must be this user's own.
+            $fp = @fopen($file, 'x+');
+            $created = $fp !== false;
+            if ($fp !== false) {
+                @chmod($file, 0600);
+            } elseif (self::ownedPrivateFile($file)) {
+                $fp = @fopen($file, 'r+');
             }
-            ftruncate($fp, 0);
-            rewind($fp);
-            fwrite($fp, (string) json_encode($w));
-            fflush($fp);
-        } finally {
-            flock($fp, LOCK_UN);
-            fclose($fp);
-        }
-        if (random_int(1, 200) === 1) {
-            foreach (glob($dir . DIRECTORY_SEPARATOR . 'rl-*') ?: [] as $f) {
-                if (@filemtime($f) < time() - 3600) {
-                    @unlink($f);
+            if ($fp === false) {
+                throw new DeweeRateLimitUnavailable();
+            }
+            $now = self::nowMs();
+            try {
+                if (!flock($fp, LOCK_EX)) throw new DeweeRateLimitUnavailable();
+                $raw = stream_get_contents($fp);
+                if ($raw === false) throw new DeweeRateLimitUnavailable();
+                $w = json_decode($raw, true);
+                // An incomplete or corrupt existing counter is not evidence of a fresh window.
+                if ($created && $raw === '') {
+                    $w = ['start' => $now, 'count' => 1];
+                } elseif (!is_array($w) || !is_int($w['start'] ?? null) || !is_int($w['count'] ?? null) || $w['count'] < 1 || $w['start'] > $now) {
+                    throw new DeweeRateLimitUnavailable();
+                } elseif ($now - $w['start'] >= $windowMs) {
+                    $w = ['start' => $now, 'count' => 1];
+                } else {
+                    $w['count']++;
+                }
+                $encoded = (string) json_encode($w);
+                if (!rewind($fp) || !ftruncate($fp, 0) || fwrite($fp, $encoded) !== strlen($encoded) || !fflush($fp)) throw new DeweeRateLimitUnavailable();
+            } finally {
+                flock($fp, LOCK_UN);
+                fclose($fp);
+            }
+            if (random_int(1, 200) === 1) {
+                foreach (glob($dir . DIRECTORY_SEPARATOR . 'rl-*') ?: [] as $f) {
+                    if (!self::ownedPrivateFile($f)) continue;
+                    $mtime = @filemtime($f);
+                    if ($mtime !== false && $mtime < time() - 3600) {
+                        @unlink($f);
+                    }
                 }
             }
+            return $w['count'] <= $max;
+        } finally {
+            flock($guard, LOCK_UN);
+            fclose($guard);
         }
-        return $w['count'] <= $max;
     }
 
     public static function verifyTurnstile(string $secret, string $response, ?string $ip = null): bool

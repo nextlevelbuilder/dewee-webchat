@@ -6,6 +6,7 @@ implements these four routes works with the widget — the Node/Workers handler 
 
 Errors always use `{"error": {"message": string, "code": string}}` with a matching HTTP status.
 Identity errors of [signed-in users](#signed-in-users) add `remediation`.
+The PHP backend returns `503 rate_limit_unavailable` when its configured limiter cannot make a reliable decision; see the [PHP setup](../php/README.md).
 
 ## Image proxy
 

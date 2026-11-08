@@ -464,8 +464,8 @@ links on its own. `dewee:link` fires with `{ expiresAt, deepLinks }`. A link tha
 progress answers `409 link_in_progress`, a reused idempotency key `409 idempotency_key_reused`, and a
 gateway with linking switched off `503 linking_unavailable`; the widget shows its own text for each.
 
-The PHP backend does not support signed-in users (it has no JWS signing), with either transport; use
-the Node/Workers handler. It refuses tokens that carry an identity session.
+The PHP backend also supports signed-in users and a server-side logout hook; see the
+[PHP identity setup](../../php/README.md#signed-in-users). Its stateless reuse uses the CCP reuse hint.
 
 ## Security model
 

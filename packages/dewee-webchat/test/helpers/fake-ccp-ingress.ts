@@ -241,6 +241,9 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       // The real shape: `{channel, url}` per chat account (contract §1.8).
       return send(res, 201, { proof_code: "482913", expires_at: new Date(Date.now() + 600_000).toISOString(), deep_links: [{ channel: "telegram", url: "https://t.me/acme_bot?start=482913" }, { channel: "bad channel!", url: "https://x.example" }] });
     }
+    if (route === "job-access") {
+      return send(res, 200, { bootstrap_url: "https://access.example/identity/job-access/launch", launch_token: "one_time_ticket_0123456789", expires_at: new Date(Date.now() + 45_000).toISOString() });
+    }
     return error(res, 404, "not_found");
   }
 

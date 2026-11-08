@@ -46,7 +46,10 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.2"
+          extensions: sodium
       - run: php -l php/dewee-webchat.php
+      - run: |
+          php -r "exit(extension_loaded('sodium') ? 0 : 1);"
       # Page-action block/hash parity between the PHP and TypeScript backends.
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
@@ -54,4 +57,4 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -C packages/dewee-webchat exec vitest run test/php-parity.test.ts
+      - run: pnpm -C packages/dewee-webchat exec vitest run test/php-parity.test.ts test/php-ccp-transport.test.ts test/php-identity-*.test.ts

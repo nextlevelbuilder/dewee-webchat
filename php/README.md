@@ -2,12 +2,39 @@
 
 `dewee-webchat.php` is a single-file backend for the chat widget (PHP >= 8.1, `ext-openssl`, no
 Composer). It implements the [HTTP contract](../docs/http-contract.md) and behaves like the Node
-handler in `dewee-webchat/server` for anonymous visitors. The integration secret stays on your server.
+handler in `dewee-webchat/server` for anonymous and signed-in visitors. The integration secret stays on your server.
 
-**No signed-in users.** The PHP backend has no identity mode (it cannot sign partner assertions):
-every visitor is anonymous, with either transport. A visitor token that carries an identity session
-(issued by a Node backend with the same secret) is refused, never downgraded. For signed-in users,
-use the Node/Workers handler.
+## Signed-in users
+
+Configure `identity` in the PHP options and authenticate using your site's server-side session. The
+callback must return the stable subject of the currently signed-in user, or `null` when signed out;
+throw when the login service cannot be checked. Keep both secrets in server-only configuration.
+
+```php
+$options = DeweeWebchat::optionsFromEnv();
+$options['identity'] = [
+    'appId' => getenv('DEWEE_IDENTITY_APP_ID'),
+    'issuer' => 'https://shop.example',
+    'assertionSecret' => getenv('DEWEE_IDENTITY_ASSERTION_SECRET'),
+    'authenticate' => static function () {
+        return isset($_SESSION['user_id']) ? ['subject' => (string) $_SESSION['user_id']] : null;
+    },
+    'rebindEachRequest' => true,
+];
+DeweeWebchat::handle($options);
+```
+
+Start and protect the host session before invoking the handler. Alternatively configure
+`privateKeyJwk` and `algorithm` (`RS256`, `ES256`, or `EdDSA`; EdDSA requires `ext-sodium`)
+instead of `assertionSecret`. CCP defaults to the integration's agent; direct Gateway mode needs an
+allowed agent. `required` refuses anonymous sessions and `sessionTtlSeconds` controls the session
+lifetime (60–43200 seconds). PHP is stateless between requests: CCP reuse relies on the signed,
+subject-bound reuse hint, not a server-side shared session store.
+
+On logout, before removing the host session, call `DeweeWebchat::revoke($subject, $token, $options)`
+with the authenticated subject and the widget's `reuseHint()` or visitor token. With CCP this makes a
+best-effort revocation of the matching identity session; the direct Gateway transport has no revoke
+endpoint and its session expires normally. The hook does not replace the host's logout or CSRF checks.
 
 ## Install
 

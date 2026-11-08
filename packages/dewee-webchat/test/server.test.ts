@@ -68,6 +68,12 @@ async function readSse(res: Response): Promise<ChatStreamEvent[]> {
 }
 
 describe("visitor tokens", () => {
+  it("requires a stable secret unless legacy ephemeral sessions are explicitly enabled", () => {
+    expect(() => createDeweeHandler({ gatewayUrl, token: "good" })).toThrow(/secret/i);
+    expect(() => createDeweeHandler({ gatewayUrl, token: "good", secret: "short" })).toThrow(/32 bytes/i);
+    expect(() => createDeweeHandler({ gatewayUrl, token: "good", secret: "short", allowEphemeralSecret: true })).toThrow(/32 bytes/i);
+    expect(() => createDeweeHandler({ gatewayUrl, token: "good", allowEphemeralSecret: true })).not.toThrow();
+  });
   it("round-trips and rejects tampering/expiry", async () => {
     const t = await signVisitorToken("k".repeat(32), { v: "visitor_123", exp: Date.now() + 1000 });
     expect((await verifyVisitorToken("k".repeat(32), t))?.v).toBe("visitor_123");

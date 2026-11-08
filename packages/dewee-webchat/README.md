@@ -56,7 +56,7 @@ first three values below.
 | `DEWEE_CCP_CHAT_URL` | The ingress URL, `https://<ccp>/api/public/webchat/v1/wci_…`. https only (plain http to `localhost` for development). |
 | `DEWEE_WEBCHAT_INTEGRATION_ID` | `wci_…`; must match the end of `DEWEE_CCP_CHAT_URL` |
 | `DEWEE_WEBCHAT_INTEGRATION_SECRET` | `dwc_…`. **Server only.** Sent only to the `DEWEE_CCP_CHAT_URL` origin, never across a redirect. |
-| `DEWEE_WEBCHAT_SECRET` | 32+ random chars to sign visitor sessions (`openssl rand -base64 32`) |
+| `DEWEE_WEBCHAT_SECRET` | At least 32 random UTF-8 bytes to sign visitor sessions (`openssl rand -base64 32`) |
 | `DEWEE_ALLOWED_ORIGINS` | Extra origins for cross-origin embedding (same origin always works) |
 | `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | Optional Cloudflare Turnstile check for new visitors (with `ccp`, a returning visitor's hourly refresh is not challenged) |
 | `DEWEE_WEBCHAT_TRANSPORT` | Optional: `ccp` or `legacy-gateway`. Without it, the variables that are set decide (gateway variables alone select `legacy-gateway`, with a deprecation warning); set it to pin the transport explicitly. |
@@ -84,6 +84,11 @@ works and logs a deprecation warning once; see
 The two sets cannot be mixed: with CCP and gateway variables both set, or `transport` naming one and
 the other's variables set, the handler refuses to start rather than send a credential to an origin
 you did not pick. `agents`, `defaultAgent` and `allowClientCredentials` are refused with `ccp`.
+
+Both transports need a stable `secret` shared by every backend instance. For local development only,
+the legacy transport can opt in to a generated process-local secret with `allowEphemeralSecret: true`.
+Sessions and identity bindings then stop working after a restart or when a request reaches another
+instance. CCP always requires a configured secret of at least 32 bytes.
 
 ## 2. Add the widget
 
@@ -468,6 +473,9 @@ the Node/Workers handler. It refuses tokens that carry an identity session.
 - Only allowed agents are reachable (the integration's, legacy: `agents`); origin allowlist, rate limits (20 messages/min per visitor, 10
   new sessions/10 min per IP by default — pass `rateLimit` for a shared store), 4000-char messages,
   optional Turnstile.
+- The default rate limiter is in memory and applies per handler instance, not across replicas or
+  serverless invocations. For a shared backend limit, provide an atomic shared-store `rateLimit`
+  implementation; do not rely on the default as a cluster-wide limit.
 - The Dewee gateway enforces the shared admission limits on every message. A refusal reaches the widget
   as a typed SSE error (`POLICY_DENIED`, or `RATE_LIMITED` with `retryAfterMs`) with a fixed message, never
   the gateway's own text. The widget shows a localized error and disables sending until `retryAfterMs`

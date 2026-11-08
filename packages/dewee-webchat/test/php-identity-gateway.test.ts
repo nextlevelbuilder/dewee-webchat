@@ -48,6 +48,16 @@ describe.skipIf(!available)("PHP signed-in Gateway sessions", () => {
       if (frame.method === "chat.send") lastChat = frame.params;
       if (frame.method === "chat.send" && pageContextRefusal) { socket.send(JSON.stringify({ type: "res", id: frame.id, ok: false, error: { code: "INVALID_REQUEST", message: "private page content", details: { reason: "page_context_invalid" } } })); return; }
       if (frame.method === "connect" && wsFailure) { socket.send(JSON.stringify({ type: "res", id: frame.id, ok: false, error: wsFailure })); return; }
+      if (frame.method === "chat.send" && frame.params.message === "credential-test") {
+        const ev = (type:string, payload:unknown) => socket.send(JSON.stringify({type:"event",event:"agent",payload:{type,sessionKey:frame.params.sessionKey,payload}}));
+        ev("tool.call",{id:"safe",name:"search",arguments:{q:"visible"}}); ev("tool.result",{id:"safe",result:"public-result"});
+        ev("tool.call",{id:"s1",name:"request_credentials",arguments:{value:"credential-argument-secret"}});
+        ev("tool.call",{id:"s1",name:"search",arguments:{value:"reused-call-secret"}}); ev("tool.result",{id:"s1",result:"credential-result-secret"});
+        ev("tool.result",{id:"unknown",result:"unmatched-result-secret"});
+      }
+      if (frame.method === "chat.history" && String(frame.params.sessionKey).includes("conv_cred")) {
+        socket.send(JSON.stringify({type:"res",id:frame.id,ok:true,payload:{messages:[{role:"assistant",content:"",tool_calls:[{id:"s1",name:"request_credentials",arguments:{value:"credential-argument-secret"}},{id:"s1",name:"search",arguments:{value:"reused-call-secret"}},{name:"request_credentials"},{name:"search"},{id:"safe",name:"search",arguments:{q:"visible"}}]},{role:"tool",tool_call_id:"s1",content:"credential-result-secret"},{role:"tool",content:"missing-id-secret"},{role:"tool",tool_call_id:"safe",content:"public-result"}]}})); return;
+      }
       const payload = frame.method === "connect" ? (applied ? { user_id: "tuc:principal-test", ...(pageContextSupported ? { page_context_versions: [1] } : {}) } : {}) : frame.method === "chat.history" ? { messages: [] } : { content: "hello" };
       socket.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload }));
     }));
@@ -83,6 +93,17 @@ describe.skipIf(!available)("PHP signed-in Gateway sessions", () => {
     expect(history.status).toBe(200);
     const link = await fetch(`${base}/link`, { method: "POST", headers, body: "{}" });
     expect(await link.json()).toMatchObject({ proofCode: "123456", deepLinks: [{ channelType: "telegram" }] });
+  });
+
+  it("keeps credential tool payloads out of legacy streams and history", async () => {
+    const issued=await (await fetch(`${base}/session`,{method:"POST",headers:{cookie:"uid=user-a"},body:"{}"})).json();
+    const headers={cookie:"uid=user-a",authorization:`Bearer ${issued.token}`};
+    const response=await fetch(`${base}/chat`,{method:"POST",headers,body:JSON.stringify({message:"credential-test",agent:"support",conversationId:"conv_cred"})});
+    const stream=await response.text();
+    for (const secret of ["credential-argument-secret","reused-call-secret","credential-result-secret","unmatched-result-secret"]) expect(stream).not.toContain(secret);
+    expect(stream).toContain("public-result");
+    const history=await (await fetch(`${base}/history?agent=support&conversationId=conv_cred`,{headers})).text();
+    expect(history).not.toContain("secret"); expect(history).toContain("public-result");
   });
 
   it("negotiates page context and binds it to the verified Gateway session", async () => {

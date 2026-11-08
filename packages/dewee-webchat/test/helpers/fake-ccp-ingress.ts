@@ -34,6 +34,8 @@ export interface FakeCcpState {
   /** Conversations by `${actor}|${conversationId}`. */
   conversations: Map<string, Array<{ role: string; content: string; thinking?: string; tool_calls?: unknown[] }>>;
   edgeTtlSeconds: number;
+  credentialCard?: Record<string, unknown>;
+  credentialHandoffUrl?: string;
 }
 
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
@@ -206,6 +208,7 @@ export async function startFakeCcp(): Promise<FakeCcp> {
         return res.end();
       }
       if (cfg.show_thinking || state.leaky) frame({ type: "thinking", text: "secret plan" });
+      if (state.credentialCard && actor.startsWith("tuc:") && req.headers["x-dewee-webchat-features"] === "credential-requests") frame({ type: "credential_request", credential_request: state.credentialCard });
       if (cfg.show_tool_activity || state.leaky) {
         frame({ type: "tool_call", id: "t1", name: "search_products", arguments: { q: "internal" } });
         frame({ type: "tool_result", id: "t1", name: "search_products", isError: false, result: "internal rows" });
@@ -219,7 +222,7 @@ export async function startFakeCcp(): Promise<FakeCcp> {
     if (route === "history") {
       const conv = state.conversations.get(`${actor}|${body?.conversation_id}`);
       if (!conv) return error(res, 404, "not_found");
-      return send(res, 200, { conversation_id: body.conversation_id, messages: [...conv, { role: "tool", content: "raw tool output" }] });
+      return send(res, 200, { conversation_id: body.conversation_id, messages: [...conv, { role: "tool", content: "raw tool output" }], ...(state.credentialCard && actor.startsWith("tuc:") && req.headers["x-dewee-webchat-features"] === "credential-requests" ? { credential_requests: [state.credentialCard] } : {}) });
     }
     if (route === "abort") return send(res, 200, { aborted: true });
     if (route === "identity/exchange") {
@@ -244,6 +247,11 @@ export async function startFakeCcp(): Promise<FakeCcp> {
     if (route === "job-access") {
       return send(res, 200, { bootstrap_url: "https://access.example/identity/job-access/launch", launch_token: "one_time_ticket_0123456789", expires_at: new Date(Date.now() + 45_000).toISOString() });
     }
+    if (["credential-request", "credential-request-handoff", "credential-request-cancel"].includes(route)) {
+      if (!actor.startsWith("tuc:") || req.headers["x-dewee-webchat-features"] !== "credential-requests" || !state.credentialCard || !state.conversations.has(`${actor}|${body?.conversation_id}`) || body?.credential_request_id !== state.credentialCard.id) return error(res, 404, "credential_request_not_found");
+      if (route === "credential-request-handoff") return send(res, 200, { credential_request_id: state.credentialCard.id, url: state.credentialHandoffUrl ?? "https://app.example/credential-requests/open?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", expires_at: state.credentialCard.expires_at });
+      return send(res, 200, { credential_request: { ...state.credentialCard, ...(route === "credential-request-cancel" ? { status: "cancelled" } : {}) } });
+    }
     return error(res, 404, "not_found");
   }
 
@@ -263,6 +271,8 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       state.redirectTo = undefined;
       state.leaky = false;
       state.edgeTtlSeconds = 3600;
+      state.credentialCard = undefined;
+      state.credentialHandoffUrl = undefined;
     },
     routes: (name) => seen.filter((r) => r.route === name),
     close: () =>

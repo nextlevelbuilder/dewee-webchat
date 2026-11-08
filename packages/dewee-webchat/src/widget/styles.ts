@@ -241,6 +241,10 @@ details > summary svg.ic { width: 14px; height: 14px; flex: none; }
 .btn.allow { background: var(--dw-accent); border-color: var(--dw-accent); color: var(--dw-accent-contrast); }
 .btn.allow.danger { background: #c2334f; border-color: #c2334f; color: #fff; }
 .btn:focus-visible { outline: 3px solid color-mix(in srgb, var(--dw-accent) 45%, transparent); outline-offset: 2px; }
+.credential-request .bubble { overflow-wrap: anywhere; max-width: 100%; }
+.credential-request p { margin: 8px 0; }
+.credential-request ul { margin: 8px 0; padding-inline-start: 20px; }
+.credential-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* ---------- composer ---------- */
 .composer { padding: 10px 12px 12px; border-top: 1px solid var(--dw-border); background: var(--dw-bg); }

@@ -21,9 +21,11 @@ import { disposeMarkdownImages, renderMarkdown } from "./markdown";
 import { SendCooldown } from "./send-cooldown";
 import { styles } from "./styles";
 import type { PageContextAttachment } from "./page-context";
+import type { CredentialRequestView } from "../credential-request";
 
 /** Pause after a RATE_LIMITED refusal that says nothing about when to retry. */
 const DEFAULT_COOLDOWN_MS = 5_000;
+const CREDENTIAL_GONE_CODES = new Set(["credential_requests_unavailable", "credential_request_not_found"]);
 
 export interface DeweeChatConfig {
   /** Backend base URL (the server handler). Default: "/api/dewee". */
@@ -202,6 +204,11 @@ export class DeweeChatElement extends ElementBase {
   private messages: ViewMessage[] = [];
   private running: AbortController | null = null;
   private jobAccessLaunch: AbortController | null = null;
+  private credentialCards = new Map<string, CredentialRequestView>();
+  private credentialGeneration = 0;
+  private credentialBusy = new Set<string>();
+  private credentialPopups = new Map<string, { popup: Window; controller: AbortController; timer?: ReturnType<typeof setTimeout> }>();
+  private credentialRequestsInFlight = new Set<AbortController>();
   private activated = false;
   private probedPage = false;
   private strings: Strings = pickStrings();
@@ -391,6 +398,7 @@ export class DeweeChatElement extends ElementBase {
 
   /** One request/response with the agent. */
   private async runTurn(message: string, hidden: boolean, attachment?: PageContextAttachment): Promise<ViewMessage> {
+    const generation = this.credentialGeneration;
     this.pushMessage({ role: "user", content: message, hidden });
     const reply: ViewMessage = { role: "assistant", content: "", status: "streaming", startedAt: Date.now() };
     this.pushMessage(reply);
@@ -399,7 +407,7 @@ export class DeweeChatElement extends ElementBase {
     try {
       // The session decides which backend conversation (visitor) the page-action ack belongs to.
       await this.client().ensureSession();
-      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => this.onStreamEvent(reply, e), this.running!.signal);
+      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal);
       if (reply.status === "streaming") reply.status = "done";
     } catch (e) {
       if ((e as Error).name === "AbortError") {
@@ -538,6 +546,8 @@ export class DeweeChatElement extends ElementBase {
    */
   async renewSession(): Promise<void> {
     this.stop();
+    this.clearCredentials();
+    this.renderLog();
     try {
       await this.client().renewSession();
     } catch (e) {
@@ -636,6 +646,7 @@ export class DeweeChatElement extends ElementBase {
   /** Starts a fresh conversation with the current agent. */
   newConversation(): void {
     this.stop();
+    this.clearCredentials();
     this.conversationId = randomConversationId();
     if (this.config.persist !== false) store.set(this.convKey(), this.conversationId);
     this.messages = [];
@@ -655,6 +666,7 @@ export class DeweeChatElement extends ElementBase {
   }
 
   disconnectedCallback(): void {
+    this.clearCredentials();
     this.pageGeneration++;
     this.sharedPage = undefined;
     this.els.pageChoice.checked = false;
@@ -984,6 +996,8 @@ export class DeweeChatElement extends ElementBase {
   }
 
   private async loadConversation() {
+    this.clearCredentials();
+    const generation = this.credentialGeneration;
     const persist = this.config.persist !== false;
     const saved = persist ? store.get(this.convKey()) : null;
     this.conversationId = saved || randomConversationId();
@@ -992,8 +1006,10 @@ export class DeweeChatElement extends ElementBase {
     this.renderLog();
     if (!saved) return;
     try {
-      const history = await this.client().history(this.agentId, this.conversationId);
-      this.messages = decorateHistory(history.map((m) => ({ ...m, status: "done" as const })));
+      const history = await this.client().historyDetails(this.agentId, this.conversationId);
+      if (generation !== this.credentialGeneration) return;
+      this.messages = decorateHistory(history.messages.map((m) => ({ ...m, status: "done" as const })));
+      for (const card of history.credentialRequests) this.credentialCards.set(card.id, card);
       this.renderLog();
     } catch {
       /* history is a nicety: a fresh conversation still works */
@@ -1006,7 +1022,136 @@ export class DeweeChatElement extends ElementBase {
     log.replaceChildren();
     if (!this.messages.length) log.appendChild(this.renderWelcome());
     for (const m of this.messages) log.appendChild(this.renderMessage(m));
+    for (const card of this.credentialCards.values()) log.appendChild(this.renderCredential(card));
     log.scrollTop = log.scrollHeight;
+  }
+
+  private clearCredentials() {
+    this.credentialGeneration++;
+    for (const id of this.credentialPopups.keys()) this.closeCredentialPopup(id);
+    for (const request of this.credentialRequestsInFlight) request.abort();
+    this.credentialRequestsInFlight.clear();
+    this.credentialCards.clear();
+    this.credentialBusy.clear();
+  }
+
+  private closeCredentialPopup(id: string) {
+    const active = this.credentialPopups.get(id);
+    if (!active) return;
+    this.credentialPopups.delete(id);
+    if (active.timer) clearTimeout(active.timer);
+    active.controller.abort();
+    try { active.popup.close(); } catch { /* only this popup */ }
+  }
+
+  private discardCredential(id: string) {
+    this.closeCredentialPopup(id);
+    this.credentialCards.delete(id);
+  }
+
+  private credentialButton(card: CredentialRequestView, label: string, run: () => void, disabled = false): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn";
+    button.textContent = label;
+    button.disabled = disabled || this.credentialBusy.has(card.id);
+    button.addEventListener("click", run);
+    return button;
+  }
+
+  private renderCredential(card: CredentialRequestView): HTMLElement {
+    const root = document.createElement("section");
+    root.className = "msg assistant credential-request";
+    const bubble = document.createElement("div"); bubble.className = "bubble";
+    const title = document.createElement("strong"); title.textContent = card.title;
+    const purpose = document.createElement("p"); purpose.textContent = card.purpose;
+    const intro = document.createElement("p"); intro.textContent = this.strings.credential.intro;
+    const destination = document.createElement("p"); destination.textContent = [card.target.type, card.target.mode].filter(Boolean).join(" · ");
+    const status = document.createElement("p"); status.setAttribute("role", "status");
+    const effective = card.status === "pending" && Date.parse(card.expires_at) <= Date.now() ? "expired" : card.status;
+    status.textContent = this.strings.credential.status[effective];
+    const list = document.createElement("ul");
+    for (const field of card.fields) { const li = document.createElement("li"); li.textContent = `${field.label} (${field.required ? this.strings.credential.required : this.strings.credential.optional})`; list.appendChild(li); }
+    const expiry = document.createElement("p"); expiry.textContent = `${this.strings.credential.expires}: ${new Date(card.expires_at).toLocaleString()}`;
+    const actions = document.createElement("div"); actions.className = "credential-actions";
+    if (effective === "pending") {
+      actions.append(
+        this.credentialButton(card, this.strings.credential.open, () => { void this.openCredential(card); }, this.credentialPopups.has(card.id)),
+        this.credentialButton(card, this.strings.credential.cancel, () => { void this.updateCredential(card, "credential-request-cancel"); }),
+      );
+    }
+    if (card.resumable) actions.append(this.credentialButton(card, this.strings.credential.continue, () => { void this.resumeCredential(card); }));
+    bubble.append(title, purpose, destination, list, intro, expiry, status, actions); root.appendChild(bubble);
+    return root;
+  }
+
+  private async updateCredential(card: CredentialRequestView, route: "credential-request" | "credential-request-cancel"): Promise<void> {
+    if (!this.credentialCards.has(card.id) || this.credentialBusy.has(card.id)) return;
+    const generation = this.credentialGeneration, agent = this.agentId, conversation = this.conversationId;
+    const controller = new AbortController(); this.credentialRequestsInFlight.add(controller);
+    this.credentialBusy.add(card.id); this.renderLog();
+    try {
+      const result = await this.client().credentialRequest(route, agent, conversation, card.id, controller.signal);
+      if (generation !== this.credentialGeneration || !("id" in result)) return;
+      this.credentialCards.set(result.id, result);
+      if (route === "credential-request-cancel") this.closeCredentialPopup(card.id);
+    } catch (error) {
+      if (generation === this.credentialGeneration && error instanceof ApiError && CREDENTIAL_GONE_CODES.has(error.code ?? "")) this.discardCredential(card.id);
+      else if (generation === this.credentialGeneration && route !== "credential-request") this.showNotice(this.strings.credential.unavailable);
+    }
+    finally { this.credentialRequestsInFlight.delete(controller); if (generation === this.credentialGeneration) { this.credentialBusy.delete(card.id); this.renderLog(); } }
+  }
+
+  private async openCredential(card: CredentialRequestView): Promise<void> {
+    if (this.credentialCards.get(card.id) !== card || this.credentialBusy.has(card.id) || this.credentialPopups.has(card.id)) return;
+    let popup: Window | null;
+    try { popup = window.open("about:blank", `dewee-credential-${crypto.randomUUID()}`, "popup,width=720,height=800"); }
+    catch { popup = null; }
+    if (!popup) { this.showNotice(this.strings.credential.unavailable); return; }
+    const generation = this.credentialGeneration, agent = this.agentId, conversation = this.conversationId;
+    const active = { popup, controller: new AbortController(), timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    this.credentialPopups.set(card.id, active);
+    this.credentialBusy.add(card.id); this.renderLog();
+    try {
+      popup.opener = null;
+      const result = await this.client().credentialRequest("credential-request-handoff", agent, conversation, card.id, active.controller.signal);
+      if (generation !== this.credentialGeneration || popup.closed || !("url" in result)) throw new Error("cancelled");
+      const meta = popup.document.createElement("meta"); meta.name = "referrer"; meta.content = "no-referrer"; popup.document.head.append(meta);
+      popup.location.replace(result.url);
+      const poll = async () => {
+        if (generation !== this.credentialGeneration) return;
+        const before = this.credentialCards.get(card.id);
+        if (before && (before.status === "pending" || before.status === "applying")) await this.updateCredential(before, "credential-request");
+        const current = this.credentialCards.get(card.id);
+        if (generation === this.credentialGeneration && !popup!.closed && current && Date.parse(current.expires_at) > Date.now() && this.credentialPopups.get(card.id) === active) {
+          if (current.status === "pending" || current.status === "applying") active.timer = setTimeout(poll, 4000);
+          else { this.closeCredentialPopup(card.id); this.renderLog(); }
+        } else { if (this.credentialPopups.get(card.id) === active) this.closeCredentialPopup(card.id); if (generation === this.credentialGeneration) this.renderLog(); }
+      };
+      active.timer = setTimeout(poll, 4000);
+    } catch { if (this.credentialPopups.get(card.id) === active) this.closeCredentialPopup(card.id); if (generation === this.credentialGeneration) this.showNotice(this.strings.credential.unavailable); }
+    finally { if (generation === this.credentialGeneration) { this.credentialBusy.delete(card.id); this.renderLog(); } }
+  }
+
+  private async resumeCredential(card: CredentialRequestView): Promise<void> {
+    if (this.credentialCards.get(card.id) !== card || this.running || this.credentialBusy.has(card.id)) return;
+    const generation = this.credentialGeneration, agent = this.agentId, conversation = this.conversationId;
+    const reply: ViewMessage = { role: "assistant", content: "", status: "streaming", startedAt: Date.now() };
+    const controller = new AbortController();
+    this.credentialBusy.add(card.id); this.pushMessage(reply); this.setRunning(controller);
+    try {
+      await this.client().chat({ message: "", agent, conversationId: conversation, credentialRequestId: card.id }, (event) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, event); }, this.running!.signal);
+      if (reply.status === "streaming") reply.status = "done";
+      if (generation === this.credentialGeneration) { this.credentialBusy.delete(card.id); await this.updateCredential(card, "credential-request"); }
+    } catch (error) {
+      if (generation === this.credentialGeneration) {
+        this.messages = this.messages.filter((message) => message !== reply);
+        if (error instanceof ApiError && CREDENTIAL_GONE_CODES.has(error.code ?? "")) this.discardCredential(card.id);
+        else if (error instanceof ApiError && error.code === "credential_request_resumed") { this.credentialBusy.delete(card.id); await this.updateCredential(card, "credential-request"); }
+        else this.showNotice(this.strings.credential.unavailable);
+      }
+    }
+    finally { if (this.running === controller) this.setRunning(null); if (generation === this.credentialGeneration) { this.credentialBusy.delete(card.id); this.updateMessage(reply); this.renderLog(); } }
   }
 
   private renderWelcome(): HTMLElement {
@@ -1209,6 +1354,10 @@ export class DeweeChatElement extends ElementBase {
         t.isError = e.isError;
         break;
       }
+      case "credential_request":
+        this.credentialCards.set(e.credentialRequest.id, e.credentialRequest);
+        this.renderLog();
+        break;
       case "done":
         this.finishThinking(m);
         if (e.content && e.content.length >= m.content.length) m.content = e.content;

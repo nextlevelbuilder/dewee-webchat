@@ -51,6 +51,7 @@ export interface Strings {
   pageShare: string;
   pageChanged: string;
   pageUnavailable: string;
+  credential: { open: string; cancel: string; continue: string; unavailable: string; intro: string; required: string; optional: string; expires: string; status: Record<"pending" | "applying" | "resolved" | "cancelled" | "expired" | "failed", string> };
 }
 
 const en: Strings = {
@@ -115,6 +116,7 @@ const en: Strings = {
   pageShare: "Share this page with the assistant for this message",
   pageChanged: "The page changed. Review it and choose to share again before sending.",
   pageUnavailable: "Page details are unavailable. You can send without them.",
+  credential: { open: "Open secure form", cancel: "Cancel request", continue: "Continue conversation", unavailable: "Could not open or update the request. Please try again.", intro: "Enter credentials only on the authenticated Dewee form.", required: "required", optional: "optional", expires: "Expires", status: { pending: "Waiting for you", applying: "Processing", resolved: "Completed", cancelled: "Cancelled", expired: "Expired", failed: "Failed" } },
 };
 
 const vi: Strings = {
@@ -179,6 +181,7 @@ const vi: Strings = {
   pageShare: "Chia sẻ trang này với trợ lý trong tin nhắn này",
   pageChanged: "Trang đã thay đổi. Hãy xem lại và chọn chia sẻ trước khi gửi.",
   pageUnavailable: "Không thể đọc nội dung trang. Bạn vẫn có thể gửi tin nhắn.",
+  credential: { open: "Mở biểu mẫu bảo mật", cancel: "Hủy yêu cầu", continue: "Tiếp tục trò chuyện", unavailable: "Chưa thể mở hoặc cập nhật yêu cầu. Bạn thử lại nhé.", intro: "Chỉ nhập thông tin xác thực trên biểu mẫu Dewee sau khi đăng nhập.", required: "bắt buộc", optional: "tùy chọn", expires: "Hết hạn", status: { pending: "Đang chờ bạn", applying: "Đang xử lý", resolved: "Đã hoàn tất", cancelled: "Đã hủy", expired: "Đã hết hạn", failed: "Không thành công" } },
 };
 
 export const locales: Record<string, Strings> = { en, vi };

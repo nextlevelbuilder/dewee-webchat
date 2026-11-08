@@ -51,6 +51,7 @@ import { CcpClient, CcpError, parseCcpOptions, type CcpOptions } from "./ccp-cli
 import { resolveTransport } from "./transport-selection";
 import { readChatBody, validPageContext } from "./page-context";
 import { JobAccessRefusal, mintJobAccess } from "./job-access";
+import { parseCredentialHandoff, parseCredentialRequest } from "../credential-request";
 import { CCP_AGENT_RE, CCP_ID_RE, EDGE_RESEAL_MS, browserErrorFor, createCcpTransport, type BrowserError, type CcpConfig, type EdgeSession, type VisitorContext } from "./ccp-transport";
 import { memoryIdentitySessionStore, type IdentitySessionStore, type StoredIdentitySession } from "./identity-session-store";
 import { allowedImageSource, fetchRasterImage, issueImageTicket, readImageTicketBody, verifyImageTicket } from "./image-proxy";
@@ -209,6 +210,8 @@ export interface DeweeHandlerOptions {
   allowedHeaders?: string[];
   /** HTTPS directory prefixes from which the backend may proxy images; disabled when unset. */
   imageSources?: string[];
+  /** Enable signed-in hosted credential requests, pinning the Dewee form's HTTPS origin. */
+  credentialRequests?: { formOrigin: string };
   /** Explicitly public directories in this Worker's Assets binding. Bypasses site middleware. */
   cloudflarePublicImageAssets?: { binding: { fetch(request: Request): Promise<Response> }; prefixes: string[] };
   /**
@@ -320,6 +323,16 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     ...options,
   };
   const transport = resolveTransport(o);
+  let credentialFormOrigin: string | undefined;
+  if (o.credentialRequests) {
+    if (transport !== "ccp" || !o.identity) throw new Error("[dewee-webchat] credentialRequests requires CCP transport and identity");
+    try {
+      if (typeof o.credentialRequests.formOrigin !== "string" || /[^\x21-\x7e]|[\\%]/.test(o.credentialRequests.formOrigin)) throw new Error();
+      const u = new URL(o.credentialRequests.formOrigin);
+      if (u.protocol !== "https:" || u.username || u.password || u.pathname !== "/" || u.search || u.hash) throw new Error();
+      credentialFormOrigin = u.origin;
+    } catch { throw new Error("[dewee-webchat] credentialRequests.formOrigin must be an ASCII HTTPS origin (use punycode for internationalized domains)"); }
+  }
   if (o.imageSources !== undefined && !Array.isArray(o.imageSources)) throw new Error("[dewee-webchat] imageSources must be an array");
   const imageSources = (o.imageSources ?? []).map((origin) => {
     let url: URL;
@@ -361,6 +374,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       ? createCcpTransport(
           new CcpClient(parseCcpOptions(o.ccp)),
           idn ? { createAssertion: (a) => idn.sdk.createAssertion!(a), signer: () => identitySigner(), ttlSeconds: idn.sessionTtlSeconds } : undefined,
+          !!credentialFormOrigin,
         )
       : null;
 
@@ -845,6 +859,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       ...(o.turnstile ? { refreshWithoutTurnstile: true } : {}),
       maxMessageLength: Math.min(o.maxMessageLength, cfg.maxMessageChars),
       ...(cfg.pageContextVersions.length ? { pageContextVersions: cfg.pageContextVersions } : {}),
+      ...(credentialFormOrigin ? { credentialFormOrigin } : {}),
       version: VERSION,
     };
     if (idn) {
@@ -975,7 +990,14 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return fail(req, 400, "Invalid request", "bad_request");
     const body: any = input.body;
     const message = typeof body?.message === "string" ? body.message.trim() : "";
-    if (!message) return fail(req, 400, "Message is required");
+    const resumeId = body?.credentialRequestId;
+    if (resumeId !== undefined) {
+      if (!ccp || !credentialFormOrigin || !claims.ids || typeof resumeId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(resumeId) || (body.message !== undefined && typeof body.message !== "string") || message || body?.actions != null || body?.pageContext != null || body?.page_context != null || typeof body?.conversationId !== "string" || !CCP_ID_RE.test(body.conversationId)) return fail(req, 400, "Invalid request", "bad_request");
+      try { const origin = req.headers.get("origin"); const u = new URL(origin ?? ""); if (u.protocol !== "https:" || u.origin !== origin) throw new Error(); }
+      catch { return fail(req, 403, "Origin not allowed", "forbidden_origin"); }
+      const rebound = await rebindRefusal(req, claims, true);
+      if (rebound) return rebound;
+    } else if (!message) return fail(req, 400, "Message is required");
     if (message.length > o.maxMessageLength) return fail(req, 413, `Message exceeds ${o.maxMessageLength} characters`, "too_long");
     // CCP accepts 8 to 64 characters; a shorter id the browser chose counts as invalid and is replaced.
     const idRe = ccp ? CCP_ID_RE : ID_RE;
@@ -1003,7 +1025,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (typeof body.page_context === "object" && Number.isInteger(body.page_context.version) && body.page_context.version !== 1) return fail(req, 400, "Page context is not supported", "page_context_unsupported");
       if (!validPageContext(body.page_context)) return fail(req, 400, "Invalid page context", "page_context_invalid");
     }
-    if (ccp) return ccpChat(req, claims, { message: pageBlock + message, rawMessage: message, conversationId, agent, actionsHash, pageContext: body?.page_context });
+    if (ccp) return ccpChat(req, claims, { message: pageBlock + message, rawMessage: message, conversationId, agent, actionsHash, pageContext: body?.page_context, credentialRequestId: resumeId });
     if (!creds) return fail(req, 500, "Gateway is not configured", "not_configured"); // narrowing only: checked above
 
     // A signed-in user's session is checked before streaming starts, so an expired or revoked
@@ -1088,7 +1110,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   async function ccpChat(
     req: Request,
     claims: VisitorClaims,
-    turn: { message: string; rawMessage: string; conversationId: string; agent: string; actionsHash?: string; pageContext?: unknown },
+    turn: { message: string; rawMessage: string; conversationId: string; agent: string; actionsHash?: string; pageContext?: unknown; credentialRequestId?: string },
   ): Promise<Response> {
     const ctx = visitorContext(req);
     const visitorId = claims.v;
@@ -1127,6 +1149,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
         agent: turn.agent || undefined,
         identitySession: claims.ids,
         pageContext: turn.pageContext ?? undefined,
+        credentialRequestId: turn.credentialRequestId,
         signal: abort.signal,
       });
     } catch (e) {
@@ -1163,7 +1186,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       let errMsg: string | undefined;
       let agent = turn.agent || cfg.defaultAgent;
       try {
-        for await (const ev of ccp!.chatEvents(upstream, cfg, turn.conversationId, agent)) {
+        for await (const ev of ccp!.chatEvents(upstream, cfg, turn.conversationId, agent, !!claims.ids)) {
           if (ev.type === "start") {
             runId = ev.runId;
             agent = ev.agent;
@@ -1205,7 +1228,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     return new Response(readable, {
       headers: {
         "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache, no-transform",
+        "cache-control": "no-store, no-transform",
         "x-accel-buffering": "no",
         ...corsHeaders(req),
       },
@@ -1222,8 +1245,8 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     // A browser-valid id CCP cannot hold has no conversation yet.
     if (!CCP_ID_RE.test(conversationId)) return json(req, { messages: [] });
     try {
-      const messages = await ccp!.history(visitorContext(req), claims.v, sealedEdge(claims), { conversationId, agent: agent || undefined, identitySession: claims.ids });
-      return json(req, { messages });
+      const history = await ccp!.history(visitorContext(req), claims.v, sealedEdge(claims), { conversationId, agent: agent || undefined, identitySession: claims.ids });
+      return json(req, history);
     } catch (e) {
       return ccpFail(req, e, "history", claims.ids);
     }
@@ -1283,6 +1306,35 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (error instanceof CcpError) return ccpFail(req, error, "job-access", claims.ids);
       return fail(req, 502, "Job access is unavailable. Try again later.", "job_access_unavailable");
     }
+  }
+
+  /** Credential handoffs are bound to an actively authenticated user and a fixed Dewee origin. */
+  async function handleCredentialRequest(req: Request, route: "credential-request" | "credential-request-handoff" | "credential-request-cancel"): Promise<Response> {
+    if (!ccp || !credentialFormOrigin || !idn) return fail(req, 404, "Not found", "not_found");
+    const origin = req.headers.get("origin");
+    try { const u = new URL(origin ?? ""); if (u.protocol !== "https:" || u.origin !== origin) throw new Error(); }
+    catch { return fail(req, 403, "Origin not allowed", "forbidden_origin"); }
+    const claims = await visitorFrom(req);
+    if (!claims?.ids || !claims.ida) return identityFail(req, "IDENTITY_REQUIRED");
+    const refused = await rebindRefusal(req, claims, true);
+    if (refused) return refused;
+    if (limiter && !(await limiter(`credential:${claims.v}`, route === "credential-request-handoff" ? "link" : "preauth"))) return fail(req, 429, "Too many requests", "rate_limited");
+    const raw = await readImageTicketBody(req);
+    let body: any;
+    try { body = raw && JSON.parse(raw); } catch { return fail(req, 400, "Invalid request", "bad_request"); }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => !["conversationId", "credentialRequestId", "agent"].includes(key)) || typeof body.conversationId !== "string" || !CCP_ID_RE.test(body.conversationId) || typeof body.credentialRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.credentialRequestId)) return fail(req, 400, "Invalid request", "bad_request");
+    const agent = ccpAgentFor(req, claims, body.agent);
+    if (agent instanceof Response) return agent;
+    if (!agent) return fail(req, 403, "Agent not allowed", "agent_not_allowed");
+    try {
+      const result = await ccp.credentialRequest(visitorContext(req), claims.v, sealedEdge(claims), route, { conversationId: body.conversationId, requestId: body.credentialRequestId, agent, identitySession: claims.ids });
+      if (route === "credential-request-handoff") {
+        const handoff = parseCredentialHandoff(result, body.credentialRequestId, credentialFormOrigin);
+        return handoff ? json(req, handoff) : fail(req, 502, "Credential request is unavailable", "credential_request_unavailable");
+      }
+      const view = parseCredentialRequest((result as { credential_request?: unknown } | null)?.credential_request, agent);
+      return view && view.id === body.credentialRequestId ? json(req, { credentialRequest: view }) : fail(req, 502, "Credential request is unavailable", "credential_request_unavailable");
+    } catch (e) { return ccpFail(req, e, route, claims.ids); }
   }
 
   /** Web-first linking: starts a Dewee link for the signed-in user and returns the proof code. */
@@ -1400,6 +1452,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (req.method === "GET" && action === "history") return await handleHistory(req);
       if (req.method === "POST" && action === "link" && idn) return await handleLink(req);
       if (req.method === "POST" && action === "job-access" && idn) return await handleJobAccess(req);
+      if (req.method === "POST" && (action === "credential-request" || action === "credential-request-handoff" || action === "credential-request-cancel")) return await handleCredentialRequest(req, action);
       return fail(req, 404, "Not found", "not_found");
     } catch (e) {
       if (e instanceof IdentityStoreError) return identityFail(req, "SOURCE_UNAVAILABLE", { action: "retry_later", audience: "end_user" });

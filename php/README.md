@@ -36,6 +36,12 @@ with the authenticated subject and the widget's `reuseHint()` or visitor token. 
 best-effort revocation of the matching identity session; the direct Gateway transport has no revoke
 endpoint and its session expires normally. The hook does not replace the host's logout or CSRF checks.
 
+For hosted credential requests, CCP and signed-in identity are required. Set
+`$options['credentialRequests'] = ['formOrigin' => 'https://app.example.com'];` to the exact HTTPS
+origin of the Dewee form, using ASCII punycode for an internationalized domain. The Gateway and agent must also enable the capability. The widget never
+receives credential values; only an authenticated workspace approval administrator can submit them
+on the hosted form. See the [HTTP contract](../docs/http-contract.md#hosted-credential-requests).
+
 ## Install
 
 Copy `dewee-webchat.php` into your project and create an endpoint, for example `api/dewee.php`:

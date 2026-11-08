@@ -168,6 +168,11 @@ export function buildSessionKey(agent: string, conversationId: string): string {
   return `agent:${agent}:ws:direct:${conversationId}`;
 }
 
+/** Credential requests are not ordinary tool output: their arguments/results may contain a handoff. */
+function credentialTool(name: unknown): boolean {
+  return typeof name === "string" && /(?:^|__)request_credentials$/i.test(name);
+}
+
 export interface StreamChatOptions {
   creds: GatewayCredentials;
   /** Gateway user id (anonymous visitors). Ignored when `identitySession` or `connection` is set. */
@@ -196,6 +201,8 @@ export async function* streamChat(opts: StreamChatOptions): AsyncGenerator<ChatS
   const queue: ChatStreamEvent[] = [];
   let wake: (() => void) | null = null;
   let finished = false;
+  const toolNames = new Map<string, string>();
+  const sensitiveToolIds = new Set<string>();
   const push = (e: ChatStreamEvent) => { queue.push(e); wake?.(); };
   const end = () => { finished = true; wake?.(); };
 
@@ -208,8 +215,21 @@ export async function* streamChat(opts: StreamChatOptions): AsyncGenerator<ChatS
       case "run.started": push({ type: "start", runId: payload.runId, conversationId: "", agent: opts.agent }); break;
       case "thinking": if (p.content) push({ type: "thinking", text: p.content }); break;
       case "chunk": if (p.content) push({ type: "delta", text: p.content }); break;
-      case "tool.call": push({ type: "tool_call", id: p.id || "", name: p.name || "tool", arguments: p.arguments }); break;
-      case "tool.result": push({ type: "tool_result", id: p.id || "", name: p.name || "tool", isError: !!p.is_error, result: clip(p.result ?? p.content) }); break;
+      case "tool.call": {
+        const id = typeof p.id === "string" ? p.id : "";
+        const name = typeof p.name === "string" ? p.name : "";
+        if (id && credentialTool(name)) sensitiveToolIds.add(id);
+        if (id && name) toolNames.set(id, name);
+        if (name && !sensitiveToolIds.has(id) && !credentialTool(name)) push({ type: "tool_call", id, name, arguments: p.arguments });
+        break;
+      }
+      case "tool.result": {
+        const id = typeof p.id === "string" ? p.id : "";
+        const known = toolNames.get(id);
+        const name = typeof p.name === "string" && p.name ? p.name : known;
+        if (id && known && name === known && !sensitiveToolIds.has(id) && !credentialTool(name)) push({ type: "tool_result", id, name, isError: !!p.is_error, result: clip(p.result ?? p.content) });
+        break;
+      }
       case "run.failed": push({ type: "error", message: p.error || p.message || "Agent run failed", code: "run_failed" }); end(); break;
       case "run.cancelled": push({ type: "error", message: "Run cancelled", code: "cancelled" }); end(); break;
     }
@@ -265,6 +285,10 @@ export async function fetchHistory(creds: GatewayCredentials, actor: GatewayActo
 
 export function foldHistory(raw: any[]): HistoryMessage[] {
   const out: HistoryMessage[] = [];
+  const sensitiveIds = new Set<string>();
+  for (const m of raw) for (const tc of Array.isArray(m?.tool_calls) ? m.tool_calls : []) {
+    if (credentialTool(tc?.name ?? tc?.function?.name) && typeof tc?.id === "string") sensitiveIds.add(tc.id);
+  }
   let current: HistoryMessage | null = null;
   for (const m of raw) {
     if (m.role === "user") {
@@ -278,12 +302,14 @@ export function foldHistory(raw: any[]): HistoryMessage[] {
       if (m.thinking) current.thinking = (current.thinking ? current.thinking + "\n\n" : "") + m.thinking;
       if (m.content) current.content = current.content ? `${current.content}\n\n${m.content}` : String(m.content);
       for (const tc of m.tool_calls ?? []) {
-        const view: ToolCallView = { id: tc.id, name: tc.name ?? tc.function?.name ?? "tool", arguments: tc.arguments ?? tc.function?.arguments, status: "done" };
+        const name = tc.name ?? tc.function?.name;
+        if (typeof tc.id !== "string" || !tc.id || !name || sensitiveIds.has(tc.id) || credentialTool(name)) continue;
+        const view: ToolCallView = { id: tc.id, name, arguments: tc.arguments ?? tc.function?.arguments, status: "done" };
         (current.toolCalls ??= []).push(view);
       }
     } else if (m.role === "tool" && current?.toolCalls) {
       const tc = current.toolCalls.find((t) => t.id === m.tool_call_id);
-      if (tc) {
+      if (typeof m.tool_call_id === "string" && m.tool_call_id && tc && !sensitiveIds.has(m.tool_call_id)) {
         tc.result = clip(m.content);
         if (m.is_error) { tc.isError = true; tc.status = "error"; }
       }

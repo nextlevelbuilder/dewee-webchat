@@ -37,12 +37,22 @@ beforeAll(async () => {
         ev("thinking", { content: "Let me check." });
         ev("tool.call", { id: "t1", name: "search", arguments: { q: "x" } });
         ev("tool.result", { id: "t1", name: "search", is_error: false, result: "found" });
+        if (f.params.message.endsWith("credential-test")) {
+          ev("tool.call", { id: "s1", name: "request_credentials", arguments: { value: "credential-argument-secret" } });
+          ev("tool.call", { id: "s1", name: "search", arguments: { value: "reused-call-secret" } });
+          ev("tool.result", { id: "s1", result: "credential-result-secret" });
+          ev("tool.result", { id: "unknown", result: "unmatched-result-secret" });
+        }
         ev("chunk", { content: "Hello " });
         ev("chunk", { content: "world" });
         ev("run.completed", { content: "Hello world" });
         return res({ content: "Hello world", usage: { total_tokens: 42 } });
       }
       if (f.method === "chat.history") {
+        if (String(f.params.sessionKey).includes("conv_cred")) return res({ messages: [
+          { role: "assistant", content: "", tool_calls: [{ id: "s1", name: "request_credentials", arguments: { value: "credential-argument-secret" } }, { id: "s1", name: "search", arguments: { value: "reused-call-secret" } }, { name: "request_credentials" }, { name: "search" }, { id: "safe", name: "search", arguments: { q: "public" } }] },
+          { role: "tool", content: "credential-result-secret", tool_call_id: "s1" }, { role: "tool", content: "missing-id-secret" }, { role: "tool", content: "public-result", tool_call_id: "safe" },
+        ] });
         return res({
           messages: [
             { role: "user", content: "hi" },
@@ -91,6 +101,15 @@ async function visitor(h: ReturnType<typeof createDeweeHandler>) {
 }
 
 describe("legacy-gateway transport: browser responses", () => {
+  it("does not expose credential tool arguments or results in stream and history", async () => {
+    const h=createDeweeHandler(opts()); const s=await visitor(h); const headers={authorization:`Bearer ${s.token}`};
+    const response=await h(new Request(`${BASE}/chat`,{method:"POST",headers,body:JSON.stringify({message:"credential-test",agent:"support",conversationId:"conv_cred"})}));
+    const stream=await response.text();
+    for (const secret of ["credential-argument-secret","reused-call-secret","credential-result-secret","unmatched-result-secret"]) expect(stream).not.toContain(secret);
+    expect(stream).toContain('"result":"found"');
+    const history=await (await h(new Request(`${BASE}/history?agent=support&conversationId=conv_cred`,{headers}))).text();
+    expect(history).not.toContain("secret"); expect(history).toContain("public-result");
+  });
   it("negotiates and forwards page context only when the connected runtime supports it", async () => {
     const h = createDeweeHandler(opts({ agents: [{ id: "support", name: "Support" }] }));
     const context = { version: 1, url: "https://site.test/page", content: { format: "text", text: "A page", truncated: false } };

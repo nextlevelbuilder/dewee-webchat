@@ -51,6 +51,9 @@ import { CcpClient, CcpError, parseCcpOptions, type CcpOptions } from "./ccp-cli
 import { resolveTransport } from "./transport-selection";
 import { JobAccessRefusal, mintJobAccess } from "./job-access";
 import { CCP_AGENT_RE, CCP_ID_RE, EDGE_RESEAL_MS, browserErrorFor, createCcpTransport, type BrowserError, type CcpConfig, type EdgeSession, type VisitorContext } from "./ccp-transport";
+import { memoryIdentitySessionStore, type IdentitySessionStore, type StoredIdentitySession } from "./identity-session-store";
+
+class IdentityStoreError extends Error {}
 
 /**
  * A signed-in user of the host app, as `identity.authenticate` reports it. Scopes are not part of
@@ -117,6 +120,8 @@ export interface DeweeIdentitySdk {
  * to one agent, and the gateway derives the user from it.
  */
 export interface DeweeIdentityOptions {
+  /** Optional protected shared store for identity-session reuse across handler instances. */
+  sessionStore?: IdentitySessionStore;
   /** `deweeIdentitySdk` from `dewee-webchat/server/identity`. */
   sdk: DeweeIdentitySdk;
   /**
@@ -238,8 +243,9 @@ export interface DeweeHandler {
    * and IP (without it, the origin of the request the session was issued for is used). `token` is the
    * widget's reuse hint (`reuseHint()`) or visitor token, sent along by your logout page: its identity
    * session is revoked too when it belongs to `subject`, so a host that keeps no memory between
-   * requests still ends the exact session. Best effort: never throws. Other sessions held only by
-   * other instances end at their expiry (`sessionTtlSeconds`). Without `identity` it does nothing.
+   * requests still ends the exact session. Best effort: never throws; a store failure is logged and
+   * the exact supplied token is still attempted. Without a shared store, other instances' sessions
+   * end at expiry (`sessionTtlSeconds`). Without `identity` it does nothing.
    */
   revoke(subject: string, request?: Request, token?: string): Promise<void>;
 }
@@ -253,7 +259,6 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const DEFAULT_IDENTITY_TTL_MS = 3600_000;
 const MAX_IDENTITY_TTL_MS = 43_200_000;
 /** Most identity sessions kept for reuse; each is a few hundred bytes. */
-const MAX_CACHED_SESSIONS = 1000;
 /** An anonymous token this far from expiry is handed back as is instead of minting a new one. */
 const ANON_REUSE_MS = 86_400_000;
 /**
@@ -439,14 +444,14 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   const misconfigured = (req: Request) => fail(req, 500, "Signed-in chat is misconfigured on this server", "identity_misconfigured");
 
   /** A CCP refusal or failure, as the browser contract answers it. Never carries CCP's own text. */
-  function ccpFail(req: Request, e: unknown, route: Parameters<typeof browserErrorFor>[1], sessionToken?: string): Response {
+  async function ccpFail(req: Request, e: unknown, route: Parameters<typeof browserErrorFor>[1], sessionToken?: string): Promise<Response> {
     const b: BrowserError = browserErrorFor(e, route);
     if (b.admission) {
       const r = admissionErrorResponse(b.admission, b.retryAfterMs);
       return json(req, r.body, r.status, r.headers);
     }
     if (b.identity) {
-      if (sessionToken && DEAD_SESSION_CODES.has(b.identity)) forgetCachedSession(sessionToken);
+      if (sessionToken && DEAD_SESSION_CODES.has(b.identity)) await forgetCachedSession(sessionToken);
       return identityFail(req, b.identity, b.remediation);
     }
     const res = fail(req, b.status, b.message, b.code);
@@ -459,13 +464,13 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
    * gateway error.
    * A dead identity session is dropped from the reuse cache.
    */
-  const gatewayFail = (req: Request, e: unknown, sessionToken?: string) => {
+  const gatewayFail = async (req: Request, e: unknown, sessionToken?: string) => {
     if (e instanceof GatewayError && isAdmissionErrorCode(e.code)) {
       const r = admissionErrorResponse(e.code, e.retryAfterMs);
       return json(req, r.body, r.status, r.headers);
     }
     if (!(e instanceof GatewayError && isIdentityErrorCode(e.code))) return fail(req, 502, (e as Error).message, "gateway_error");
-    if (sessionToken && DEAD_SESSION_CODES.has(e.code)) forgetCachedSession(sessionToken);
+    if (sessionToken && DEAD_SESSION_CODES.has(e.code)) await forgetCachedSession(sessionToken);
     if (e.remediation?.audience === "operator") console.error(`[dewee-webchat] identity: ${e.message} (${e.code})`);
     return identityFail(req, e.code, e.remediation);
   };
@@ -514,7 +519,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   };
 
   /** Link start failure: the gateway's conflict and availability codes get their own answers. */
-  const linkFail = (req: Request, e: unknown, sessionToken: string) => {
+  const linkFail = async (req: Request, e: unknown, sessionToken: string) => {
     const code = (e as { code?: unknown })?.code;
     if (code === "IDEMPOTENCY_KEY_REUSED") return fail(req, 409, "This idempotency key was already used for a different link request", "idempotency_key_reused");
     if (code === "FAILED_PRECONDITION") return fail(req, 409, "A link is already in progress. Use its code or wait until it expires.", "link_in_progress");
@@ -522,7 +527,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       console.error("[dewee-webchat] identity link start: the gateway has identity exchange switched off");
       return fail(req, 503, "Linking is not available right now", "linking_unavailable");
     }
-    if (typeof code === "string" && DEAD_SESSION_CODES.has(code)) forgetCachedSession(sessionToken);
+    if (typeof code === "string" && DEAD_SESSION_CODES.has(code)) await forgetCachedSession(sessionToken);
     return sdkFail(req, e, "link start");
   };
 
@@ -575,7 +580,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       // logout revokes it through `revoke`. The revoked session is the old user's one shared session,
       // so it also ends on their other devices; their widget recovers there with a 401 and a new
       // exchange at `/session`.
-      forgetCachedSession(claims.ids);
+      await forgetCachedSession(claims.ids);
       await ccp.revoke(visitorContext(req), claims.v, sealedEdge(claims), claims.ids, claims.ida);
     }
     return identityFail(req, "IDENTITY_REQUIRED");
@@ -599,26 +604,21 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
    * not cost an exchange. Bounded; a session the gateway reports dead is dropped.
    */
   /** `origin`: the visitor origin the session was issued for, used by a `revoke` without a request. */
-  interface CachedSession { sessionToken: string; visitorId: string; deadline: number; margin: number; origin?: string }
-  const sessionCache = new Map<string, CachedSession>();
+  type CachedSession = StoredIdentitySession;
+  const sessionStore = idn?.sessionStore ?? memoryIdentitySessionStore();
   const exchanges = new Map<string, Promise<CachedSession>>();
 
-  function forgetCachedSession(sessionToken: string): void {
-    for (const [k, c] of sessionCache) if (c.sessionToken === sessionToken) sessionCache.delete(k);
+  async function storeOperation<T>(operation: () => Promise<T>): Promise<T> {
+    try { return await operation(); }
+    catch { throw new IdentityStoreError("Identity session store unavailable"); }
   }
 
-  function rememberSession(key: string, c: CachedSession): void {
-    sessionCache.delete(key);
-    sessionCache.set(key, c);
-    if (sessionCache.size <= MAX_CACHED_SESSIONS) return;
-    const now = Date.now();
-    for (const [k, v] of sessionCache) if (v.deadline - now <= v.margin) sessionCache.delete(k);
-    // Still full: drop the least recently issued.
-    for (const k of sessionCache.keys()) {
-      if (sessionCache.size <= MAX_CACHED_SESSIONS) break;
-      sessionCache.delete(k);
-    }
+  async function forgetCachedSession(sessionToken: string): Promise<void> {
+    await storeOperation(async () => sessionStore.deleteToken(await storeNamespace(), sessionToken));
   }
+
+  const storeNamespace = () => subjectDigest(secret!, JSON.stringify([o.ccp?.chatUrl ?? o.gatewayUrl ?? "", o.ccp?.integrationId ?? o.tenantId ?? "", idn!.appId, idn!.issuer]));
+  const storeSubject = async (subject: string) => `${await storeNamespace()}:${await subjectDigest(secret!, subject)}`;
 
   async function exchangeFor(subject: string, req: Request, sealed?: EdgeSession): Promise<CachedSession> {
     if (ccp) return ccpExchangeFor(subject, req, sealed);
@@ -700,28 +700,44 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     } catch (e) {
       return ccpFail(req, e, "config");
     }
-    const key = `${agent}\n${subject}`;
-    let s = sessionCache.get(key);
+    const subjectKey = await storeSubject(subject);
+    const key = JSON.stringify([subjectKey, agent]);
+    const observed = await storeOperation(() => sessionStore.read(subjectKey, agent));
+    let s = observed.session;
     const userVisitor = ccp ? await deriveVisitorId(secret!, `subject:${subject}`) : undefined;
     // The edge session of an earlier token of this user is refreshed rather than replaced.
     const sealed = hint && hint.ids && hint.v === userVisitor ? sealedEdge(hint) : undefined;
     if (!s || s.deadline - Date.now() <= s.margin) {
-      const reused = await verifiedReuse(req, hint, subject, agent, userVisitor);
-      if (reused) {
-        s = reused;
-      } else {
-        let pending = exchanges.get(key);
-        if (!pending) {
-          pending = exchangeFor(subject, req, sealed).finally(() => exchanges.delete(key));
-          exchanges.set(key, pending);
-        }
-        try {
-          s = await pending;
-        } catch (e) {
-          return ccp ? ccpExchangeFail(req, e) : exchangeFail(req, e);
-        }
+      let pending = exchanges.get(key);
+      if (!pending) {
+        pending = (async () => {
+          const reused = await verifiedReuse(req, hint, subject, agent, userVisitor);
+          const candidate = reused ?? await exchangeFor(subject, req, sealed);
+          const revokeMinted = async () => {
+            if (ccp && !reused) await ccp.revoke(visitorContext(req), candidate.visitorId, sealed, candidate.sessionToken, agent).catch(() => {});
+          };
+          try {
+            const committed = await storeOperation(() => sessionStore.commit(subjectKey, agent, observed.revision, candidate));
+            if (!committed) {
+              const current = await storeOperation(() => sessionStore.read(subjectKey, agent));
+              if (current.session?.sessionToken !== candidate.sessionToken) throw new IdentityStoreError("Identity session changed");
+            }
+            return candidate;
+          } catch (error) {
+            await revokeMinted();
+            throw error;
+          }
+        })().finally(() => exchanges.delete(key));
+        exchanges.set(key, pending);
       }
-      rememberSession(key, s);
+      try {
+        s = await pending;
+      } catch (e) {
+        if (e instanceof IdentityStoreError) throw e;
+        return ccp ? ccpExchangeFail(req, e) : exchangeFail(req, e);
+      }
+    } else if (!(await storeOperation(() => sessionStore.check(subjectKey, observed.revision)))) {
+      return identityFail(req, "SOURCE_UNAVAILABLE", { action: "retry_later", audience: "end_user" });
     }
     const now = Date.now();
     const expiresAt = Math.min(s.deadline, now + o.sessionTtlMs);
@@ -985,7 +1001,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
           if (ev.type === "done") reply = ev.content;
           if (ev.type === "error") {
             errMsg = gatewayReasonOf(ev) ?? ev.message; // onChat sees the gateway's reason; the browser does not
-            if (claims.ids && ev.code && DEAD_SESSION_CODES.has(ev.code)) forgetCachedSession(claims.ids);
+            if (claims.ids && ev.code && DEAD_SESSION_CODES.has(ev.code)) await forgetCachedSession(claims.ids);
           }
           await send(ev);
           if (abort.signal.aborted) break;
@@ -1110,7 +1126,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
           if (ev.type === "error") {
             errMsg = ev.message;
             finished = true;
-            if (claims.ids && ev.code && DEAD_SESSION_CODES.has(ev.code)) forgetCachedSession(claims.ids);
+            if (claims.ids && ev.code && DEAD_SESSION_CODES.has(ev.code)) await forgetCachedSession(claims.ids);
           }
           await send(ev);
           if (abort.signal.aborted) break;
@@ -1256,11 +1272,10 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   async function revoke(subject: string, request?: Request, token?: string): Promise<void> {
     if (!idn || typeof subject !== "string" || subject === "") return;
     try {
-      const held: Array<{ agent: string; session: CachedSession; edge?: EdgeSession }> = [];
-      for (const [k, c] of sessionCache) {
-        const cut = k.indexOf("\n");
-        if (k.slice(cut + 1) === subject) held.push({ agent: k.slice(0, cut), session: c });
-      }
+      const subjectKey = await storeSubject(subject);
+      let held: Array<{ agent: string; session: CachedSession; edge?: EdgeSession }> = [];
+      try { held = await storeOperation(() => sessionStore.takeSubject(subjectKey)); }
+      catch { console.warn("[dewee-webchat] identity session store unavailable during revoke"); }
       // The session the logout page sent along (reuse hint or visitor token), when it is this user's.
       if (ccp && typeof token === "string" && token !== "") {
         const c = (await verifyReuseHint(secret!, token)) ?? (await verifyVisitorToken(secret!, token));
@@ -1268,7 +1283,6 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
           held.push({ agent: c.ida, session: { sessionToken: c.ids, visitorId: c.v, deadline: c.exp, margin: 0 }, edge: sealedEdge(c) });
         }
       }
-      for (const { session } of held) forgetCachedSession(session.sessionToken);
       if (!ccp) return; // the legacy gateway has no revoke call; the forgotten sessions expire on their own
       const fromRequest = request ? visitorContext(request) : null;
       await Promise.all(
@@ -1297,6 +1311,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (req.method === "POST" && action === "job-access" && idn) return await handleJobAccess(req);
       return fail(req, 404, "Not found", "not_found");
     } catch (e) {
+      if (e instanceof IdentityStoreError) return identityFail(req, "SOURCE_UNAVAILABLE", { action: "retry_later", audience: "end_user" });
       if (!ccp) return fail(req, 500, (e as Error).message || "Internal error", "internal");
       // CCP: the browser gets no detail, and the log only a CCP error's code (never CCP's text).
       console.error("[dewee-webchat] internal error:", e instanceof CcpError ? e.code : e);

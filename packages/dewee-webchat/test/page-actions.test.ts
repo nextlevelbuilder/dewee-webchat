@@ -67,6 +67,18 @@ describe("parseDirectives", () => {
 });
 
 describe("action results", () => {
+  it("restores results when history collapses fence newlines", () => {
+    const msg = '```dewee-action-result {"id":"a1","name":"navigate","status":"ok","result":{"route":"/runs"}} ```';
+    expect(isActionResultMessage(msg)).toBe(true);
+    expect(parseActionResults(msg)).toEqual([{ id: "a1", name: "navigate", status: "ok", result: { route: "/runs" } }]);
+    expect(isActionResultMessage(`Please explain ${msg}`)).toBe(false);
+  });
+
+  it("keeps fences and escaped quotes inside compact result JSON", () => {
+    const result = { id: "a1", name: "navigate", status: "ok", result: { text: '```sample``` "quoted"' } };
+    const compact = `\`\`\`dewee-action-result ${JSON.stringify(result)} \`\`\``;
+    expect(parseActionResults(compact)).toEqual([result]);
+  });
   it("round-trips through the follow-up message", () => {
     const msg = formatActionResults([
       { id: "a1", name: "navigate", status: "ok", result: { route: "/runs" } },

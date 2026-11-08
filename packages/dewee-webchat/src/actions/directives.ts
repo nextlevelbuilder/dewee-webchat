@@ -95,16 +95,50 @@ export function stripDirectives(content: string): string {
 
 /** True when a user message is an automatic action-result follow-up (hidden in the transcript). */
 export function isActionResultMessage(content: string): boolean {
-  return RESULT_OPEN_RE.test(content.trimStart().split("\n", 1)[0] ?? "");
+  return /^\s*```dewee-action-result(?:\s|$)/.test(content);
+}
+
+/** Extract compact result objects without confusing fences inside JSON strings for the closing fence. */
+function compactResultBodies(content: string): string[] {
+  const open = /```dewee-action-result\s+/g;
+  const bodies: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = open.exec(content))) {
+    const start = open.lastIndex;
+    if (content[start] !== "{") continue;
+    let depth = 0, quoted = false, escaped = false;
+    for (let i = start; i < content.length; i++) {
+      const c = content[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') quoted = false;
+      } else if (c === '"') quoted = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) {
+        const close = /^\s*```/.exec(content.slice(i + 1));
+        if (close) {
+          bodies.push(content.slice(start, i + 1));
+          open.lastIndex = i + 1 + close[0].length;
+        }
+        break;
+      }
+    }
+  }
+  return bodies;
 }
 
 /** Reads results back from an action-result message (history rendering). */
 export function parseActionResults(content: string): ActionResult[] {
   const lines = content.replace(/\r\n?/g, "\n").split("\n");
   const out: ActionResult[] = [];
-  for (const b of findBlocks(lines, RESULT_OPEN_RE)) {
+  const blocks = findBlocks(lines, RESULT_OPEN_RE);
+  // Accept compact history fences while preserving the original multi-line parser.
+  const bodies = blocks.length ? blocks.map((b) => b.body.join("\n")) :
+    compactResultBodies(content);
+  for (const body of bodies) {
     try {
-      const r = JSON.parse(b.body.join("\n"));
+      const r = JSON.parse(body);
       if (r && typeof r.id === "string" && ["ok", "denied", "error"].includes(r.status)) out.push(r as ActionResult);
     } catch { /* ignore */ }
   }

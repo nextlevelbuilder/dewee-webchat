@@ -209,6 +209,8 @@ export interface DeweeHandlerOptions {
   allowedHeaders?: string[];
   /** HTTPS directory prefixes from which the backend may proxy images; disabled when unset. */
   imageSources?: string[];
+  /** Explicitly public directories in this Worker's Assets binding. Bypasses site middleware. */
+  cloudflarePublicImageAssets?: { binding: { fetch(request: Request): Promise<Response> }; prefixes: string[] };
   /**
    * Legacy gateway transport: let visitors bring their own gateway URL + token (sent per request, never stored).
    * Meant for playgrounds. `allowedHosts` restricts which gateways may be targeted.
@@ -325,6 +327,11 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || url.port || !url.pathname.endsWith("/") || /%(?:2f|5c|25|2e|0[0-9a-f]|1[0-9a-f]|7f)/i.test(url.pathname)) throw new Error("[dewee-webchat] Image sources must be HTTPS directory prefixes on the default port");
     return url;
   });
+  const publicAssets = o.cloudflarePublicImageAssets;
+  if (publicAssets && (typeof publicAssets.binding?.fetch !== "function" || !Array.isArray(publicAssets.prefixes) || !publicAssets.prefixes.length || publicAssets.prefixes.some((path) => typeof path !== "string" || !/^\/(?:[A-Za-z0-9_-]+\/)+$/.test(path)))) {
+    throw new Error("[dewee-webchat] Public image asset prefixes must be explicit absolute directory paths");
+  }
+  const assetPrefixes = publicAssets?.prefixes ?? [];
   let activeImages = 0;
   const imageNamespace = `${o.ccp?.chatUrl ?? o.gatewayUrl ?? ""}\n${o.ccp?.integrationId ?? o.tenantId ?? ""}`;
   if (o.allowedHeaders !== undefined && (!Array.isArray(o.allowedHeaders) || o.allowedHeaders.some((name) => typeof name !== "string" || !/^[A-Za-z0-9-]+$/.test(name)))) {
@@ -1360,22 +1367,30 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
         try { parsed = JSON.parse(body); } catch { return fail(req, 400, "Invalid image", "invalid_request"); }
         const raw = (parsed as { url?: unknown } | null)?.url;
         const worker = globalThis.navigator?.userAgent === "Cloudflare-Workers";
-        const source = typeof raw === "string" ? allowedImageSource(raw, imageSources, new URL(req.url), worker) : null;
+        const source = typeof raw === "string" ? allowedImageSource(raw, imageSources, new URL(req.url), worker, worker ? assetPrefixes : []) : null;
         if (!source) return fail(req, 403, "Image not allowed", "forbidden_image");
-        return json(req, { ticket: await issueImageTicket(secret!, imageNamespace, claims.v, source.href) });
+        const endpoint = new URL(req.url);
+        const asset = publicAssets && source.origin === endpoint.origin && assetPrefixes.some((prefix) => source.pathname.startsWith(prefix));
+        const namespace = asset ? `${imageNamespace}\nassets:${endpoint.origin}` : imageNamespace;
+        return json(req, { ticket: await issueImageTicket(secret!, namespace, claims.v, source.href) });
       }
       if (req.method === "GET" && action === "image" && imageSources.length) {
         const ticket = new URL(req.url).searchParams.get("ticket") ?? "";
-        const claims = await verifyImageTicket(secret!, imageNamespace, ticket);
+        const endpoint = new URL(req.url);
+        const assetClaims = await verifyImageTicket(secret!, `${imageNamespace}\nassets:${endpoint.origin}`, ticket);
+        const claims = assetClaims ?? await verifyImageTicket(secret!, imageNamespace, ticket);
         if (!claims) return fail(req, 401, "Image ticket expired", "unauthorized");
         const worker = globalThis.navigator?.userAgent === "Cloudflare-Workers";
-        const source = allowedImageSource(claims.source, imageSources, new URL(req.url), worker);
+        const source = allowedImageSource(claims.source, imageSources, endpoint, worker, worker ? assetPrefixes : []);
         if (!source) return fail(req, 403, "Image not allowed", "forbidden_image");
+        const asset = publicAssets && source.origin === endpoint.origin && assetPrefixes.some((prefix) => source.pathname.startsWith(prefix));
+        if (Boolean(asset) !== Boolean(assetClaims)) return fail(req, 403, "Image not allowed", "forbidden_image");
         if (limiter && !(await limiter(`image:${claims.visitor}`, "preauth"))) return fail(req, 429, "Too many requests, try again later", "rate_limited");
         if (activeImages >= 8) return fail(req, 429, "Too many requests, try again later", "rate_limited");
         activeImages++;
         try {
-          const result = await fetchRasterImage(source.href, worker ? globalThis.fetch : publicImageFetchNode, worker ? "manual" : "error");
+          const assetFetch: typeof fetch = (input, init) => publicAssets!.binding.fetch(new Request(new URL(new URL(String(input)).pathname, "https://assets.invalid"), init));
+          const result = await fetchRasterImage(source.href, asset ? assetFetch : worker ? globalThis.fetch : publicImageFetchNode, worker ? "manual" : "error");
           return result ?? fail(req, 502, "Image unavailable", "image_unavailable");
         } finally { activeImages--; }
       }

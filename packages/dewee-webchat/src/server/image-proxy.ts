@@ -49,7 +49,7 @@ export async function verifyImageTicket(secret: string, namespace: string, ticke
 }
 
 /** Reject ambiguous path encodings before comparing against explicitly configured directory prefixes. */
-export function allowedImageSource(raw: string, prefixes: URL[], endpoint: URL, cloudflare: boolean): URL | null {
+export function allowedImageSource(raw: string, prefixes: URL[], endpoint: URL, cloudflare: boolean, publicAssets: string[] = []): URL | null {
   try {
     if (!raw || raw.length > 4096 || /[\u0000-\u0020\u007f\\]/.test(raw)) return null;
     const match = /^https:\/\/[^/?#]+([^?#]*)/i.exec(raw);
@@ -63,7 +63,9 @@ export function allowedImageSource(raw: string, prefixes: URL[], endpoint: URL, 
     // conservatively refuse the endpoint's last two hostname labels (including sibling subdomains).
     if (cloudflare) {
       const suffix = endpoint.hostname.split(".").slice(-2).join(".");
-      if (source.hostname === suffix || source.hostname.endsWith(`.${suffix}`)) return null;
+      const sameZone = source.hostname === suffix || source.hostname.endsWith(`.${suffix}`);
+      const isPublicAsset = source.origin === endpoint.origin && publicAssets.some((prefix) => source.pathname.startsWith(prefix));
+      if (sameZone && !isPublicAsset) return null;
     }
     return prefixes.some((prefix) => prefix.origin === source.origin && source.pathname.startsWith(prefix.pathname)) ? source : null;
   } catch { return null; }

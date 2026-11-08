@@ -3,7 +3,7 @@
 // contract next to the TS handler's answers, error mapping and redaction, redirect refusal, timeout
 // abort. Runs when a PHP 8.1+ binary is available (PHP_BIN or `php` on PATH); skipped otherwise.
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -51,7 +51,7 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
     writeFileSync(join(dir, optionsFile), JSON.stringify({ ccp: ccpOptions(), secret: VISITOR_SECRET, rateLimit: false, ...extra }));
   };
   /** The integration config is cached for a minute in a private temp dir; tests that change it drop the cache. */
-  const dropConfigCache = () => spawnSync("sh", ["-c", `rm -f ${JSON.stringify(dir)}/tmp/dewee-webchat-*/ccp-config-*`]);
+  const dropConfigCache = () => { for (const cacheDir of cacheDirs()) for (const name of readdirSync(cacheDir)) if (name.startsWith("ccp-config-")) rmSync(join(cacheDir, name), { force: true }); };
   /** The private cache directory (`dewee-webchat-<uid>`) the PHP server created, if any. */
   const cacheDirs = () => readdirSync(join(dir, "tmp")).filter((n) => /^dewee-webchat-\d+$/.test(n)).map((n) => join(dir, "tmp", n));
 
@@ -69,7 +69,7 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
   beforeAll(async () => {
     ccp = await startFakeCcp();
     dir = mkdtempSync(join(tmpdir(), "dewee-php-srv-"));
-    spawnSync("mkdir", [join(dir, "tmp")]);
+    mkdirSync(join(dir, "tmp"));
     writeFileSync(
       join(dir, "router.php"),
       `<?php\nrequire ${JSON.stringify(phpFile)};\n$f = basename((string) ($_SERVER['HTTP_X_TEST_OPTIONS'] ?? ''));\n$o = preg_match('/^options-\\d+\\.json$/', $f) ? json_decode((string) file_get_contents(__DIR__ . '/' . $f), true) : null;\nif (!is_array($o)) { http_response_code(599); exit; }\nDeweeWebchat::handle($o);\n`,
@@ -344,7 +344,7 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     expect(ccp.routes("session")).toHaveLength(1);
   });
 
-  it("limits returning visitors per visitor, so visitors behind one address keep the new-visitor budget", async () => {
+  it.skipIf(process.platform === "win32")("limits returning visitors per visitor, so visitors behind one address keep the new-visitor budget", async () => {
     setOptions({ rateLimit: true });
     const headers = { "x-forwarded-for": "198.51.100.77", "content-type": "application/json" };
     for (let i = 0; i < 12; i++) {
@@ -355,7 +355,7 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     expect((await call("/session", { method: "POST", headers, body: "{}" })).status).toBe(200);
   });
 
-  it("caches the integration config only in a directory private to this user", async () => {
+  it.skipIf(process.platform === "win32")("caches the integration config only in a directory private to this user", async () => {
     await call("/config");
     await call("/config");
     expect(ccp.routes("config")).toHaveLength(1);
@@ -372,6 +372,13 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     } finally {
       chmodSync(cache, 0o700);
     }
+  });
+
+  it.skipIf(process.platform !== "win32")("does not persist config when Windows private storage cannot be verified", async () => {
+    await call("/config");
+    await call("/config");
+    expect(ccp.routes("config")).toHaveLength(2);
+    expect(cacheDirs().flatMap((cacheDir) => readdirSync(cacheDir).filter((name) => name.startsWith("ccp-config-")))).toHaveLength(0);
   });
 
   it("challenges new visitors with Turnstile but lets a returning visitor refresh without one", async () => {
@@ -427,16 +434,21 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     expect([r.status, r.json().error.code]).toEqual([403, "forbidden_origin"]);
     expect(ccp.seen).toHaveLength(0);
     setOptions({ rateLimit: true });
+    if (process.platform === "win32") {
+      const unavailable = await call("/session", { method: "POST", body: "{}" });
+      expect([unavailable.status, unavailable.json().error.code]).toEqual([503, "rate_limit_unavailable"]);
+      return;
+    }
     const statuses: number[] = [];
     for (let i = 0; i < 11; i++) statuses.push((await call("/session", { method: "POST", headers: { "x-forwarded-for": "198.51.100.99" }, body: "{}" })).status);
     expect(statuses.slice(0, 10).every((x) => x === 200)).toBe(true);
     expect(statuses[10]).toBe(429);
   });
 
-  it("keeps rate-limit counters in the private temp directory, never in a shared one", async () => {
+  it.skipIf(process.platform === "win32")("keeps rate-limit counters in the private temp directory, never in a shared one", async () => {
     // Another account on a shared host could have created the old shared directory first.
     const shared = join(dir, "tmp", "dewee-webchat-rl");
-    spawnSync("mkdir", ["-p", shared]);
+    mkdirSync(shared, { recursive: true });
     chmodSync(shared, 0o777);
     setOptions({ rateLimit: true });
     expect((await call("/session", { method: "POST", headers: { "x-forwarded-for": "198.51.100.42" }, body: "{}" })).status).toBe(200);

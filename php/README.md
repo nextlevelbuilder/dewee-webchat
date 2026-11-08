@@ -102,8 +102,11 @@ Array options use the TS names (`transport`, `ccp` = `['chatUrl' => …, 'integr
 'integrationSecret' => …]`, `gatewayUrl`, `token`, `agents`, `allowedOrigins`, `allowedHeaders` (additional CORS header names), `rateLimit` =
 `false` or `callable(string $key, string $bucket): bool`, `onChat`, `timeoutMs`, …). Rate limits
 default to 20 messages/min per visitor+IP and 10 sessions/10 min per IP, kept in files in the
-private temp directory described above (when it is unavailable, requests are not limited and `error_log` says
-why). They are defense in depth: the Dewee gateway owns the shared message limit, and its
+private temp directory described above. If it cannot be verified, PHP refuses limited requests with
+`503 rate_limit_unavailable` and records a warning. On Windows the built-in private-directory check
+is unavailable: provide a shared `rateLimit` callback for these routes. The callback must return a
+boolean and use an atomic shared store; exceptions or invalid return values also refuse the request.
+Explicit `rateLimit => false` disables this protection. The limits are defense in depth: the Dewee gateway owns the shared message limit, and its
 `POLICY_DENIED` / `RATE_LIMITED` refusals (and, with transport `ccp`, CCP's refusals of a message) are answered as typed errors exactly like the TypeScript handler
 ([admission errors](../docs/http-contract.md#admission-errors)). Set `DEWEE_WEBCHAT_SECRET` for either transport;
 without a secret of at least 32 bytes, the backend refuses startup with `500 not_configured`. It does

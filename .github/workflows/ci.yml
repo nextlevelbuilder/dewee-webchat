@@ -48,7 +48,8 @@ jobs:
           php-version: "8.2"
           extensions: sodium
       - run: php -l php/dewee-webchat.php
-      - run: php -r "exit(extension_loaded('sodium') ? 0 : 1);"
+      - run: |
+          php -r "exit(extension_loaded('sodium') ? 0 : 1);"
       # Page-action block/hash parity between the PHP and TypeScript backends.
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4

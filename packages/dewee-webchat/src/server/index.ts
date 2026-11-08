@@ -11,6 +11,7 @@ export {
   type IdentitySigner,
 } from "./handler";
 export { toNodeHandler } from "./node";
+export { memoryIdentitySessionStore, type IdentitySessionStore, type StoredIdentitySession } from "./identity-session-store";
 export { CcpError, type CcpOptions } from "./ccp-client";
 export {
   GatewayConnection,

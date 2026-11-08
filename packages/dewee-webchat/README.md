@@ -399,7 +399,7 @@ How it behaves:
   memory, have the logout page send the widget's hint (`chat.reuseHint()`) along: the session in it
   is revoked when it belongs to that subject. Pass the logout request so CCP sees the visitor's
   origin (an integration with an origin allowlist needs it; without a request, the origin the
-  session was issued for is used). Sessions held only by other instances end when they expire. The
+  session was issued for is used). Without a shared store, sessions held only by other instances end when they expire. The
   legacy gateway has no revoke call, so there it only forgets them.
 
   ```ts
@@ -411,6 +411,14 @@ How it behaves:
     // …then clear your own session cookie
   }
   ```
+- For multiple handler instances, supply `identity.sessionStore` implementing the exported
+  `IdentitySessionStore` interface. Share the same protected store and visitor secret across those
+  instances. The default is a bounded, per-handler in-memory store. Store records contain bearer
+  credentials: encrypt them at rest, restrict access and never log values. The interface requires
+  atomic revision checks and updates across instances, unique non-reused revisions even after
+  eviction, conditional token deletion, and expiry by `deadline`; a simple non-atomic KV get/set is
+  insufficient. Keys use scoped HMAC digests, not raw host user IDs. Store failures refuse session
+  issuance; logout remains best effort, logs store failure and still attempts the supplied hint.
 - Fail closed. If `authenticate` returns `null`, the visitor chats anonymously, exactly as without
   `identity`, unless `required` is set, in which case no session is issued. If it throws, the answer
   is `503 SOURCE_UNAVAILABLE` and no session is issued. If the exchange for a signed-in user fails, no

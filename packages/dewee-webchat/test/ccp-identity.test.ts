@@ -3,7 +3,7 @@
 // Covers fail-closed issuance, no anonymous fallback, rebinding and logout, link, and secret hygiene.
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatStreamEvent } from "../src/protocol";
-import { createDeweeHandler, verifyVisitorToken, type DeweeHandlerOptions, type DeweeIdentityOptions } from "../src/server";
+import { createDeweeHandler, memoryIdentitySessionStore, verifyVisitorToken, type DeweeHandlerOptions, type DeweeIdentityOptions } from "../src/server";
 import { deweeIdentitySdk } from "../src/server/identity";
 import { APP_ID, ASSERTION_SECRET, INTEGRATION_ID, INTEGRATION_SECRET, ISSUER, startFakeCcp, type FakeCcp } from "./helpers/fake-ccp-ingress";
 
@@ -70,6 +70,133 @@ describe("ccp identity: startup", () => {
 });
 
 describe("ccp identity: sessions", () => {
+  it("scopes token invalidation to the integration namespace", async () => {
+    const store = memoryIdentitySessionStore();
+    const record = { sessionToken: "same-token", visitorId: "visitor", deadline: Date.now() + 60000, margin: 1000 };
+    const a = await store.read("integration-a:subject", "shop");
+    const b = await store.read("integration-b:subject", "shop");
+    expect(await store.commit("integration-a:subject", "shop", a.revision, record)).toBe(true);
+    expect(await store.commit("integration-b:subject", "shop", b.revision, record)).toBe(true);
+    await store.deleteToken("integration-a", record.sessionToken);
+    expect((await store.read("integration-a:subject", "shop")).session).toBeNull();
+    expect((await store.read("integration-b:subject", "shop")).session).toEqual(record);
+  });
+  it("shares identity sessions between handlers while keeping subjects isolated", async () => {
+    const store = memoryIdentitySessionStore();
+    const first = makeHandler({ sessionStore: store });
+    const second = makeHandler({ sessionStore: store });
+    const a = (await session(first, "user-a")).json();
+    const a2 = (await session(second, "user-a")).json();
+    const b = (await session(second, "user-b")).json();
+    expect(await rawIds(a.token)).toBe(await rawIds(a2.token));
+    expect(await rawIds(a.token)).not.toBe(await rawIds(b.token));
+    expect(ccp.routes("identity/exchange")).toHaveLength(2);
+  });
+
+  it("does not expose storage failures or fall back to an anonymous session", async () => {
+    const store = memoryIdentitySessionStore();
+    store.read = async () => { throw new Error("private store connection details"); };
+    const h = makeHandler({ sessionStore: store });
+    const response = await h(new Request(`${BASE}/session`, { method: "POST", headers: { cookie: "uid=user-a" }, body: "{}" }));
+    expect(response.status).toBe(503);
+    expect(response.text).not.toContain("private store connection details");
+    expect(ccp.routes("identity/exchange")).toHaveLength(0);
+  });
+
+  it.each(["commit", "read-after-conflict"] as const)("revokes a newly exchanged session when %s fails", async (mode) => {
+    const store = memoryIdentitySessionStore();
+    if (mode === "commit") store.commit = async () => { throw new Error("private store failure"); };
+    else {
+      const read = store.read.bind(store);
+      let reads = 0;
+      store.read = async (...args) => { if (++reads > 1) throw new Error("private store failure"); return read(...args); };
+      store.commit = async () => false;
+    }
+    const h = makeHandler({ sessionStore: store });
+    const response = await session(h, "user-a");
+    expect(response.status).toBe(503);
+    expect(response.text).not.toContain("private store failure");
+    expect(ccp.routes("identity/revoke")).toHaveLength(1);
+  });
+
+  it("fails closed when checking or invalidating a stored session fails", async () => {
+    const store = memoryIdentitySessionStore();
+    const h = makeHandler({ sessionStore: store });
+    const a = (await session(h, "user-a")).json();
+    const check = store.check.bind(store);
+    store.check = async () => { throw new Error("private store failure"); };
+    const cannotCheck = await session(h, "user-a");
+    expect(cannotCheck.status).toBe(503);
+    expect(cannotCheck.text).not.toContain("private store failure");
+    store.check = check;
+    store.deleteToken = async () => { throw new Error("private store failure"); };
+    for (const entry of ccp.state.identitySessions.values()) entry.revoked = true;
+    const refused = await chat(h, a.token);
+    expect(refused.status).toBe(503);
+    expect(refused.text).not.toContain("private store failure");
+  });
+
+  it("does not publish an exchange that finishes after logout", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let exchanged = false;
+    const delayedFetch: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      if (String(input).endsWith("/identity/exchange")) { exchanged = true; await gate; }
+      return response;
+    };
+    const store = memoryIdentitySessionStore();
+    const opts: DeweeHandlerOptions = {
+      ccp: { chatUrl: ccp.url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET, fetch: delayedFetch },
+      secret: VISITOR_SECRET,
+      rateLimit: false,
+      identity: { sdk: deweeIdentitySdk, authenticate: cookieUser, appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, sessionStore: store },
+    };
+    const first = createDeweeHandler(opts);
+    const second = createDeweeHandler(opts);
+    const issuing = first(new Request(`${BASE}/session`, { method: "POST", headers: { cookie: "uid=user-a" }, body: "{}" }));
+    await vi.waitFor(() => expect(exchanged).toBe(true));
+    await second.revoke("user-a");
+    release();
+    expect((await issuing).status).toBe(503);
+    expect(ccp.routes("identity/revoke")).toHaveLength(1);
+  });
+
+  it("does not publish both concurrent exchanges from separate handlers", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let exchanged = 0;
+    const delayedFetch: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      if (String(input).endsWith("/identity/exchange")) { exchanged++; await gate; }
+      return response;
+    };
+    const store = memoryIdentitySessionStore();
+    const extra = { ccp: { chatUrl: ccp.url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET, fetch: delayedFetch } };
+    const first = makeHandler({ sessionStore: store }, extra);
+    const second = makeHandler({ sessionStore: store }, extra);
+    const a = session(first, "user-a");
+    const b = session(second, "user-a");
+    await vi.waitFor(() => expect(exchanged).toBe(2));
+    release();
+    const results = await Promise.all([a, b]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 503]);
+    expect(ccp.routes("identity/revoke")).toHaveLength(1);
+  });
+
+  it("revokes an exact reuse hint even if the shared store is unavailable", async () => {
+    const store = memoryIdentitySessionStore();
+    const h = createDeweeHandler({
+      ccp: { chatUrl: ccp.url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET },
+      secret: VISITOR_SECRET, rateLimit: false,
+      identity: { sdk: deweeIdentitySdk, authenticate: cookieUser, appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, sessionStore: store },
+    });
+    const response = await h(new Request(`${BASE}/session`, { method: "POST", headers: { cookie: "uid=user-a" }, body: "{}" }));
+    const data = await response.json();
+    store.takeSubject = async () => { throw new Error("private store failure"); };
+    await h.revoke("user-a", undefined, data.reuseHint);
+    expect(ccp.routes("identity/revoke")).toHaveLength(1);
+  });
   it("exchanges a signed assertion at CCP and seals the identity session; the bound agent cannot switch", async () => {
     const h = makeHandler();
     const cfg = (await h(new Request(`${BASE}/config`))).json();

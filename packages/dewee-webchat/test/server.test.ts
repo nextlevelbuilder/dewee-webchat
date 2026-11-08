@@ -129,11 +129,13 @@ describe("handler", () => {
   });
 
   it("blocks foreign origins unless allowed, and answers CORS preflight for allowed ones", async () => {
-    const h = createDeweeHandler({ gatewayUrl, token: "good", secret: "s".repeat(32), agents: ["a"], allowedOrigins: ["https://ok.test"] });
+    const h = createDeweeHandler({ gatewayUrl, token: "good", secret: "s".repeat(32), agents: ["a"], allowedOrigins: ["https://ok.test"], allowedHeaders: ["X-CSRF-Token"] });
     const bad = await h(new Request("https://site.test/api/dewee/config", { headers: { origin: "https://evil.test" } }));
     expect(bad.status).toBe(403);
     const pre = await h(new Request("https://site.test/api/dewee/chat", { method: "OPTIONS", headers: { origin: "https://ok.test" } }));
     expect(pre.headers.get("access-control-allow-origin")).toBe("https://ok.test");
+    expect(pre.headers.get("access-control-allow-headers")).toContain("x-csrf-token");
+    expect(() => createDeweeHandler({ secret: "s".repeat(32), allowedHeaders: ["x-bad\r\nheader"] })).toThrow(/allowedHeaders/);
   });
 
   it("only accepts client credentials when enabled", async () => {

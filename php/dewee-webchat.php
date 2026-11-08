@@ -229,6 +229,16 @@ final class DeweeWebchat
             'timeoutMs' => 180000,
         ], array_filter($options, static fn ($v) => $v !== null));
 
+        $allowedHeaders = $this->o['allowedHeaders'] ?? [];
+        if (!is_array($allowedHeaders)) {
+            throw new DeweeConfigError('[dewee-webchat] allowedHeaders must be an array of header names');
+        }
+        foreach ($allowedHeaders as $name) {
+            if (!is_string($name) || !preg_match('/^[A-Za-z0-9-]+$/D', $name)) {
+                throw new DeweeConfigError('[dewee-webchat] allowedHeaders must contain valid header names (letters, digits and hyphens)');
+            }
+        }
+
         $this->secret = is_string($this->o['secret'] ?? null) ? $this->o['secret'] : '';
 
         $agents = $this->o['agents'] ?? [];
@@ -433,6 +443,7 @@ final class DeweeWebchat
             'visitorId' => $visitorId,
             'token' => self::signVisitorToken($this->secret, ['v' => $visitorId, 'exp' => $expiresAt]),
             'expiresAt' => $expiresAt,
+            'expiresIn' => max(0, $expiresAt - self::nowMs()),
         ]);
     }
 
@@ -1820,7 +1831,7 @@ final class DeweeWebchat
         return [
             'Access-Control-Allow-Origin' => $origin,
             'Access-Control-Allow-Methods' => 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers' => 'content-type, authorization, ' . self::HEADER_GATEWAY_URL . ', ' . self::HEADER_GATEWAY_TOKEN,
+            'Access-Control-Allow-Headers' => implode(', ', array_unique(array_merge(['content-type', 'authorization', self::HEADER_GATEWAY_URL, self::HEADER_GATEWAY_TOKEN], array_map('strtolower', $this->o['allowedHeaders'] ?? [])))),
             'Access-Control-Max-Age' => '600',
             'Vary' => 'Origin',
         ];

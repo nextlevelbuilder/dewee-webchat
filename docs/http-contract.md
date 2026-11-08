@@ -29,7 +29,7 @@ Body: `{ "token"?: string, "turnstileToken"?: string }`. Returns a signed visito
 Sending a still-valid previous `token` refreshes it and keeps the same `visitorId`, so history survives.
 
 ```json
-{ "visitorId": "Qx3…", "token": "<body>.<sig>", "expiresAt": 1791621449203 }
+{ "visitorId": "Qx3…", "token": "<body>.<sig>", "expiresAt": 1791621449203, "expiresIn": 3600000 }
 ```
 
 Visitor token = `base64url(JSON{"v": visitorId, "exp": epochMs})` + `.` + `base64url(HMAC-SHA256(secret, body))`.
@@ -39,7 +39,7 @@ Visitor token = `base64url(JSON{"v": visitorId, "exp": epochMs})` + `.` + `base6
 > `base64url(iv ‖ AES-256-GCM(key, JSON{"t": <edge session>}))`, the key derived from the backend secret
 > with HKDF-SHA-256, info `dewee-webchat:edge-session:aes-256-gcm:v1`, and the associated data binding it to `v`) and `ese` (its expiry, epoch ms on the backend's
 > clock). Both or neither. The answer's `expiresAt` is then the edge session's end, earlier than the
-> token's own `exp`, and `expiresIn` (milliseconds until `expiresAt`, counted from receipt) is added: the
+> token's own `exp`, and `expiresIn` (milliseconds until `expiresAt`, counted from receipt) reflects it: the
 > widget comes back to `/session` before the edge session lapses, about once an hour. A refresh with a
 > valid `token` keeps the visitor and re-seals a refreshed edge session. With Turnstile configured,
 > `/config` adds `"refreshWithoutTurnstile": true` and such a refresh needs no `turnstileToken`; new
@@ -317,12 +317,13 @@ Headers: `Authorization: Bearer <visitor token>`. Returns the visitor's own conv
 
 Hosts may configure the widget to add headers (for example `x-csrf-token`) to every request, and to use a
 custom `fetch`. The widget always sets `content-type`, `authorization` and the gateway credential headers
-itself; host headers with those names are dropped. A cross-origin backend must list any extra header in
-`Access-Control-Allow-Headers`.
+itself; host headers with those names are dropped. For a cross-origin endpoint, configure `allowedOrigins`
+and `allowedHeaders` on the built-in handler; header names may contain letters, digits and hyphens.
+Other backends must list the extra headers in `Access-Control-Allow-Headers`.
 
 The widget refreshes its visitor session (`POST /session` with the old `token`) once less than 10% of the
-lifetime it observed (`expiresAt` minus the time the session was issued), capped at 24 h and floored at 30 s,
-remains. When the answer carries `expiresIn` (transport `ccp`, and signed-in sessions), that lifetime is
+lifetime it observed, capped at 24 h, floored at 30 s, and never more than half the lifetime,
+remains. When the answer carries `expiresIn`, that lifetime is
 `expiresIn`, counted from receipt; with `ccp` this is the edge session's end, so anonymous visitors
 refresh about hourly.
 

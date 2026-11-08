@@ -104,7 +104,7 @@ export interface SessionResponse {
    */
   reuseHint?: string;
   /**
-   * Verified sessions, and every session of the ccp transport: milliseconds until `expiresAt`, counted
+   * Milliseconds until `expiresAt`, counted
    * from when the response is received. The widget refreshes from this rather than `expiresAt`, so a
    * skewed browser clock does not matter.
    */

@@ -35,6 +35,88 @@ afterEach(() => {
 });
 
 describe("anonymous refresh hint", () => {
+  it("does not refresh a short-lived anonymous session immediately", async () => {
+    const b = backend(false, () => jsonRes(200, { visitorId: "visitor", token: "short", expiresAt: Date.now() + 10000, expiresIn: 10000 }));
+    const api = page(b.fetch);
+    await api.ensureSession();
+    await api.ensureSession();
+    expect(b.bodies).toHaveLength(1);
+  });
+  it("removes an obsolete signed-in session from local storage", async () => {
+    const key = "dewee-webchat:session:/api/dewee";
+    localStorage.setItem(key, JSON.stringify({ verified: true, token: "obsolete" }));
+    const b = backend(true, () => jsonRes(200, { visitorId: "member", token: "current", verified: true, expiresAt: Date.now() + 3600000, expiresIn: 3600000 }));
+    await page(b.fetch).ensureSession();
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  it("waits for an in-flight signed-in renewal before sending history", async () => {
+    let release!: (value: Response) => void;
+    const response = new Promise<Response>((resolve) => { release = resolve; });
+    let started = false;
+    let authorization = "";
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(url), "https://site.test").pathname;
+      if (path.endsWith("/config")) return jsonRes(200, { identity: true });
+      if (path.endsWith("/session")) { started = true; return response; }
+      authorization = (init?.headers as Record<string, string>).authorization;
+      return jsonRes(200, { messages: [] });
+    });
+    localStorage.setItem("dewee-webchat:session:/api/dewee", JSON.stringify({ visitorId: "anon", token: "anonymous-token", expiresAt: Date.now() + 86400000 }));
+    const api = page(fetchImpl as typeof fetch);
+    const renewal = api.renewSession();
+    await vi.waitFor(() => expect(started).toBe(true));
+    const history = api.history("shop", "conversation");
+    await Promise.resolve();
+    expect(authorization).toBe("");
+    release(jsonRes(200, { visitorId: "member", token: "member-token", verified: true, expiresAt: Date.now() + 3600000, expiresIn: 3600000 }));
+    await Promise.all([renewal, history]);
+    expect(authorization).toBe("Bearer member-token");
+  });
+  it("does not let an older anonymous load overwrite renewal after sign-in", async () => {
+    let releaseOld!: (value: Response) => void;
+    const oldResponse = new Promise<Response>((resolve) => { releaseOld = resolve; });
+    let count = 0;
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      const path = new URL(String(url), "https://site.test").pathname;
+      if (path.endsWith("/config")) return jsonRes(200, { identity: true });
+      if (path.endsWith("/session")) {
+        count++;
+        if (count === 1) return oldResponse;
+        return jsonRes(200, { visitorId: "member", token: "member-token", verified: true, expiresAt: Date.now() + 3600000, expiresIn: 3600000 });
+      }
+      return jsonRes(200, { messages: [] });
+    });
+    const api = page(fetchImpl as typeof fetch);
+    const old = api.ensureSession();
+    await vi.waitFor(() => expect(count).toBe(1));
+    const renewed = api.renewSession();
+    await vi.waitFor(() => expect(count).toBe(2));
+    expect((await renewed).token).toBe("member-token");
+    releaseOld(jsonRes(200, { visitorId: "anonymous", token: "old-token", expiresAt: Date.now() + 3600000 }));
+    expect((await old).token).toBe("member-token");
+    expect((await api.ensureSession()).token).toBe("member-token");
+    expect(localStorage.getItem("dewee-webchat:session:/api/dewee")).toBeNull();
+  });
+
+  it("propagates a failed renewal to an older load without silently retrying", async () => {
+    let releaseOld!: (value: Response) => void;
+    const oldResponse = new Promise<Response>((resolve) => { releaseOld = resolve; });
+    let count = 0;
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      if (new URL(String(url), "https://site.test").pathname.endsWith("/config")) return jsonRes(200, { identity: true });
+      count++;
+      return count === 1 ? oldResponse : jsonRes(503, { error: { code: "SOURCE_UNAVAILABLE", message: "unavailable" } });
+    });
+    const api = page(fetchImpl as typeof fetch);
+    const old = api.ensureSession();
+    const oldResult = expect(old).rejects.toMatchObject({ status: 503 });
+    await vi.waitFor(() => expect(count).toBe(1));
+    await expect(api.renewSession()).rejects.toMatchObject({ status: 503 });
+    releaseOld(jsonRes(200, { visitorId: "anonymous", token: "old", expiresAt: Date.now() + 3600000 }));
+    await oldResult;
+    expect(count).toBe(2);
+  });
   it("comes back before the reported refresh point even though the token itself lives 30 days", async () => {
     vi.useFakeTimers({ now: 1_000_000_000_000, toFake: ["Date"] });
     const b = backend(false, (n) => jsonRes(200, { visitorId: "v_anon_001", token: `anon${n}`, expiresAt: Date.now() + 3_600_000, expiresIn: 3_600_000 }));

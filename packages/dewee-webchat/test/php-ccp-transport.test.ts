@@ -98,6 +98,21 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
     dropConfigCache();
   });
 
+  it("extends CORS headers only for an allowed origin", async () => {
+    setOptions({ allowedOrigins: ["https://shop.example"], allowedHeaders: ["X-CSRF-Token"] });
+    const pre = await call("/chat", { method: "OPTIONS", headers: { origin: "https://shop.example" } });
+    expect(pre.headers.get("access-control-allow-headers")).toContain("x-csrf-token");
+    const other = await call("/chat", { method: "OPTIONS", headers: { origin: "https://other.example" } });
+    expect(other.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("returns a relative lifetime for a legacy anonymous session", async () => {
+    setOptions({ ccp: null, gatewayUrl: "https://gateway.example", token: "test", sessionTtlMs: 60000 });
+    const s = await session();
+    expect(s.expiresIn).toBeGreaterThan(0);
+    expect(s.expiresIn).toBeLessThanOrEqual(60000);
+  });
+
   it("selects the transport explicitly and refuses conflicting or unsafe options", () => {
     const url = `http://127.0.0.1:1/api/public/webchat/v1/${INTEGRATION_ID}`;
     const ok = { chatUrl: url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET };
@@ -374,10 +389,11 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     expect(ccp.routes("session").map((r) => r.headers["x-dewee-visitor-ip"])).toEqual(["2001:db8::9", undefined]);
   });
 
-  it("leaves the legacy gateway transport's /session unchanged", async () => {
+  it("returns legacy visitor claims and a relative expiry", async () => {
     setOptions({ ccp: undefined, gatewayUrl: "https://gw.example", token: "gw-token", agents: ["shop"] });
     const s = await session();
-    expect(Object.keys(s).sort()).toEqual(["expiresAt", "token", "visitorId"]);
+    expect(Object.keys(s).sort()).toEqual(["expiresAt", "expiresIn", "token", "visitorId"]);
+    expect(s.expiresIn).toBeGreaterThan(29 * 86_400_000);
     expect(await verifyVisitorToken(VISITOR_SECRET, s.token)).toEqual({ v: s.visitorId, exp: s.expiresAt });
     expect(s.expiresAt - Date.now()).toBeGreaterThan(29 * 86_400_000);
     // A returning visitor keeps its id, also from a token a CCP backend issued.

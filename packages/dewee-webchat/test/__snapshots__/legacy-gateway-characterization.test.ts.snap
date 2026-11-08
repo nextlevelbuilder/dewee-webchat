@@ -169,7 +169,7 @@ exports[`legacy-gateway transport: browser responses > history 1`] = `
 
 exports[`legacy-gateway transport: browser responses > session (new and refreshed) 1`] = `
 {
-  "body": "{"visitorId":"<visitor>","token":"<token>","expiresAt":"<epoch-ms>"}",
+  "body": "{"visitorId":"<visitor>","token":"<token>","expiresAt":"<epoch-ms>","expiresIn":"<duration-ms>"}",
   "headers": {
     "cache-control": "no-store",
     "content-type": "application/json; charset=utf-8",
@@ -180,7 +180,7 @@ exports[`legacy-gateway transport: browser responses > session (new and refreshe
 
 exports[`legacy-gateway transport: browser responses > session (new and refreshed) 2`] = `
 {
-  "body": "{"visitorId":"<visitor>","token":"<token>","expiresAt":"<epoch-ms>"}",
+  "body": "{"visitorId":"<visitor>","token":"<token>","expiresAt":"<epoch-ms>","expiresIn":"<duration-ms>"}",
   "headers": {
     "cache-control": "no-store",
     "content-type": "application/json; charset=utf-8",

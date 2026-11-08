@@ -322,7 +322,7 @@ describe("identity sessions: fail closed", () => {
     const h = makeHandler();
     const s = (await session(h)).json();
     expect(s.verified).toBeUndefined();
-    expect(s).not.toHaveProperty("expiresIn");
+    expect(s.expiresIn).toBeGreaterThan(0);
     expect(claimsOf(s.token)).not.toHaveProperty("ids");
     await chat(h, s.token);
     expect(seen.connects.at(-1)).toEqual({ token: GW_TOKEN, user_id: `webchat-${s.visitorId}` });
@@ -483,7 +483,9 @@ describe("identity sessions: reuse and rate limits", () => {
     expect(calls.map(([, b]) => b)).toEqual(["preauth", "session"]);
     calls.length = 0;
     const again = (await session(h, undefined, { token: anon.token })).json();
-    expect(again).toEqual({ visitorId: anon.visitorId, token: anon.token, expiresAt: anon.expiresAt });
+    expect(again).toEqual({ visitorId: anon.visitorId, token: anon.token, expiresAt: anon.expiresAt, expiresIn: expect.any(Number) });
+    expect(again.expiresIn).toBeGreaterThan(0);
+    expect(again.expiresIn).toBeLessThanOrEqual(anon.expiresIn);
     expect(calls).toEqual([["unknown", "preauth"]]);
   });
 

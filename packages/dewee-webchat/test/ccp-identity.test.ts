@@ -70,6 +70,17 @@ describe("ccp identity: startup", () => {
 });
 
 describe("ccp identity: sessions", () => {
+  it("scopes token invalidation to the integration namespace", async () => {
+    const store = memoryIdentitySessionStore();
+    const record = { sessionToken: "same-token", visitorId: "visitor", deadline: Date.now() + 60000, margin: 1000 };
+    const a = await store.read("integration-a:subject", "shop");
+    const b = await store.read("integration-b:subject", "shop");
+    expect(await store.commit("integration-a:subject", "shop", a.revision, record)).toBe(true);
+    expect(await store.commit("integration-b:subject", "shop", b.revision, record)).toBe(true);
+    await store.deleteToken("integration-a", record.sessionToken);
+    expect((await store.read("integration-a:subject", "shop")).session).toBeNull();
+    expect((await store.read("integration-b:subject", "shop")).session).toEqual(record);
+  });
   it("shares identity sessions between handlers while keeping subjects isolated", async () => {
     const store = memoryIdentitySessionStore();
     const first = makeHandler({ sessionStore: store });

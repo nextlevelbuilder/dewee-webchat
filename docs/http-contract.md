@@ -454,22 +454,43 @@ so the one test turn of that page load can be told apart from real visitors. The
 `^[A-Za-z0-9_-]{22,64}$`; it is not a secret and grants nothing. Needs widget **and** host
 **0.5.0-beta.7** or later; the TypeScript and PHP backends behave identically.
 
-- **Widget.** With a valid nonce in the URL it boots (even when closed) and sends it as `check` in the
-  body of one `POST {base}/session`, also when its stored session is still fresh. Only when the answer
-  carries `"check": true` does it send one fixed, localized test message ("Install check: please reply
-  to confirm this chat works.") with the same `check` in the `POST {base}/chat` body. Without that
-  answer it sends nothing. At most once per page load: not after `renewSession()`, a re-boot or a second
-  widget. A malformed value is ignored, and so is any nonce for a widget given `gatewayUrl` and
-  `gatewayToken`. `diagnostics()` adds `check: "accepted" | "ignored"` on such a page load only; the
-  nonce itself never appears in a snapshot, an event or storage.
+- **Widget.** It reads the nonce once per page load and at once removes `dewee_check` from the address
+  bar (`history.replaceState`; the path, the other parameters and the hash stay), so it does not spread
+  through links, `Referer` or analytics. Page context and page-action results redact it as well, for a
+  widget that mounts late. A malformed value is removed and ignored, and so is any nonce for a widget
+  given `gatewayUrl` and `gatewayToken`.
+  - With a valid nonce the widget boots even when closed (config, history, one session request): that
+    eager boot is the cost of the check, once per page load that carries the parameter. It sends the
+    nonce as `check` in the body of one `POST {base}/session`, also when its stored session is still
+    fresh. If opening the session would need a Turnstile challenge, it gives up instead of rendering one.
+  - Only when the answer carries `"check": true` does it send one fixed, localized test message
+    ("Install check: please reply to confirm this chat works.") with the same `check` in the
+    `POST {base}/chat` body. Without that answer it sends nothing further. The test turn runs in a
+    conversation of its own that is never stored: the visitor's conversation stays the one the widget
+    uses and shows after a reload, and the test turn carries no page context and no action manifest. It
+    waits for a turn or a cooldown in progress, and opens the panel without taking the focus or touching
+    the visitor's draft. `dewee:send` marks it with `check: true` (never the nonce).
+  - At most once per page load, and once per tab for a nonce: the widget keeps a SHA-256 hash of a nonce
+    it sent (never the nonce) in `sessionStorage`, so a reload or back-navigation with the same link
+    sends nothing. `renewSession()`, a second widget and the visitor's own messages never carry it; a
+    boot superseded before the message was sent hands the check to the next boot.
+  - A `/session` carrying `check` that is refused or fails (a control plane without install checks
+    answers `400`) is reported, and the widget opens a session without `check` so chat works as usual.
+    A step that is already `ok` is never downgraded by the check.
+  - `diagnostics()` adds `check: "accepted" | "ignored" | "failed"` on such a page load only; the nonce
+    itself never appears in a snapshot, an event or storage.
+  - A site that requires sign-in records the check under the signed-in visitor. For a visitor who is not
+    signed in the session is refused with the identity code (`IDENTITY_REQUIRED`), which the control
+    plane shows as the reason; the outcome is then `failed`.
 - **Backend.** `check` is optional on `/session` and `/chat`; any value other than a matching string is
   `400 bad_request`. Over transport `ccp` it is forwarded to the ingress as body field `check` on its
   `session` and `chat` calls, only when the widget sent it, and never in a URL or a log line with the
   visitor's text. A `/session` with `check` always calls the ingress (refreshing the visitor's edge
   session, or opening one), and answers `"check": true` when the ingress accepted the nonce for this
   integration and origin; the flag is never sealed in the visitor token. The legacy gateway transport
-  validates `check` and ignores it. Requests without `check` are unchanged, down to the bytes sent to
-  the ingress.
+  validates `check` (before any rate limit, like the PHP backend) and ignores it. `onChat` marks the test
+  turn with `check: true`, never the nonce. Requests without `check` are unchanged, down to the bytes
+  sent to the ingress.
 
 ```json
 { "visitorId": "Qx3…", "token": "<body>.<sig>", "expiresAt": 1791621449203, "expiresIn": 3600000, "check": true }

@@ -55,8 +55,10 @@ before. Turn it on only with widget 0.5.0-beta.7 or later on the pages that embe
 
 Nothing to configure. When the control plane checks the install (`?dewee_check=<nonce>` on the page),
 the widget sends the nonce as `check` on `/session` and on its one test message; with CCP this backend
-forwards it to the ingress exactly like the TypeScript handler and answers `check: true` when CCP
-accepted it. A malformed `check` is `400 bad_request`; requests without it are unchanged. Needs widget
+forwards it to the ingress exactly like the TypeScript handler (for a signed-in user after the identity
+exchange, on the refreshed edge session) and answers `check: true` when CCP accepted it. A malformed
+`check` is `400 bad_request`, before any rate limit; `onChat` gets `check => true` for the test turn,
+never the nonce; requests without it are unchanged. Needs widget
 and backend 0.5.0-beta.7 or later. See the [HTTP contract](../docs/http-contract.md#install-check).
 
 ## Install

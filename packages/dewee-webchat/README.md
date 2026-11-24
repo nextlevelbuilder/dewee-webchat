@@ -229,14 +229,25 @@ await chat.send("ping");       // then `reply` shows whether the agent answered
 ### Install check
 
 The control plane's **Check on my website** opens your page with `?dewee_check=<nonce>`. The widget
-then boots (even when closed), sends the nonce with its `/session` request, and, only when the backend
-confirms it (`check: true`, which CCP decides for your integration and origin), sends one fixed test
-message ("Install check: please reply to confirm this chat works.", localized) so the check sees a
-real reply. Nothing is sent without that confirmation, and at most once per page load: not after
-`renewSession()`, a re-boot or for a second widget. A malformed value is ignored, as is any nonce for a
-widget configured with `gatewayUrl` and `gatewayToken`. On such a page load `diagnostics()` adds
-`check: "accepted" | "ignored"`; the nonce itself never appears in a snapshot, an event or storage.
-Visitors without the parameter see no change.
+reads the nonce once, removes the parameter from the address bar (path, other parameters and hash
+stay), boots even when closed, and sends the nonce with its `/session` request. Only when the backend
+confirms it (`check: true`, which CCP decides for your integration and origin) does it send one fixed
+test message ("Install check: please reply to confirm this chat works.", localized), in a conversation
+of its own that is never stored, so the check sees a real reply while your visitor's conversation stays
+untouched. The panel opens without taking the focus.
+
+- Nothing is sent without that confirmation, and no Turnstile challenge is rendered for the check.
+- At most once per page load and once per tab for a nonce (a hash, never the nonce, is kept in
+  `sessionStorage`): not after a reload, `renewSession()` or for a second widget.
+- A refused check session is reported as `failed`, and the widget opens a normal session so chat works.
+- `diagnostics()` adds `check: "accepted" | "ignored" | "failed"`; `dewee:send` (and the backend's
+  `onChat`) mark the test turn with `check: true`. The nonce never appears in a snapshot, an event,
+  storage, page context or a page-action result.
+- A malformed value is ignored, as is any nonce for a widget configured with `gatewayUrl` and
+  `gatewayToken`. Visitors without the parameter see no change; the eager boot is the cost of a page
+  load that carries it.
+- A site that requires sign-in records the check under the signed-in visitor; for a visitor who is not
+  signed in, the identity refusal is the reason the control plane shows.
 
 Needs widget **and** backend **0.5.0-beta.7** or later (the TypeScript handler and the PHP backend
 alike). The nonce is not a secret and grants nothing; the backend forwards it to CCP only over transport

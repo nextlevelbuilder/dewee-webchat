@@ -654,15 +654,28 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env]);`,
       }
       expect((await call("/request-human", { method: "POST", body: JSON.stringify({ conversationId: "conv_php_0001" }) })).status).toBe(401);
       expect(ccp.routes("request-human")).toHaveLength(0);
-      const cases: Array<[number, string, number, string]> = [
+      const remediation = { action: "contact_admin", audience: "end_user" };
+      const cases: Array<[number, string, number, string, unknown?]> = [
         [403, "PERMISSION_DENIED", 403, "human_handoff_unavailable"],
+        [403, "PERMISSION_DENIED", 403, "PERMISSION_DENIED", remediation],
         [403, "human_handoff_unavailable", 403, "human_handoff_unavailable"],
+        [429, "rate_limited", 429, "rate_limited"],
+        [429, "RATE_LIMITED", 429, "RATE_LIMITED"],
+        [403, "POLICY_DENIED", 403, "POLICY_DENIED"],
         [502, "upstream_failed", 502, "gateway_error"],
       ];
-      for (const [status, code, want, wantCode] of cases) {
-        ccp.state.failNext.set("request-human", { status, code });
+      const ts = createDeweeHandler({ ccp: ccpOptions(), secret: VISITOR_SECRET, rateLimit: false, humanHandoff: true });
+      const tsSession = await (await ts(new Request("https://shop.example/api/dewee/session", { method: "POST", body: "{}" }))).json();
+      await ts(new Request("https://shop.example/api/dewee/chat", { method: "POST", headers: { authorization: `Bearer ${tsSession.token}` }, body: JSON.stringify({ message: "hi", conversationId: "conv_php_0001", agent: "shop" }) }));
+      for (const [status, code, want, wantCode, withRemediation] of cases) {
+        const inject = { status, code, ...(withRemediation ? { remediation: withRemediation } : {}) };
+        ccp.state.failNext.set("request-human", inject);
+        const tsAnswer = await ts(new Request("https://shop.example/api/dewee/request-human", { method: "POST", headers: { authorization: `Bearer ${tsSession.token}` }, body: JSON.stringify({ conversationId: "conv_php_0001", agent: "shop" }) }));
+        const tsBody = await tsAnswer.json();
+        ccp.state.failNext.set("request-human", inject);
         const r = await requestHuman(s.token);
         expect([code, r.status, r.json().error.code]).toEqual([code, want, wantCode]);
+        expect([code, r.status, r.json()]).toEqual([code, tsAnswer.status, tsBody]);
         expect(r.text).not.toMatch(/postgres|0193/);
       }
       expect((await chat(s.token, { agent: "shop", message: "still here" })).status).toBe(200);

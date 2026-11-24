@@ -2028,8 +2028,9 @@ final class DeweeWebchat
         }
         $log = static fn (string $hint) => error_log("[dewee-webchat] ccp {$route}: {$e->ccpCode} (HTTP {$e->status}) {$hint}");
         // The visitor cannot be handed to a person: the ingress names it with the generic
-        // PERMISSION_DENIED. The widget hides its button for this code.
-        if ($route === 'request-human' && ($e->ccpCode === 'human_handoff_unavailable' || $e->ccpCode === 'PERMISSION_DENIED')) {
+        // PERMISSION_DENIED and no remediation, as it has no distinct code yet. The widget hides its
+        // button for this code. A refusal that carries a remediation is an identity refusal and stays one.
+        if ($route === 'request-human' && ($e->ccpCode === 'human_handoff_unavailable' || ($e->ccpCode === 'PERMISSION_DENIED' && $e->remediation === null))) {
             return ['status' => 403, 'code' => 'human_handoff_unavailable', 'message' => 'Talking to a person is not available'];
         }
         if (isset(self::IDENTITY_ERRORS[$e->ccpCode])) {
@@ -2037,13 +2038,12 @@ final class DeweeWebchat
             return ['status' => $status, 'code' => $e->ccpCode, 'message' => $message, 'identity' => true, 'remediation' => $e->remediation ?? ['action' => $action, 'audience' => 'end_user']];
         }
         $retryAfterMs = $e->retryAfterSeconds ? $e->retryAfterSeconds * 1000 : null;
-        if ($route === 'chat') {
-            if (in_array($e->ccpCode, self::ADMISSION_ERROR_CODES, true)) {
-                return ['status' => $e->ccpCode === 'RATE_LIMITED' ? 429 : 403, 'code' => $e->ccpCode, 'message' => '', 'admission' => $e->ccpCode, 'retryAfterMs' => $retryAfterMs];
-            }
-            if ($e->ccpCode === 'rate_limited' || $e->ccpCode === 'concurrency_limited' || $e->status === 429) {
-                return ['status' => 429, 'code' => 'RATE_LIMITED', 'message' => '', 'admission' => 'RATE_LIMITED', 'retryAfterMs' => $retryAfterMs];
-            }
+        // A refused message (or request for a person) is the typed admission refusal the widget localizes.
+        if (($route === 'chat' || $route === 'request-human') && in_array($e->ccpCode, self::ADMISSION_ERROR_CODES, true)) {
+            return ['status' => $e->ccpCode === 'RATE_LIMITED' ? 429 : 403, 'code' => $e->ccpCode, 'message' => '', 'admission' => $e->ccpCode, 'retryAfterMs' => $retryAfterMs];
+        }
+        if ($route === 'chat' && ($e->ccpCode === 'rate_limited' || $e->ccpCode === 'concurrency_limited' || $e->status === 429)) {
+            return ['status' => 429, 'code' => 'RATE_LIMITED', 'message' => '', 'admission' => 'RATE_LIMITED', 'retryAfterMs' => $retryAfterMs];
         }
         $limited = ['status' => 429, 'code' => 'rate_limited', 'message' => 'Too many messages, please wait a moment'] + ($e->retryAfterSeconds ? ['retryAfterSeconds' => $e->retryAfterSeconds] : []);
         switch ($e->ccpCode) {
@@ -3178,7 +3178,7 @@ final class DeweeCcpClient
         }
         $meta = stream_get_meta_data($fp);
         $respHeaders = is_array($meta['wrapper_data'] ?? null) ? $meta['wrapper_data'] : [];
-        $status = isset($respHeaders[0]) && preg_match('#^HTTP/\S+\s+(\d{3})#', (string) $respHeaders[0], $sm) ? (int) $sm[1] : 0;
+        $status = self::statusOf($fp);
         if ($status === 0) {
             fclose($fp);
             throw new DeweeCcpError(0, 'ccp_bad_response', "CCP {$route}: no HTTP status");

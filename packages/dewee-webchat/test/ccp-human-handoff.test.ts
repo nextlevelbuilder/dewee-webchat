@@ -180,15 +180,21 @@ describe("human takeover: opted-in host", () => {
     const h = makeHandler({ humanHandoff: true });
     const s = await session(h);
     await chat(h, s.token);
-    const cases: Array<[number, string, number, string]> = [
+    const remediation = { action: "contact_admin", audience: "end_user" };
+    const cases: Array<[number, string, number, string, unknown?]> = [
       [403, "PERMISSION_DENIED", 403, "human_handoff_unavailable"],
+      // An identity refusal (it names a remediation) stays one: it is not "unavailable".
+      [403, "PERMISSION_DENIED", 403, "PERMISSION_DENIED", remediation],
       [403, "human_handoff_unavailable", 403, "human_handoff_unavailable"],
       [429, "rate_limited", 429, "rate_limited"],
+      // Admission refusals keep their typed code so the widget shows its localized refusal.
+      [429, "RATE_LIMITED", 429, "RATE_LIMITED"],
+      [403, "POLICY_DENIED", 403, "POLICY_DENIED"],
       [500, "upstream_failed", 502, "gateway_error"],
       [502, "upstream_failed", 502, "gateway_error"],
     ];
-    for (const [status, code, want, wantCode] of cases) {
-      ccp.state.failNext.set("request-human", { status, code });
+    for (const [status, code, want, wantCode, withRemediation] of cases) {
+      ccp.state.failNext.set("request-human", { status, code, ...(withRemediation ? { remediation: withRemediation } : {}) });
       const r = await quiet(() => requestHuman(h, s.token));
       expect([code, r.status, r.json().error.code]).toEqual([code, want, wantCode]);
       expect(r.text).not.toMatch(/postgres|0193/);

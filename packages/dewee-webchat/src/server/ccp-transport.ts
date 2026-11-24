@@ -109,16 +109,16 @@ export function browserErrorFor(e: unknown, route: CcpRoute): BrowserError {
   }
   const log = (level: "warn" | "error", hint: string) => console[level](`[dewee-webchat] ccp ${route}: ${e.code} (HTTP ${e.status}) ${hint}`);
   // The visitor cannot be handed to a person (no Human Oversight config, or the feature is off): the
-  // ingress names it with the generic PERMISSION_DENIED. The widget hides its button for this code.
-  if (route === "request-human" && (e.code === "human_handoff_unavailable" || e.code === "PERMISSION_DENIED")) return { status: 403, code: "human_handoff_unavailable", message: "Talking to a person is not available" };
+  // ingress names it with the generic PERMISSION_DENIED and no remediation, as it has no distinct code
+  // yet. The widget hides its button for this code. A refusal that carries a remediation is an identity
+  // refusal and stays one.
+  if (route === "request-human" && (e.code === "human_handoff_unavailable" || (e.code === "PERMISSION_DENIED" && !e.remediation))) return { status: 403, code: "human_handoff_unavailable", message: "Talking to a person is not available" };
   if (isIdentityErrorCode(e.code)) return { status: IDENTITY_ERRORS[e.code].status, code: e.code, message: IDENTITY_ERRORS[e.code].message, identity: e.code, remediation: e.remediation };
   const retryAfterMs = e.retryAfterSeconds ? e.retryAfterSeconds * 1000 : undefined;
-  // A refused message is an admission error, the same typed refusal the legacy gateway gives, so the
-  // widget shows its cooldown or the refusal note. Other routes keep their own codes.
-  if (route === "chat") {
-    if (isAdmissionErrorCode(e.code)) return { status: e.code === "RATE_LIMITED" ? 429 : 403, code: e.code, message: "", admission: e.code, retryAfterMs };
-    if (e.code === "rate_limited" || e.code === "concurrency_limited" || e.status === 429) return { status: 429, code: "RATE_LIMITED", message: "", admission: "RATE_LIMITED", retryAfterMs };
-  }
+  // A refused message (or request for a person) is an admission error, the same typed refusal the
+  // legacy gateway gives, so the widget shows its localized refusal. Other routes keep their own codes.
+  if ((route === "chat" || route === "request-human") && isAdmissionErrorCode(e.code)) return { status: e.code === "RATE_LIMITED" ? 429 : 403, code: e.code, message: "", admission: e.code, retryAfterMs };
+  if (route === "chat" && (e.code === "rate_limited" || e.code === "concurrency_limited" || e.status === 429)) return { status: 429, code: "RATE_LIMITED", message: "", admission: "RATE_LIMITED", retryAfterMs };
   switch (e.code) {
     case "credential_requests_unavailable":
       return { status: 403, code: e.code, message: "Credential requests are unavailable" };

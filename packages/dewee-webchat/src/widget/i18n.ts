@@ -83,6 +83,48 @@ export interface Strings {
     unavailable: string;
     staff: string;
   };
+  /**
+   * Business requests ("call me back") and their receipts. A receipt's state is the business's, never
+   * the conversation's: `received`, `inProgress` and `waiting` never read as done.
+   */
+  workRequests: {
+    /** The entry button. */
+    entry: string;
+    /** Next to the entry when nobody would answer now. */
+    offHours: string;
+    intro: string;
+    method: string;
+    methods: Record<"phone" | "zalo" | "email", string>;
+    contact: Record<"phone" | "zalo" | "email", string>;
+    purpose: string;
+    /** The consent checkbox; names what the contact is for. */
+    consent: (title: string) => string;
+    submit: string;
+    cancel: string;
+    close: string;
+    errors: Record<"contact_method" | "contact_value_phone" | "contact_value_email" | "purpose" | "consent", string>;
+    sending: string;
+    checking: string;
+    unconfirmed: string;
+    checkAgain: string;
+    sendAgain: string;
+    failed: string;
+    invalid: string;
+    unavailable: string;
+    limited: string;
+    conflict: string;
+    /** Announced once the server stored the request. */
+    recorded: (code: string) => string;
+    receipts: string;
+    due: string;
+    /** The due time in the business's own time zone, when it differs from the visitor's. */
+    dueLocal: (time: string, zone: string) => string;
+    contactHint: string;
+    note: string;
+    states: Record<"received" | "in_progress" | "waiting" | "resolved" | "cancelled", string>;
+    /** Announced when a receipt's state changed. */
+    changed: (code: string, state: string) => string;
+  };
 }
 
 const en: Strings = {
@@ -175,6 +217,44 @@ const en: Strings = {
     unavailable: "Talking to a person isn't available right now.",
     staff: "Support staff",
   },
+  workRequests: {
+    entry: "Request a callback",
+    offHours: "No one is available right now. You can ask us to call you back.",
+    intro: "Leave your details and we'll contact you. You can keep chatting either way.",
+    method: "How should we contact you?",
+    methods: { phone: "Phone", zalo: "Zalo", email: "Email" },
+    contact: { phone: "Phone number", zalo: "Zalo number", email: "Email address" },
+    purpose: "What is it about?",
+    consent: (title) => `I agree to be contacted at these details only for this request (${title}).`,
+    submit: "Send request",
+    cancel: "Cancel",
+    close: "Close",
+    errors: {
+      contact_method: "Choose how we should contact you.",
+      contact_value_phone: "Enter a phone number with 6 to 15 digits.",
+      contact_value_email: "Enter a valid email address.",
+      purpose: "Tell us briefly what it is about (up to 500 characters).",
+      consent: "Tick the box to let us contact you for this request.",
+    },
+    sending: "Sending your request…",
+    checking: "Checking whether your request was received…",
+    unconfirmed: "We couldn't confirm that your request was received. Check again, or send it again: it won't be sent twice.",
+    checkAgain: "Check again",
+    sendAgain: "Send again",
+    failed: "Your request wasn't sent. Please try again.",
+    invalid: "Your request wasn't sent. Check the details and try again.",
+    unavailable: "This request can't be sent here right now.",
+    limited: "You've sent several requests already. Please wait a while and try again.",
+    conflict: "A request was already sent with other details. Your new details weren't sent.",
+    recorded: (code) => `Request received. Your code is ${code}.`,
+    receipts: "Your requests",
+    due: "We'll reply by",
+    dueLocal: (time, zone) => `${time} ${zone} time`,
+    contactHint: "Contact",
+    note: "Note",
+    states: { received: "Received", in_progress: "In progress", waiting: "On hold", resolved: "Resolved", cancelled: "Cancelled" },
+    changed: (code, state) => `Request ${code}: ${state}`,
+  },
 };
 
 const vi: Strings = {
@@ -266,6 +346,44 @@ const vi: Strings = {
     limited: "Bạn đã yêu cầu nhiều lần. Vui lòng chờ vài phút rồi thử lại.",
     unavailable: "Hiện chưa thể gặp nhân viên hỗ trợ.",
     staff: "Nhân viên hỗ trợ",
+  },
+  workRequests: {
+    entry: "Nhờ gọi lại",
+    offHours: "Hiện chưa có ai trực. Bạn có thể nhờ chúng tôi gọi lại.",
+    intro: "Để lại thông tin, chúng tôi sẽ liên hệ bạn. Bạn vẫn chat tiếp bình thường.",
+    method: "Liên hệ bạn qua đâu?",
+    methods: { phone: "Điện thoại", zalo: "Zalo", email: "Email" },
+    contact: { phone: "Số điện thoại", zalo: "Số Zalo", email: "Địa chỉ email" },
+    purpose: "Bạn cần hỗ trợ việc gì?",
+    consent: (title) => `Tôi đồng ý được liên hệ qua thông tin trên, chỉ cho yêu cầu này (${title}).`,
+    submit: "Gửi yêu cầu",
+    cancel: "Hủy",
+    close: "Đóng",
+    errors: {
+      contact_method: "Bạn chọn cách liên hệ nhé.",
+      contact_value_phone: "Nhập số điện thoại có từ 6 đến 15 chữ số.",
+      contact_value_email: "Nhập địa chỉ email hợp lệ.",
+      purpose: "Ghi ngắn gọn việc cần hỗ trợ (tối đa 500 ký tự).",
+      consent: "Đánh dấu ô đồng ý để chúng tôi liên hệ bạn cho yêu cầu này.",
+    },
+    sending: "Đang gửi yêu cầu…",
+    checking: "Đang kiểm tra yêu cầu đã được nhận chưa…",
+    unconfirmed: "Chưa xác nhận được yêu cầu đã tới nơi. Bạn bấm Kiểm tra lại hoặc Gửi lại: yêu cầu sẽ không bị gửi trùng.",
+    checkAgain: "Kiểm tra lại",
+    sendAgain: "Gửi lại",
+    failed: "Yêu cầu chưa được gửi. Bạn thử lại nhé.",
+    invalid: "Yêu cầu chưa được gửi. Bạn xem lại thông tin rồi thử lại nhé.",
+    unavailable: "Hiện chưa gửi được yêu cầu này ở đây.",
+    limited: "Bạn đã gửi khá nhiều yêu cầu. Vui lòng chờ một lúc rồi thử lại.",
+    conflict: "Đã có yêu cầu gửi với thông tin khác. Thông tin mới của bạn chưa được gửi.",
+    recorded: (code) => `Đã nhận yêu cầu. Mã của bạn là ${code}.`,
+    receipts: "Yêu cầu của bạn",
+    due: "Phản hồi trước",
+    dueLocal: (time, zone) => `${time} giờ ${zone}`,
+    contactHint: "Liên hệ",
+    note: "Ghi chú",
+    states: { received: "Đã nhận", in_progress: "Đang xử lý", waiting: "Đang tạm chờ", resolved: "Đã giải quyết", cancelled: "Đã hủy" },
+    changed: (code, state) => `Yêu cầu ${code}: ${state}`,
   },
 };
 

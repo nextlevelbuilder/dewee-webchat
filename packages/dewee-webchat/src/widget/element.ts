@@ -22,6 +22,7 @@ import { icons, pickStrings, type Strings } from "./i18n";
 import { disposeMarkdownImages, renderMarkdown } from "./markdown";
 import { SendCooldown } from "./send-cooldown";
 import { styles } from "./styles";
+import { WorkRequests } from "./work-requests";
 import type { PageContextAttachment } from "./page-context";
 import type { CredentialRequestView } from "../credential-request";
 
@@ -287,7 +288,10 @@ export class DeweeChatElement extends ElementBase {
     newChat: HTMLButtonElement; jobAccess: HTMLButtonElement; memberLink: HTMLButtonElement; close: HTMLButtonElement; foot: HTMLElement; cooldown: HTMLElement; announcer: HTMLElement;
     pageChoice: HTMLInputElement; pageWrap: HTMLElement; pageLabel: HTMLElement; pagePreview: HTMLElement;
     handoff: HTMLElement; handoffStatus: HTMLElement; handoffRequest: HTMLButtonElement;
+    wrEntry: HTMLElement; wrHint: HTMLElement; wrOpen: HTMLButtonElement; wrReceipts: HTMLElement;
   };
+  /** Business requests (callback form and receipts), apart from the conversation and the takeover. */
+  private wr!: WorkRequests;
 
   constructor() {
     super();
@@ -388,7 +392,10 @@ export class DeweeChatElement extends ElementBase {
     this.removeAttribute("data-unread");
     this.els.launcher.setAttribute("aria-expanded", "true");
     this.activate();
-    if (this.activated) this.resumePolling();
+    if (this.activated) {
+      this.resumePolling();
+      this.wr.attention();
+    }
     if (focus) setTimeout(() => this.els.input.focus(), 120);
     this.emit("dewee:open");
   }
@@ -750,10 +757,18 @@ export class DeweeChatElement extends ElementBase {
     if (this.pollTimer === undefined && this.pollInFlight !== this.pollGeneration) this.updatePolling(true);
   };
 
+  /** The visitor focused the widget: receipts are read again (throttled). */
+  private readonly onFocusIn = () => { if (this.activated) this.wr.attention(); };
+
   /** Not polled while the tab is hidden. */
   private readonly onVisibility = () => {
-    if (document.visibilityState === "hidden") this.stopPolling();
-    else this.resumePolling();
+    if (document.visibilityState === "hidden") {
+      this.stopPolling();
+      this.wr.pause();
+    } else {
+      this.resumePolling();
+      this.wr.attention();
+    }
   };
 
   /** The status line and the "talk to a person" button, shown only when the backend offers takeovers. */
@@ -775,6 +790,7 @@ export class DeweeChatElement extends ElementBase {
     // aria-disabled, not disabled: a disabled button drops keyboard focus.
     e.handoffRequest.setAttribute("aria-disabled", String(this.handoffBusy));
     if (hadFocus && !button) e.input.focus();
+    this.wr?.render();
   }
 
   /** The visitor asks for a person. One request at a time; a failure leaves the chat working and the button retryable. */
@@ -934,6 +950,8 @@ export class DeweeChatElement extends ElementBase {
     this.stop();
     this.clearCredentials();
     this.resetHandoff();
+    // Another visitor: the previous one's receipts, form and pending send are not theirs.
+    this.wr.reset();
     // Another visitor: what was learned about the previous one's session and answers is void.
     this.setCheck("session", "idle");
     this.setCheck("reply", "idle");
@@ -944,7 +962,10 @@ export class DeweeChatElement extends ElementBase {
       this.showError(null, e as Error);
       return;
     }
-    if (this.activated) await this.loadConversation();
+    if (this.activated) {
+      await this.loadConversation();
+      void this.wr.refresh();
+    }
   }
 
   /**
@@ -1102,16 +1123,22 @@ export class DeweeChatElement extends ElementBase {
     }
     document.addEventListener("visibilitychange", this.onVisibility);
     this.addEventListener("focusin", this.resumePolling);
+    this.addEventListener("focusin", this.onFocusIn);
     // The control plane is checking this install: boot now (even closed) so the check can run.
     if (this.installCheckNonce()) void this.activate().catch(() => {});
     // Moved back into the page: the server says again who answers, and a takeover is watched again.
-    if (this.activated) this.resumeHandoff();
+    if (this.activated) {
+      this.resumeHandoff();
+      this.wr.attention();
+    }
   }
 
   disconnectedCallback(): void {
     document.removeEventListener("visibilitychange", this.onVisibility);
     this.removeEventListener("focusin", this.resumePolling);
+    this.removeEventListener("focusin", this.onFocusIn);
     this.stopPolling();
+    this.wr.pause();
     this.clearCredentials();
     // A request for a person in flight is abandoned with this page view: its answer is never applied.
     this.handoffBusy = false;
@@ -1161,6 +1188,7 @@ export class DeweeChatElement extends ElementBase {
     if (newBackend) {
       this.server = null;
       this.resetHandoff();
+      this.wr.configure(undefined);
       this.probedPage = false;
       this.diag.setVersion(undefined);
       for (const step of ["reply", "session", "config"] as const) this.setCheck(step, "idle");
@@ -1283,9 +1311,11 @@ export class DeweeChatElement extends ElementBase {
           <button class="icon-btn close">${icons.close}</button>
         </header>
         <div class="log" part="log" role="log" aria-live="polite"></div>
+        <section class="wr-receipts" part="receipts" hidden></section>
         <div class="challenge"><slot name="challenge"></slot></div>
         <form class="composer" part="composer">
           <div class="handoff" part="handoff" hidden><span class="handoff-status" hidden></span><button type="button" class="btn handoff-request" hidden></button></div>
+          <div class="wr-entry" part="work-request-entry" hidden><span class="wr-hint" hidden></span><button type="button" class="btn wr-open" aria-haspopup="dialog"></button></div>
           <div class="page-context" hidden><label><input type="checkbox" class="page-choice"> <span class="page-label"></span></label><pre class="page-preview" hidden></pre></div>
           <div class="cooldown" part="cooldown" aria-hidden="true" hidden></div>
           <div class="sr-only announcer" role="status" aria-live="polite"></div>
@@ -1303,8 +1333,22 @@ export class DeweeChatElement extends ElementBase {
       newChat: $(".new"), jobAccess: $(".job-access"), memberLink: $(".member-link"), close: $(".close"), foot: $(".foot"), cooldown: $(".cooldown"), announcer: $(".announcer"),
       pageChoice: $(".page-choice"), pageWrap: $(".page-context"), pageLabel: $(".page-label"), pagePreview: $(".page-preview"),
       handoff: $(".handoff"), handoffStatus: $(".handoff-status"), handoffRequest: $(".handoff-request"),
+      wrEntry: $(".wr-entry"), wrHint: $(".wr-hint"), wrOpen: $(".wr-open"), wrReceipts: $(".wr-receipts"),
     };
     const e = this.els;
+    this.wr = new WorkRequests({
+      client: () => this.client(),
+      strings: () => this.strings,
+      locale: () => this.config.locale || undefined,
+      endpoint: () => this.config.endpoint,
+      panel: e.panel, entry: e.wrEntry, entryHint: e.wrHint, entryButton: e.wrOpen, receipts: e.wrReceipts,
+      announce: (text) => { e.announcer.textContent = text; },
+      // Only a conversation the server holds: a request never names one that was never sent.
+      conversation: () => (this.messages.some((m) => !m.hidden && !m.installCheck) ? { agent: this.agentId, conversationId: this.conversationId } : null),
+      unattended: () => this.server?.humanHandoff === true && this.control === "agent" && Date.now() < this.unattendedUntil,
+      emit: (name, detail) => this.emit(name, detail),
+      live: () => this.isConnected && document.visibilityState !== "hidden",
+    });
     e.handoffRequest.addEventListener("click", () => { void this.requestHandoff(); });
     e.launcher.addEventListener("click", () => this.toggle());
     e.close.addEventListener("click", () => this.close());
@@ -1500,6 +1544,7 @@ export class DeweeChatElement extends ElementBase {
       const wanted = this.config.agent;
       const known = (id?: string) => !!id && (loaded!.agents.length === 0 || loaded!.agents.some((a: AgentInfo) => a.id === id));
       this.agentId = known(wanted) ? wanted! : loaded.defaultAgent || loaded.agents[0]?.id || wanted || "";
+      this.wr.configure(loaded.workRequests);
       try {
         await this.loadConversation();
       } catch (e) {
@@ -1507,6 +1552,8 @@ export class DeweeChatElement extends ElementBase {
         if (seq === this.bootSeq) this.showError(null, e instanceof Error ? e : new Error(this.strings.errorGeneric));
       }
       if (seq !== this.bootSeq) return;
+      // Receipts belong to the visitor, not to this conversation: read once a session is held.
+      void this.wr.refresh();
     }
     if (refocus) (this.diag.state("config") === "ok" ? this.els.input : this.unavailablePanel?.querySelector<HTMLElement>(".retry"))?.focus();
     this.renderSubtitle();

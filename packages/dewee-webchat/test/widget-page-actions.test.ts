@@ -104,6 +104,49 @@ describe("<dewee-chat> page actions", () => {
     expect(chats[1].message).toContain('"status":"denied"');
   });
 
+  it("shows a coded failure and an unconfirmed write as such, to the visitor, the host and the agent", async () => {
+    const { ActionError } = await import("../src/index");
+    const chats = mockBackend((_b, n) => ({ content: n === 1 ? directive("orders.status", { id: "o1" }, "c1") + "\n```dewee-action\n" + JSON.stringify({ id: "c2", name: "payments.create", args: {} }) + "\n```" : "I could not confirm the payment." }));
+    const el = await mount();
+    el.configure({ confirm: async () => true });
+    el.registerActions([
+      { name: "orders.status", description: "Look up", sensitivity: "read", handler: () => { throw new ActionError("not_found", "Order not found"); } },
+      { name: "payments.create", description: "Pay", sensitivity: "mutate", handler: () => { throw new ActionError("payment_outcome_unknown", "Not confirmed", { outcome: "unknown" }); } },
+    ]);
+    const events: any[] = [];
+    el.addEventListener("dewee:action", (e) => events.push((e as CustomEvent).detail));
+    await el.send("status of o1, then pay");
+    expect(events.filter((e) => e.phase === "result").map((e) => [e.status, e.code])).toEqual([["error", "not_found"], ["unknown", "payment_outcome_unknown"]]);
+    expect(chats[1].message).toContain('"status":"error","error":"Order not found","code":"not_found"');
+    expect(chats[1].message).toContain('"status":"unknown","error":"Not confirmed","code":"payment_outcome_unknown"');
+    const chips = [...el.shadowRoot!.querySelectorAll<HTMLElement>(".action")].map((c) => [c.dataset.status, c.querySelector(".action-state")!.textContent]);
+    expect(chips).toEqual([["error", "failed"], ["unknown", "not confirmed"]]);
+  });
+
+  it("restores an unconfirmed action as unconfirmed after reload", async () => {
+    const history = [
+      { role: "assistant", content: directive("payments.create", {}) },
+      { role: "user", content: '```dewee-action-result {"id":"c1","name":"payments.create","status":"unknown","error":"Not confirmed","code":"payment_outcome_unknown"} ```' },
+      { role: "assistant", content: "Please check the order." },
+    ];
+    mockBackend(() => ({ content: "unused" }), history);
+    const el = document.createElement("dewee-chat") as DeweeChatElement;
+    el.setAttribute("endpoint", "/api/dewee");
+    el.setAttribute("mode", "inline");
+    document.body.appendChild(el);
+    await new Promise((r) => setTimeout(r, 0));
+    el.remove();
+    const reloaded = document.createElement("dewee-chat") as DeweeChatElement;
+    reloaded.setAttribute("endpoint", "/api/dewee");
+    reloaded.setAttribute("mode", "inline");
+    document.body.appendChild(reloaded);
+    await new Promise((r) => setTimeout(r, 0));
+    const chip = reloaded.shadowRoot!.querySelector<HTMLElement>(".action");
+    expect(chip?.dataset.status).toBe("unknown");
+    expect(chip?.title).toContain("Not confirmed");
+    localStorage.clear();
+  });
+
   it("sends the page context with every turn", async () => {
     const chats = mockBackend(() => ({ content: "hi" }));
     const el = await mount();

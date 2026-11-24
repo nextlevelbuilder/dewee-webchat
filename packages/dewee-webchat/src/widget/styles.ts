@@ -210,7 +210,7 @@ details > summary svg.ic { width: 14px; height: 14px; flex: none; }
 .action-state { font-size: 11px; flex: none; }
 .action[data-status="done"] .action-state { color: #13a06f; }
 .action[data-status="awaiting-confirmation"] { border-color: color-mix(in srgb, #d98a00 45%, transparent); }
-.action[data-status="awaiting-confirmation"] .action-state { color: #b06f00; }
+.action[data-status="awaiting-confirmation"] .action-state, .action[data-status="unknown"] .action-state { color: #b06f00; }
 .action[data-status="denied"] .action-state, .action[data-status="error"] .action-state { color: #c2334f; }
 .notice { margin: -6px 0 16px; font-size: 12px; color: var(--dw-muted); text-align: center; }
 .msg.user.refused { flex-direction: column; align-items: flex-end; }

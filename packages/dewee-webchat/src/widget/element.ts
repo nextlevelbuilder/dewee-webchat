@@ -119,6 +119,8 @@ export interface ActionEventDetail {
   status?: ActionResultStatus;
   result?: unknown;
   error?: string;
+  /** The handler's `ActionError` code, when it gave one. */
+  code?: string;
   agent: string;
   conversationId: string;
 }
@@ -514,7 +516,7 @@ export class DeweeChatElement extends ElementBase {
         if (r.error) view.error = r.error;
         this.updateMessage(reply);
         results.push(r);
-        this.emit("dewee:action", { phase: "result", id: r.id, name: r.name, sensitivity, args, status: r.status, result: r.result, error: r.error, ...base } satisfies ActionEventDetail);
+        this.emit("dewee:action", { phase: "result", id: r.id, name: r.name, sensitivity, args, status: r.status, result: r.result, error: r.error, ...(r.code ? { code: r.code } : {}), ...base } satisfies ActionEventDetail);
       }
     } finally {
       this.setRunning(null);

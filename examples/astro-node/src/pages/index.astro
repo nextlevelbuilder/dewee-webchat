@@ -88,6 +88,8 @@ const money = (n: number) => `${n.toLocaleString("vi-VN")} ₫`;
           // component fed by this same value.
           link.href = p.checkoutUrl;
           section.hidden = false;
+          // Reported to the agent as "checkout shown": true only when the link is really on screen.
+          return section.isConnected && !section.hidden;
         },
       });
 

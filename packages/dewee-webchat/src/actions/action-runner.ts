@@ -33,7 +33,37 @@ export type PageActionInfo = Omit<PageAction, "handler">;
 /** Host-owned approval for `mutate`/`destructive` calls. Only a resolved `true` approves. */
 export type ActionConfirmHook = (action: PageActionInfo & { callId: string }, args: Record<string, unknown>) => boolean | Promise<boolean>;
 
-export type ActionCallStatus = "pending" | "awaiting-confirmation" | "running" | "done" | "denied" | "error";
+export type ActionCallStatus = "pending" | "awaiting-confirmation" | "running" | "done" | "denied" | "error" | "unknown";
+
+const ACTION_ERROR_CODE_RE = /^[a-z][a-z0-9_.-]{0,63}$/;
+
+/**
+ * How a handler reports a business failure. A handler that resolves has succeeded, whatever it
+ * returns (a returned `{ error }` object is data, as before), so a failed lookup or a refused write
+ * must throw:
+ *
+ *   if (!res.ok) throw new ActionError("not_found", "Order not found");
+ *
+ * `outcome: "unknown"` is for a write whose answer was lost and could not be reconciled with the
+ * server: the agent is told the result is unconfirmed instead of failed, so it does not repeat it.
+ */
+export class ActionError extends Error {
+  readonly code: string;
+  readonly outcome: "failed" | "unknown";
+  constructor(code: string, message?: string, options: { outcome?: "failed" | "unknown" } = {}) {
+    super(message || code);
+    this.name = "ActionError";
+    this.code = ACTION_ERROR_CODE_RE.test(code) ? code : "action_failed";
+    this.outcome = options.outcome === "unknown" ? "unknown" : "failed";
+  }
+}
+
+/** Duck-typed so an `ActionError` from another copy of the package (CDN + bundle) is still recognised. */
+function asActionError(e: unknown): { code: string; outcome: "failed" | "unknown"; message: string } | null {
+  const x = e as { name?: unknown; code?: unknown; outcome?: unknown; message?: unknown } | null;
+  if (!x || typeof x !== "object" || x.name !== "ActionError" || typeof x.code !== "string" || !ACTION_ERROR_CODE_RE.test(x.code)) return null;
+  return { code: x.code, outcome: x.outcome === "unknown" ? "unknown" : "failed", message: typeof x.message === "string" ? x.message : x.code };
+}
 
 export const needsConfirmation = (s: ActionSensitivity) => s === "mutate" || s === "destructive";
 
@@ -125,7 +155,20 @@ export async function runActionCall(call: ParsedCall, o: RunCallOptions): Promis
     o.onStatus?.("done");
     return { id: call.id, name: call.name, status: "ok", result: toJsonValue(value) ?? null };
   } catch (e) {
-    return fail(ctrl.signal.aborted ? (o.signal.aborted ? "Cancelled" : "Timed out") : String((e as Error)?.message ?? e).slice(0, 500) || "Action failed");
+    const unknown = (error: string, code?: string): ActionResult => {
+      o.onStatus?.("unknown");
+      return { id: call.id, name: call.name, status: "unknown", error, ...(code ? { code } : {}) };
+    };
+    if (ctrl.signal.aborted) {
+      const why = o.signal.aborted ? "Cancelled" : "Timed out";
+      // The handler was already running: a write may have reached the server before it was stopped.
+      return needsConfirmation(action.sensitivity) ? unknown(`${why} while running; the outcome is not confirmed`) : fail(why);
+    }
+    const known = asActionError(e);
+    if (!known) return fail(String((e as Error)?.message ?? e).slice(0, 500) || "Action failed");
+    const message = known.message.slice(0, 500);
+    if (known.outcome === "unknown") return unknown(message, known.code);
+    return { ...fail(message), code: known.code };
   } finally {
     clearTimeout(timer);
     o.signal.removeEventListener("abort", stop);

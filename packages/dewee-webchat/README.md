@@ -325,10 +325,30 @@ type ActionConfirmHook = (action: PageActionInfo & { callId: string }, args: Rec
 - `mutate` and `destructive` actions run only after approval: the built-in accessible dialog, or your
   `confirm(action, args)` hook — only a resolved `true` approves. A denial is reported to the agent as
   `status: "denied"`.
-- Each call shows a status chip (pending, awaiting confirmation, running, done, denied, error). Stop
-  cancels running handlers (`ctx.signal`).
+- Each call shows a status chip (pending, awaiting confirmation, running, done, denied, error, not
+  confirmed). Stop cancels running handlers (`ctx.signal`).
+- **A handler that resolves has succeeded**, whatever it returns. To report a business failure, throw
+  an `ActionError` with a machine-readable code; the agent gets `status: "error"` and the code:
+
+  ```ts
+  import { ActionError } from "dewee-webchat";
+
+  handler: async ({ id }, { signal }) => {
+    const res = await fetch(`/api/orders/${id}`, { signal });
+    if (!res.ok) throw new ActionError("not_found", "Order not found"); // not: return { error: "not_found" }
+    return res.json();
+  }
+  ```
+
+- **A write whose result you cannot confirm is `unknown`, not a failure.** When the answer to a POST is
+  lost, ask your server whether it happened before reporting anything; only if that fails too, throw
+  `new ActionError("payment_outcome_unknown", "…", { outcome: "unknown" })`. The agent is told the
+  outcome is unconfirmed and that it must not run the action again. A `mutate`/`destructive` handler
+  that times out or is stopped while running is reported as `unknown` for the same reason. See
+  [`examples/astro-node`](https://github.com/nextlevelbuilder/dewee-webchat/blob/main/examples/astro-node/src/lib/page-actions.ts).
 - `getPageContext()` returns a small snapshot (≤ 4 KB as JSON) sent with every message. Redact it yourself.
-- `dewee:action` fires with `{ phase: "start" | "result", id, name, sensitivity, args, status, result, error, agent, conversationId }`.
+- `dewee:action` fires with `{ phase: "start" | "result", id, name, sensitivity, args, status, result, error, code, agent, conversationId }`;
+  `status` is `ok`, `denied`, `error` or `unknown`.
 - The manifest is sent only when it changes (hash acknowledged per conversation).
 - The wire format is in [docs/http-contract.md](https://github.com/nextlevelbuilder/dewee-webchat/blob/main/docs/http-contract.md#page-actions).
 

@@ -16,7 +16,7 @@ function setup(approve: boolean) {
     return json({ error: { code: "not_found" } }, 404);
   }) as unknown as typeof globalThis.fetch;
   const approvePayment = vi.fn(async () => approve);
-  const showCheckout = vi.fn();
+  const showCheckout = vi.fn(() => true);
   const { actions, confirm } = tosePageActions({ fetch, approvePayment, showCheckout });
   const byName = (name: string) => actions.find((a) => a.name === name)!;
   const ctx = (callId: string) => ({ callId, signal: new AbortController().signal }) as never;

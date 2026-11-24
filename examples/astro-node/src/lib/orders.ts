@@ -40,7 +40,13 @@ export function orderFor(user: string, id: string): Order | null {
   return payments.has(order.id) ? { ...order, status: "paid" } : order;
 }
 
-export const ordersOf = (user: string) => ORDERS.filter((o) => o.owner === user).map((o) => orderFor(user, o.id)!);
+/** The payment already created for the user's own order, so a client that lost the answer can reconcile. */
+export function paymentFor(user: string, orderId: string): Payment | null {
+  const order = ORDERS.find((o) => o.id === orderId && o.owner === user);
+  return order ? payments.get(order.id) ?? null : null;
+}
+
+export const ordersOf =(user: string) => ORDERS.filter((o) => o.owner === user).map((o) => orderFor(user, o.id)!);
 
 function checkoutBase(): string {
   const raw = process.env.PAYMENT_CHECKOUT_URL || "https://pay.example.test/checkout";

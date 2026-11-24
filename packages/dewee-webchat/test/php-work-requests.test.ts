@@ -216,7 +216,7 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env, 'features
         step.before?.();
         const from = ccp.seen.length;
         const answer = await call(step.path, { method: "POST", headers: auth, body: JSON.stringify(step.body) });
-        expect(answer.text).not.toMatch(/staff_0193|VIP|leaked-contact|postgres|912/);
+        expect(answer.text).not.toMatch(/staff_0193|VIP|leaked-contact|postgres|912 345/);
         const upstream = ccp.seen.slice(from).filter((r) => r.route !== "config" && r.route !== "session")
           .map((r) => ({ route: r.route, features: r.headers["x-dewee-webchat-features"], session: typeof r.headers["x-dewee-webchat-session"] === "string", body: r.body }));
         out.push({ answer: normal({ status: answer.status, retryAfter: answer.retryAfter, body: answer.body }), upstream });

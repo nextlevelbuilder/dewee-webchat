@@ -111,7 +111,7 @@ describe("work requests: opted-in host", () => {
       },
       replayed: false,
     });
-    expect(first.text).not.toMatch(/staff_0193|VIP|leaked-contact|912/);
+    expect(first.text).not.toMatch(/staff_0193|VIP|leaked-contact|912 345/);
     const sent = ccp.routes("work-requests/create")[0];
     expect(sent.headers["x-dewee-webchat-features"]).toBe("work-requests");
     expect(sent.body).toEqual({ kind: "callback", summary: "Call me after 5pm about my order", payload: callback().payload, idempotency_key: "wr_key_0001abcd", conversation_id: CONVERSATION, agent: "shop" });

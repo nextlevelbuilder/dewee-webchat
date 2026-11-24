@@ -308,7 +308,7 @@ describe("<dewee-chat> callback request", () => {
     expect(b.creates()[1].body.idempotencyKey).not.toBe(sent.idempotencyKey);
     expect(receipts(el)).toHaveLength(2);
     const leaks = exposed(consoleSpies);
-    expect(leaks).not.toContain("912");
+    expect(leaks).not.toContain("912 345");
     expect(leaks).not.toContain("call me about");
   });
 

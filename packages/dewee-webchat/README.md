@@ -367,7 +367,8 @@ type ActionConfirmHook = (action: PageActionInfo & { callId: string }, args: Rec
 
   handler: async ({ id }, { signal }) => {
     const res = await fetch(`/api/orders/${id}`, { signal });
-    if (!res.ok) throw new ActionError("not_found", "Order not found"); // not: return { error: "not_found" }
+    if (res.status === 404) throw new ActionError("not_found", "Order not found"); // not: return { error: "not_found" }
+    if (!res.ok) throw new ActionError(`http_${res.status}`);
     return res.json();
   }
   ```
@@ -376,7 +377,9 @@ type ActionConfirmHook = (action: PageActionInfo & { callId: string }, args: Rec
   lost, ask your server whether it happened before reporting anything; only if that fails too, throw
   `new ActionError("payment_outcome_unknown", "…", { outcome: "unknown" })`. The agent is told the
   outcome is unconfirmed and that it must not run the action again. A `mutate`/`destructive` handler
-  that times out or is stopped while running is reported as `unknown` for the same reason. See
+  that times out or is stopped while running is reported as `unknown` for the same reason; after a
+  Stop that leaves such a result, the widget still sends the results to the agent once (and runs no
+  further actions), so the conversation and a later reload both show it as unconfirmed. See
   [`examples/astro-node`](https://github.com/nextlevelbuilder/dewee-webchat/blob/main/examples/astro-node/src/lib/page-actions.ts).
 - `getPageContext()` returns a small snapshot (≤ 4 KB as JSON) sent with every message. Redact it yourself.
 - `dewee:action` fires with `{ phase: "start" | "result", id, name, sensitivity, args, status, result, error, code, agent, conversationId }`;

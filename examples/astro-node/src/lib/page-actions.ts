@@ -34,7 +34,8 @@ export interface TosePageActionDeps {
   approvePayment(quote: PaymentQuote): Promise<boolean>;
   /**
    * The host renders the checkout link (or its own QR component) from the server's answer.
-   * Resolve true only when the customer can actually see it.
+   * Resolve true only when the customer can actually see it. Seeing the link is not opening it,
+   * and neither is paying: the agent is told `checkout_link_shown`, nothing more.
    */
   showCheckout(payment: CreatedPayment): boolean | Promise<boolean>;
 }
@@ -59,15 +60,31 @@ export function tosePageActions(deps: TosePageActionDeps): { actions: PageAction
   const approved = new Map<string, PaymentQuote>();
 
   /**
-   * After a POST whose answer never arrived: asks the server whether the payment exists.
-   * Resolves the payment, `null` when the server says there is none, and throws when it cannot tell.
+   * After a POST whose answer was lost or unusable: asks the server whether the payment exists.
+   * Resolves the payment, `null` only when this API itself says there is none (a 404 from a proxy
+   * proves nothing), and throws when it cannot tell. A payment that does not match the approved
+   * quote was made elsewhere (another tab), so it is not this call's success either.
    */
-  async function reconcilePayment(orderId: string, signal: AbortSignal): Promise<CreatedPayment | null> {
-    const res = await deps.fetch(`/api/payments?orderId=${encodeURIComponent(orderId)}`, { credentials: "same-origin", signal });
-    if (res.status === 404) return null;
+  async function reconcilePayment(quote: PaymentQuote, signal: AbortSignal): Promise<CreatedPayment | null> {
+    const res = await deps.fetch(`/api/payments?orderId=${encodeURIComponent(quote.orderId)}`, { credentials: "same-origin", signal });
     const body = await readJson(res);
-    if (!res.ok || !isPayment(body) || body.orderId !== orderId) throw new Error("reconcile failed");
+    if (res.status === 404 && body?.error?.code === "not_found") return null;
+    if (!res.ok || !isPayment(body) || body.orderId !== quote.orderId) throw new Error("reconcile failed");
+    if (body.amount !== quote.amount || body.currency !== quote.currency) throw new Error("payment does not match the quote");
     return body;
+  }
+
+  /** The write may or may not have happened: report what the server says, or that nobody knows. */
+  async function settleLostAnswer(quote: PaymentQuote, signal: AbortSignal) {
+    let found: CreatedPayment | null;
+    try {
+      found = await reconcilePayment(quote, signal);
+    } catch (e) {
+      if (signal.aborted) throw e; // stopped or timed out: the SDK reports a write as unconfirmed
+      throw new ActionError("payment_outcome_unknown", "The payment request was sent but its result could not be confirmed. Check the order before trying again.", { outcome: "unknown" });
+    }
+    if (!found) throw new ActionError("payment_not_created", "The payment request did not go through; no payment was created.");
+    return finish(found);
   }
 
   const actions: PageAction[] = [
@@ -107,18 +124,14 @@ export function tosePageActions(deps: TosePageActionDeps): { actions: PageAction
           // Stopped or timed out: the SDK reports that itself (as unconfirmed, for a write).
           if (signal.aborted) throw sendError;
           // The request may have reached the server. Ask before telling the agent anything.
-          let found: CreatedPayment | null;
-          try {
-            found = await reconcilePayment(orderId, signal);
-          } catch {
-            throw new ActionError("payment_outcome_unknown", "The payment request was sent but its result could not be confirmed. Check the order before trying again.", { outcome: "unknown" });
-          }
-          if (!found) throw new ActionError("network_error", "The payment request did not reach the server; no payment was created.");
-          return finish(found);
+          return settleLostAnswer(quote, signal);
         }
+        // A gateway error or timeout says nothing about the write behind it: the backend may have
+        // committed before the proxy gave up. Only this API's own 4xx is a definite refusal.
+        if (res.status >= 500 || res.status === 408) return settleLostAnswer(quote, signal);
         const body = await readJson(res);
         if (!res.ok) throw refusal(res, body);
-        if (!isPayment(body)) throw new ActionError("payment_outcome_unknown", "The server accepted the request but its answer could not be read.", { outcome: "unknown" });
+        if (!isPayment(body)) return settleLostAnswer(quote, signal);
         return finish(body);
       },
     },
@@ -133,7 +146,7 @@ export function tosePageActions(deps: TosePageActionDeps): { actions: PageAction
       shown = false;
     }
     // "Shown" is not "paid": proof of payment comes from the payment system, never from this page.
-    return { paymentId: payment.paymentId, status: shown ? "checkout_shown_to_customer" : "payment_created_checkout_not_shown" };
+    return { paymentId: payment.paymentId, status: shown ? "checkout_link_shown" : "payment_created_checkout_not_shown" };
   }
 
   const confirm: ActionConfirmHook = async (action, args) => {

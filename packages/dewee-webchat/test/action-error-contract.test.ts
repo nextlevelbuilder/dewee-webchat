@@ -133,6 +133,24 @@ describe("result wire format", () => {
   });
 });
 
+describe("runner: errors it cannot read", () => {
+  const action = (handler: PageAction["handler"]): PageAction[] => [{ name: "a", description: "", sensitivity: "read", handler }];
+
+  it("never throws on an error whose properties throw, and reports a plain failure", async () => {
+    const hostile = new Proxy({}, { get() { throw new Error("trap"); } });
+    const { result } = await run(action(() => { throw hostile; }), "a", {});
+    expect(result.status).toBe("error");
+    expect(result.code).toBeUndefined();
+  });
+
+  it("keeps the code of a renamed subclass and never reports an empty message", async () => {
+    class OrderError extends ActionError { constructor() { super("order_locked", "Locked"); this.name = "OrderError"; } }
+    expect((await run(action(() => { throw new OrderError(); }), "a", {})).result).toMatchObject({ status: "error", code: "order_locked", error: "Locked" });
+    const foreign = { name: "ActionError", code: "denied_by_host", message: "" };
+    expect((await run(action(() => { throw foreign; }), "a", {})).result).toMatchObject({ status: "error", code: "denied_by_host", error: "denied_by_host" });
+  });
+});
+
 describe("astro-node example: orders.status", () => {
   it("returns the order on success", async () => {
     const s = shop({ order: () => json({ id: "ord_1001a", status: "awaiting_payment", total: 250_000, currency: "VND" }) });
@@ -159,7 +177,7 @@ describe("astro-node example: payments.create", () => {
   it("creates the payment and reports the checkout as shown only when the host showed it", async () => {
     const s = shop({ create: () => json(PAYMENT, 201) });
     const { result } = await pay(s);
-    expect(result).toEqual({ id: "c1", name: "payments.create", status: "ok", result: { paymentId: "pay_1", status: "checkout_shown_to_customer" } });
+    expect(result).toEqual({ id: "c1", name: "payments.create", status: "ok", result: { paymentId: "pay_1", status: "checkout_link_shown" } });
     expect(s.shownPayments).toEqual([PAYMENT]);
   });
 
@@ -188,19 +206,26 @@ describe("astro-node example: payments.create", () => {
   it("after a lost answer, finds the payment the server did create instead of creating another", async () => {
     const s = shop({ create: () => { throw new TypeError("Failed to fetch"); }, reconcile: () => json(PAYMENT) });
     const { result } = await pay(s);
-    expect(result).toMatchObject({ status: "ok", result: { paymentId: "pay_1", status: "checkout_shown_to_customer" } });
+    expect(result).toMatchObject({ status: "ok", result: { paymentId: "pay_1", status: "checkout_link_shown" } });
     expect(s.calls.filter((c) => c === "POST /api/payments")).toHaveLength(1);
     expect(s.calls.at(-1)).toBe("GET /api/payments?orderId=ord_1001a");
   });
 
   it("after a lost answer, reports a plain failure when the server confirms nothing was created", async () => {
     const s = shop({ create: () => { throw new TypeError("Failed to fetch"); }, reconcile: () => refused(404, "not_found") });
-    expect((await pay(s)).result).toMatchObject({ status: "error", code: "network_error" });
+    expect((await pay(s)).result).toMatchObject({ status: "error", code: "payment_not_created" });
     expect(s.shownPayments).toEqual([]);
   });
 
   it("after a lost answer that cannot be reconciled, reports unknown and never success", async () => {
-    for (const reconcile of [() => { throw new TypeError("Failed to fetch"); }, () => new Response("bad gateway", { status: 502 }), () => json({ ...PAYMENT, orderId: "ord_2002a" })]) {
+    const cannotTell = [
+      () => { throw new TypeError("Failed to fetch"); },
+      () => new Response("bad gateway", { status: 502 }),
+      () => json({ ...PAYMENT, orderId: "ord_2002a" }),
+      () => new Response("<html>no such route</html>", { status: 404 }), // a proxy's 404 is not the API saying "none"
+      () => json({ ...PAYMENT, amount: 990_000 }), // paid elsewhere at another amount: not this call's result
+    ];
+    for (const reconcile of cannotTell) {
       const s = shop({ create: () => { throw new TypeError("Failed to fetch"); }, reconcile });
       const { result, statuses } = await pay(s);
       expect(result).toMatchObject({ status: "unknown", code: "payment_outcome_unknown" });
@@ -209,8 +234,25 @@ describe("astro-node example: payments.create", () => {
     }
   });
 
-  it("reports unknown when the server accepted the request but the answer is unreadable", async () => {
-    const s = shop({ create: () => new Response("<html>", { status: 201 }) });
-    expect((await pay(s)).result).toMatchObject({ status: "unknown", code: "payment_outcome_unknown" });
+  it("asks the server after an unreadable 201 before reporting anything", async () => {
+    const found = shop({ create: () => new Response("<html>", { status: 201 }), reconcile: () => json(PAYMENT) });
+    expect((await pay(found)).result).toMatchObject({ status: "ok", result: { paymentId: "pay_1" } });
+    const lost = shop({ create: () => new Response("<html>", { status: 201 }), reconcile: () => new Response("", { status: 503 }) });
+    expect((await pay(lost)).result).toMatchObject({ status: "unknown", code: "payment_outcome_unknown" });
+  });
+
+  it("treats a gateway error on the POST as a lost answer, never as a definite failure", async () => {
+    for (const status of [500, 502, 504, 408]) {
+      const committed = shop({ create: () => new Response("gateway timeout", { status }), reconcile: () => json(PAYMENT) });
+      expect((await pay(committed)).result).toMatchObject({ status: "ok", result: { paymentId: "pay_1", status: "checkout_link_shown" } });
+      expect(committed.calls.filter((c) => c === "POST /api/payments")).toHaveLength(1);
+
+      const none = shop({ create: () => new Response("gateway timeout", { status }), reconcile: () => refused(404, "not_found") });
+      expect((await pay(none)).result).toMatchObject({ status: "error", code: "payment_not_created" });
+
+      const lost = shop({ create: () => new Response("gateway timeout", { status }), reconcile: () => new Response("", { status: 503 }) });
+      expect((await pay(lost)).result).toMatchObject({ status: "unknown", code: "payment_outcome_unknown" });
+      expect(lost.shownPayments).toEqual([]);
+    }
   });
 });

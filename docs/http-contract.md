@@ -193,7 +193,7 @@ sends the results back as a new (hidden) message:
 |---|---|
 | `ok` | The handler resolved. Whatever it returned is in `result`, including a returned `{ "error": … }` object, which is data. |
 | `denied` | The visitor declined. Nothing ran. |
-| `error` | Nothing took effect: unknown action, invalid args, malformed block, a handler that threw, or a `read`/`navigate` handler that timed out or was stopped. |
+| `error` | The call did not succeed: unknown action, invalid args or malformed block (the handler never ran), a handler that reported failure by throwing, or a `read`/`navigate` handler that timed out or was stopped. A write handler that cannot tell whether its write happened must throw `ActionError` with `outcome: "unknown"` instead; the widget cannot know that for it. |
 | `unknown` | The action may or may not have taken effect: a handler threw `ActionError(code, message, { outcome: "unknown" })`, or a `mutate`/`destructive` handler timed out or was stopped while running. Not a success and not a failure. |
 
 `error` and `unknown` results carry `error` (text) and, when the handler threw an `ActionError`, its

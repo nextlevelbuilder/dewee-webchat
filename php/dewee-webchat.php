@@ -324,7 +324,8 @@ final class DeweeWebchat
             if ($this->ccp === null || $this->identity === null || !is_string($origin) || preg_match('/[^\x21-\x7e]|[\\\\%]/', $origin) || !is_array($u) || strtolower($u['scheme'] ?? '') !== 'https' || empty($u['host']) || isset($u['user']) || isset($u['pass']) || isset($u['query']) || isset($u['fragment']) || !in_array($u['path'] ?? '', ['', '/'], true)) throw new DeweeConfigError('[dewee-webchat] credentialRequests requires CCP identity and an ASCII HTTPS form origin (use punycode for internationalized domains)');
             $this->credentialFormOrigin = 'https://' . strtolower($u['host']) . (isset($u['port']) && $u['port'] !== 443 ? ':' . $u['port'] : '');
         }
-        if (array_key_exists('humanHandoff', $this->o)) {
+        // optionsFromEnv() leaves the key null when the variable is unset; null means off, like TS undefined.
+        if (isset($this->o['humanHandoff'])) {
             if (!is_bool($this->o['humanHandoff'])) throw new DeweeConfigError('[dewee-webchat] humanHandoff must be true or false');
             if ($this->o['humanHandoff'] && $this->ccp === null) throw new DeweeConfigError('[dewee-webchat] humanHandoff requires the ccp transport');
             $this->humanHandoff = $this->o['humanHandoff'];

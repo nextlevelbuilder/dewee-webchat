@@ -515,25 +515,28 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     it("refuses an unsafe option at startup and reads the environment only as true", () => {
       const url = `http://127.0.0.1:1/api/public/webchat/v1/${INTEGRATION_ID}`;
       const ccpOk = { chatUrl: url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET };
+      const ccpEnv = { DEWEE_CCP_CHAT_URL: url, DEWEE_WEBCHAT_INTEGRATION_ID: INTEGRATION_ID, DEWEE_WEBCHAT_INTEGRATION_SECRET: INTEGRATION_SECRET, DEWEE_WEBCHAT_SECRET: VISITOR_SECRET };
       const out = php(
-        `$r = [];
-$class = new ReflectionClass(DeweeWebchat::class);
-foreach ($in['cases'] as $o) {
+        `$class = new ReflectionClass(DeweeWebchat::class);
+$build = function (array $o) use ($class): string {
   $h = $class->newInstanceWithoutConstructor();
-  $ctor = $class->getConstructor();
-  $ctor->setAccessible(true);
-  try { $ctor->invoke($h, $o); $r[] = 'ok'; } catch (DeweeConfigError $e) { $r[] = 'refused: ' . $e->getMessage(); }
-}
+  try { $class->getConstructor()->invoke($h, $o); return 'ok'; } catch (DeweeConfigError $e) { return 'refused: ' . $e->getMessage(); }
+};
+$r = array_map($build, $in['cases']);
+// A host configured from the environment alone, with and without the variable.
+$fromEnv = [$build(DeweeWebchat::optionsFromEnv($in['ccpEnv'])), $build(DeweeWebchat::optionsFromEnv($in['ccpEnv'] + ['DEWEE_WEBCHAT_HUMAN_HANDOFF' => 'true']))];
 $env = [];
 foreach ($in['env'] as $v) $env[] = DeweeWebchat::optionsFromEnv(['DEWEE_WEBCHAT_HUMAN_HANDOFF' => $v])['humanHandoff'] ?? null;
-echo json_encode(['cases' => $r, 'env' => $env]);`,
+echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env]);`,
         {
           cases: [
             { ccp: ccpOk, secret: VISITOR_SECRET, humanHandoff: true },
             { ccp: ccpOk, secret: VISITOR_SECRET, humanHandoff: "yes" },
             { gatewayUrl: "https://gw.example", token: "t", secret: VISITOR_SECRET, humanHandoff: true },
             { gatewayUrl: "https://gw.example", token: "t", secret: VISITOR_SECRET, humanHandoff: false },
+            { ccp: ccpOk, secret: VISITOR_SECRET, humanHandoff: null },
           ],
+          ccpEnv,
           env: ["true", " true ", "", "1", "false", "yes"],
         },
       );
@@ -541,6 +544,8 @@ echo json_encode(['cases' => $r, 'env' => $env]);`,
       expect(out.cases[1]).toMatch(/refused: .*humanHandoff must be true or false/);
       expect(out.cases[2]).toMatch(/refused: .*humanHandoff requires the ccp transport/);
       expect(out.cases[3]).toBe("ok");
+      expect(out.cases[4]).toBe("ok");
+      expect(out.fromEnv).toEqual(["ok", "ok"]);
       expect(out.env).toEqual([true, true, null, null, null, null]);
     });
 

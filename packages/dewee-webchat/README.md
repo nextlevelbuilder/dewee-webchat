@@ -527,7 +527,7 @@ person**, so a takeover ending or staff going off duty never changes them. `gene
 receipts too.
 
 **Privacy.** The contact value is never logged, stored in the browser, or put in an event. The
-`dewee:work-request` event carries `{code, state, kind}` only. The idempotency key lives in
+`dewee:work-request` event carries `{code, state}` only. The idempotency key lives in
 `sessionStorage`, without contact data.
 
 | Host | Supports |

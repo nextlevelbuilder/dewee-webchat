@@ -618,7 +618,7 @@ The backends rebuild the view from these fields only. It never carries:
   - on open or focus, at most every 10 s;
   - after a create, at 30 s and then twice as late each time, up to 5 min, for 30 min.
 
-  It never polls without the feature. The `dewee:work-request` event carries `{code, state, kind}` only.
+  It never polls without the feature. The `dewee:work-request` event carries `{code, state}` only.
 
 ## Install check
 

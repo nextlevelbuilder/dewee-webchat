@@ -36,7 +36,7 @@ export interface WorkRequestHost {
   /** A request for a person found nobody on duty (the handoff status says so). */
   unattended(): boolean;
   /** Tells the page a receipt's code and state, never anything the visitor typed. */
-  emit(name: string, detail: { code: string; state: string; kind: string }): void;
+  emit(name: string, detail: { code: string; state: string }): void;
   /** Whether the widget is in the page and its tab visible: no timer runs otherwise. */
   live(): boolean;
 }
@@ -73,6 +73,10 @@ export class WorkRequests {
   private followTimer: ReturnType<typeof setTimeout> | undefined;
   private followUntil = 0;
   private followDelay = FOLLOW_FIRST_MS;
+  /** What each receipt element shows, so an unchanged one is not redrawn (and not read out again). */
+  private drawn = new WeakMap<HTMLElement, string>();
+  /** Bumped when a request is recorded: a full list read that started before it may not know it yet. */
+  private revision = 0;
 
   constructor(private host: WorkRequestHost) {
     host.entryButton.addEventListener("click", () => this.openForm());
@@ -136,9 +140,10 @@ export class WorkRequests {
     const run = (async () => {
       this.lastRead = Date.now();
       try {
+        const revision = this.revision;
         const views = await this.host.client().workRequestList({ limit: LIST_LIMIT });
         if (generation !== this.generation) return;
-        this.apply(views, true);
+        this.apply(views, revision === this.revision);
         await this.reconcileDrafts(generation);
       } catch {
         /* receipts are read again on the next visit */
@@ -298,10 +303,11 @@ export class WorkRequests {
     this.closeForm(true);
     this.values = null; // the request is recorded: what the visitor typed is not kept
     const fresh = !this.receipts.has(view.code);
+    this.revision++;
     this.receipts.set(view.code, view);
     this.renderReceipts();
     this.host.announce(this.host.strings().workRequests.recorded(view.code));
-    if (fresh) this.host.emit("dewee:work-request", { code: view.code, state: view.state, kind: view.kind });
+    if (fresh) this.host.emit("dewee:work-request", { code: view.code, state: view.state });
     this.follow();
   }
 
@@ -334,7 +340,7 @@ export class WorkRequests {
       this.receipts.set(view.code, view);
       if (before && before.state !== view.state) {
         this.host.announce(s.changed(view.code, s.states[view.state]));
-        this.host.emit("dewee:work-request", { code: view.code, state: view.state, kind: view.kind });
+        this.host.emit("dewee:work-request", { code: view.code, state: view.state });
       }
     }
     if (all && views.length < LIST_LIMIT) {
@@ -343,7 +349,10 @@ export class WorkRequests {
       for (const code of [...this.receipts.keys()]) if (!listed.has(code)) this.receipts.delete(code);
     }
     this.renderReceipts();
-    if (this.followUntil && [...this.receipts.values()].every((r) => r.state === "resolved" || r.state === "cancelled")) this.stopFollowing();
+    if (this.followUntil && [...this.receipts.values()].every((r) => r.state === "resolved" || r.state === "cancelled")) {
+      this.followUntil = 0;
+      this.stopFollowing();
+    }
   }
 
   private follow(): void {
@@ -402,8 +411,8 @@ export class WorkRequests {
     const title = this.kinds.find((k) => k.kind === view.kind)?.title || view.kind;
     const due = formatDue(view.respondDueAt, view.dueTimezone, this.host.locale(), s);
     const signature = JSON.stringify([view, title, due, s.receipts]);
-    if (el.dataset.signature === signature) return;
-    el.dataset.signature = signature;
+    if (this.drawn.get(el) === signature) return;
+    this.drawn.set(el, signature);
     el.className = "wr-receipt";
     el.dataset.code = view.code;
     el.dataset.state = view.state;

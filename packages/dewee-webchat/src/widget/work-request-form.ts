@@ -137,6 +137,10 @@ export class CallbackForm {
   setPhase(phase: CallbackFormPhase, message = ""): void {
     this.phase = phase;
     const locked = phase !== "idle" && phase !== "failed";
+    // A field about to be disabled drops the focus: it moves to the submit button, which stays focusable.
+    const root = this.root.getRootNode();
+    const active = root instanceof ShadowRoot && document.activeElement === root.host ? root.activeElement : null;
+    if (locked && active && this.root.contains(active) && (active.matches("input, textarea"))) this.q<HTMLButtonElement>(".wr-submit").focus();
     for (const el of this.root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea")) el.disabled = locked;
     const submit = this.q<HTMLButtonElement>(".wr-submit");
     const check = this.q<HTMLButtonElement>(".wr-check");
@@ -154,8 +158,11 @@ export class CallbackForm {
     status.dataset.phase = phase;
   }
 
+  /** Focus into the form: the chosen method, or the first control that can take it while the fields are locked. */
   focusFirst(): void {
-    (this.root.querySelector<HTMLInputElement>("input[type=radio]:checked") ?? this.q<HTMLElement>(".wr-contact")).focus();
+    const checked = this.root.querySelector<HTMLInputElement>("input[type=radio]:checked");
+    const first = checked && !checked.disabled ? checked : [...this.root.querySelectorAll<HTMLElement>("input, textarea, button")].find((el) => !(el as HTMLButtonElement).disabled && !el.hidden);
+    first?.focus();
   }
 
   private syncMethod(): void {

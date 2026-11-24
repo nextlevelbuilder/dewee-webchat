@@ -298,7 +298,7 @@ describe("<dewee-chat> callback request", () => {
       code, kind: "Call me back", state: "Received", due: formatDue(DUE, "Asia/Ho_Chi_Minh", "en", locales.en.workRequests), contact: "Contact: ***678", note: null,
     }]);
     expect(announcer(el)).toBe(`Request received. Your code is ${code}.`);
-    expect(events.filter((e) => e.name === "dewee:work-request")).toEqual([{ name: "dewee:work-request", detail: { code, state: "received", kind: "callback" } }]);
+    expect(events.filter((e) => e.name === "dewee:work-request")).toEqual([{ name: "dewee:work-request", detail: { code, state: "received" } }]);
     // The recorded intent's key is gone: the next request is a new intent with a new key.
     expect(Object.keys(sessionStorage).filter((k) => k.startsWith("dewee-webchat:wr-draft:"))).toEqual([]);
     await fill(el, { purpose: "Another question" });
@@ -364,6 +364,8 @@ describe("<dewee-chat> callback request", () => {
     d.querySelector<HTMLButtonElement>(".wr-cancel")!.click();
     entry(el).click();
     expect(dialog(el)!.querySelector(".wr-submit")!.textContent).toBe("Send again");
+    // The fields are locked: the focus still goes into the dialog, on the first control that can take it.
+    expect(dialog(el)!.contains(el.shadowRoot!.activeElement)).toBe(true);
     submit(el); // send again
     await settle();
     expect(b.creates()).toHaveLength(2);
@@ -509,7 +511,7 @@ describe("<dewee-chat> receipts", () => {
     expect(callbackAfter).toBe(oldest);
     expect(receiptText(callbackAfter)).toMatchObject({ state: "In progress", note: "Note: We will call after 2 pm" });
     expect(announcer(el)).toBe(`Request ${callback}: In progress`);
-    expect(events.filter((e) => e.name === "dewee:work-request").map((e) => e.detail)).toEqual([{ code: callback, state: "in_progress", kind: "callback" }]);
+    expect(events.filter((e) => e.name === "dewee:work-request").map((e) => e.detail)).toEqual([{ code: callback, state: "in_progress" }]);
   });
 
   it("never words a request that is not finished as done", () => {

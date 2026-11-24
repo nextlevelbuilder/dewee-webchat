@@ -13,7 +13,7 @@ const props = Object.fromEntries(keys.map((k) => [k, { type: null as unknown as 
   [K in (typeof keys)[number]]: { type: PropType<any>; default: undefined };
 };
 
-const EVENTS = ["ready", "send", "reply", "error", "open", "close", "action", "context-ready", "context-error"] as const;
+const EVENTS = ["ready", "status", "send", "reply", "error", "open", "close", "action", "context-ready", "context-error"] as const;
 
 export const DeweeChat = defineComponent({
   name: "DeweeChat",

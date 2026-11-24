@@ -1,11 +1,13 @@
 // React wrapper. Usage: <DeweeChat endpoint="/api/dewee" showReasoning={false} actions={[...]} />
 import { createElement, forwardRef, useEffect, useImperativeHandle, useRef, type CSSProperties } from "react";
-import { defineDeweeChat, type ActionEventDetail, type DeweeChatConfig, type DeweeChatElement } from "./index";
+import { defineDeweeChat, type ActionEventDetail, type DeweeChatConfig, type DeweeChatElement, type WidgetDiagnostics } from "./index";
 
 export interface DeweeChatProps extends Partial<DeweeChatConfig> {
   className?: string;
   style?: CSSProperties;
   onReady?: (e: CustomEvent) => void;
+  /** Connection steps changed (`dewee:status`, detail: WidgetDiagnostics). */
+  onStatus?: (e: CustomEvent<WidgetDiagnostics>) => void;
   onSend?: (e: CustomEvent) => void;
   onReply?: (e: CustomEvent) => void;
   onError?: (e: CustomEvent) => void;
@@ -19,6 +21,7 @@ export interface DeweeChatProps extends Partial<DeweeChatConfig> {
 
 const EVENTS = {
   onReady: "dewee:ready",
+  onStatus: "dewee:status",
   onSend: "dewee:send",
   onReply: "dewee:reply",
   onError: "dewee:error",
@@ -32,8 +35,8 @@ type EventProp = keyof typeof EVENTS;
 
 export const DeweeChat = forwardRef<DeweeChatElement | null, DeweeChatProps>(function DeweeChat(props, ref) {
   const el = useRef<DeweeChatElement | null>(null);
-  const { className, style, onReady, onSend, onReply, onError, onOpen, onClose, onAction, onContextReady, onContextError, actions, confirm, getPageContext, headers, fetch, domActionsRoot, contextProvider, imageOrigins, ...config } = props;
-  const handlers: Partial<Record<EventProp, (e: CustomEvent<any>) => void>> = { onReady, onSend, onReply, onError, onOpen, onClose, onAction, onContextReady, onContextError };
+  const { className, style, onReady, onStatus, onSend, onReply, onError, onOpen, onClose, onAction, onContextReady, onContextError, actions, confirm, getPageContext, headers, fetch, domActionsRoot, contextProvider, imageOrigins, ...config } = props;
+  const handlers: Partial<Record<EventProp, (e: CustomEvent<any>) => void>> = { onReady, onStatus, onSend, onReply, onError, onOpen, onClose, onAction, onContextReady, onContextError };
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
   useImperativeHandle(ref, () => el.current!, []);

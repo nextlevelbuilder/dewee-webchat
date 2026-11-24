@@ -293,16 +293,37 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
 
   const base = (ctx: VisitorContext): CcpRequest => ({ visitorOrigin: ctx.visitorOrigin, visitorIp: ctx.visitorIp, requestId: ctx.requestId });
 
-  /** `POST session`: creates an edge session for the visitor, or refreshes `previous` (the visitor is kept). */
-  async function openEdge(ctx: VisitorContext, visitorId: string, previous?: string): Promise<EdgeSession> {
-    const data = await client.json<Record<string, unknown>>("session", { ...base(ctx), body: previous ? {} : { visitor_id: visitorId }, session: previous });
+  /**
+   * `POST session`: creates an edge session for the visitor, or refreshes `previous` (the visitor is
+   * kept). `check` (an install check nonce) is added to the body only when given; `check` in the result
+   * says whether CCP accepted it.
+   */
+  async function openEdge(ctx: VisitorContext, visitorId: string, previous?: string, check?: string): Promise<{ edge: EdgeSession; check: boolean }> {
+    const body = { ...(previous ? {} : { visitor_id: visitorId }), ...(check ? { check } : {}) };
+    const data = await client.json<Record<string, unknown>>("session", { ...base(ctx), body, session: previous });
     const token = data.session;
     if (typeof token !== "string" || !EDGE_TOKEN_RE.test(token)) throw new CcpError(200, "ccp_bad_response", "CCP session: no edge session token");
     if (data.visitor_id !== undefined && data.visitor_id !== visitorId) throw new CcpError(200, "ccp_bad_response", "CCP session: visitor mismatch");
     // Lifetime from receipt on this server's clock; the absolute expiry is not trusted across clocks.
     const seconds = Number(data.expires_in);
     const lifetime = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, EDGE_REFRESH_WINDOW_MS) : 3600_000;
-    return remember(visitorId, { token, expiresAt: Date.now() + lifetime });
+    // The flag stays beside the edge session: it is never cached or sealed in a visitor token.
+    return { edge: remember(visitorId, { token, expiresAt: Date.now() + lifetime }), check: !!check && data.check === true };
+  }
+
+  async function resolveEdge(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, force: "refresh" | "create" | undefined, minRemainingMs: number, check?: string): Promise<{ edge: EdgeSession; check: boolean }> {
+    const now = Date.now();
+    const cached = edges.get(visitorId);
+    const known = [cached, sealed].filter((e): e is EdgeSession => !!e).sort((a, b) => b.expiresAt - a.expiresAt)[0];
+    if (!force && known && known.expiresAt - now > minRemainingMs) return { edge: known, check: false };
+    if (force !== "create" && known && now - known.expiresAt < EDGE_REFRESH_WINDOW_MS - EDGE_MARGIN_MS) {
+      try {
+        return await openEdge(ctx, visitorId, known.token, check);
+      } catch (e) {
+        if (!(e instanceof CcpError && (e.code === "ingress_session_invalid" || e.code === "ingress_session_expired"))) throw e;
+      }
+    }
+    return openEdge(ctx, visitorId, undefined, check);
   }
 
   /**
@@ -310,18 +331,16 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
    * than `minRemainingMs` left is refreshed (while CCP still accepts it) instead of used.
    */
   async function edgeFor(ctx: VisitorContext, visitorId: string, sealed?: EdgeSession, force?: "refresh" | "create", minRemainingMs = EDGE_MARGIN_MS): Promise<EdgeSession> {
-    const now = Date.now();
-    const cached = edges.get(visitorId);
-    const known = [cached, sealed].filter((e): e is EdgeSession => !!e).sort((a, b) => b.expiresAt - a.expiresAt)[0];
-    if (!force && known && known.expiresAt - now > minRemainingMs) return known;
-    if (force !== "create" && known && now - known.expiresAt < EDGE_REFRESH_WINDOW_MS - EDGE_MARGIN_MS) {
-      try {
-        return await openEdge(ctx, visitorId, known.token);
-      } catch (e) {
-        if (!(e instanceof CcpError && (e.code === "ingress_session_invalid" || e.code === "ingress_session_expired"))) throw e;
-      }
-    }
-    return openEdge(ctx, visitorId);
+    return (await resolveEdge(ctx, visitorId, sealed, force, minRemainingMs)).edge;
+  }
+
+  /**
+   * {@link edgeFor} for a `/session` that carries an install check nonce: CCP is always asked (the known
+   * edge session refreshed while it can be, else a new one), so the nonce reaches the ingress on this
+   * page load even when a fresh edge session is at hand. `check` says whether CCP accepted it.
+   */
+  function checkedEdgeFor(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, check: string): Promise<{ edge: EdgeSession; check: boolean }> {
+    return resolveEdge(ctx, visitorId, sealed, "refresh", 0, check);
   }
 
   /**
@@ -349,13 +368,17 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
   return {
     config: getConfig,
     edgeFor,
+    checkedEdgeFor,
 
-    /** Starts a turn. Resolves once CCP accepted it (2xx, SSE); refusals reject with {@link CcpError}. */
+    /**
+     * Starts a turn. Resolves once CCP accepted it (2xx, SSE); refusals reject with {@link CcpError}.
+     * `check` (the install check nonce) is added to the body only when the widget sent one.
+     */
     async startChat(
       ctx: VisitorContext,
       visitorId: string,
       sealed: EdgeSession | undefined,
-      input: { message: string; conversationId: string; agent?: string; identitySession?: string; pageContext?: unknown; credentialRequestId?: string; signal: AbortSignal },
+      input: { message: string; conversationId: string; agent?: string; identitySession?: string; pageContext?: unknown; credentialRequestId?: string; check?: string; signal: AbortSignal },
     ): Promise<Response> {
       const body = {
         message: input.message,
@@ -364,6 +387,7 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
         ...(input.identitySession ? { identity_session: input.identitySession } : {}),
         ...(input.pageContext !== undefined ? { page_context: input.pageContext } : {}),
         ...(input.credentialRequestId ? { credential_request_id: input.credentialRequestId } : {}),
+        ...(input.check ? { check: input.check } : {}),
       };
       return withEdge(ctx, visitorId, sealed, (edge) => client.send("chat", { ...base(ctx), body, session: edge.token, accept: "text/event-stream", signal: input.signal, credentialRequests: credentialRequests && !!input.identitySession, humanHandoff }));
     },

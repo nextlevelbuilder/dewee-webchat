@@ -7,6 +7,7 @@
 import {
   HEADER_GATEWAY_TOKEN,
   HEADER_GATEWAY_URL,
+  INSTALL_CHECK_RE,
   VERSION,
   isAdmissionErrorCode,
   isIdentityErrorCode,
@@ -287,6 +288,16 @@ const ANON_REUSE_MS = 86_400_000;
  * identity session only with at least this long left, so a refresh near the end exchanges instead.
  */
 const VERIFIED_REUSE_MIN_MS = 120_000;
+
+/**
+ * The install check nonce of a `/session` or `/chat` body: undefined when the body has none, null when
+ * it is not one (the request is then refused). Only the ccp transport forwards it.
+ */
+function installCheckOf(body: unknown): string | undefined | null {
+  const check = body && typeof body === "object" ? (body as { check?: unknown }).check : undefined;
+  if (check === undefined) return undefined;
+  return typeof check === "string" && INSTALL_CHECK_RE.test(check) ? check : null;
+}
 
 /** Validates the identity options once, at startup, and returns the agent sessions are bound to. */
 function checkIdentityOptions(o: DeweeHandlerOptions, staticAgents: AgentInfo[], transport: DeweeTransport): string {
@@ -768,7 +779,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
    * reuse hint the widget sent back (CCP only): its identity session and edge session are reused when
    * they belong to this user. With CCP the answer carries a new reuse hint (`reuseHint`) for the tab.
    */
-  async function issueIdentitySession(req: Request, subject: string, hint: VisitorClaims | null = null): Promise<Response> {
+  async function issueIdentitySession(req: Request, subject: string, hint: VisitorClaims | null = null, check?: string): Promise<Response> {
     let agent: string;
     try {
       agent = await boundAgent();
@@ -818,9 +829,11 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     const expiresAt = Math.min(s.deadline, now + o.sessionTtlMs);
     const sub = await subjectDigest(secret!, subject);
     let edge: EdgeSession | undefined;
+    let checked = false;
     if (ccp) {
       try {
-        edge = await ccp.edgeFor(visitorContext(req), s.visitorId, sealed, undefined, EDGE_RESEAL_MS);
+        if (check) ({ edge, check: checked } = await ccp.checkedEdgeFor(visitorContext(req), s.visitorId, sealed, check));
+        else edge = await ccp.edgeFor(visitorContext(req), s.visitorId, sealed, undefined, EDGE_RESEAL_MS);
       } catch (e) {
         return ccpFail(req, e, "session");
       }
@@ -831,6 +844,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     const body: SessionResponse = { visitorId: s.visitorId, token, expiresAt: times.expiresAt, verified: true, expiresIn: times.expiresIn };
     // CCP: what a later page load needs to rebuild this session, in a token no route accepts as a bearer.
     if (ccp) body.reuseHint = await signReuseHint(secret!, claims);
+    if (checked) body.check = true;
     return json(req, body);
   }
 
@@ -926,12 +940,14 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       // A returning visitor refreshes its own session: limited per visitor, so visitors behind one
       // address (an office, a carrier NAT) do not use up each other's budget. New visitors are per IP.
       const body: any = await req.json().catch(() => ({}));
+      if (installCheckOf(body) === null) return fail(req, 400, "Invalid request", "bad_request");
       const previous = await anonymousPrevious(body);
       if (limiter && !(await limiter(previous ? `visitor:${previous.v}` : ip, "session"))) return fail(req, 429, "Too many sessions, slow down", "rate_limited");
       return issueAnonymousSession(req, body, ip, previous);
     }
     if (limiter && !(await limiter(ip, "session"))) return fail(req, 429, "Too many sessions, slow down", "rate_limited");
     const body: any = await req.json().catch(() => ({}));
+    if (installCheckOf(body) === null) return fail(req, 400, "Invalid request", "bad_request");
     return issueAnonymousSession(req, body, ip);
   }
 
@@ -953,14 +969,18 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     // CCP admits the visitor (its own quotas) before a token is issued. A stale sealed edge session
     // (a host without shared memory never saw it refreshed) is refreshed for the same visitor here, so
     // the token handed back carries a fresh one.
+    // An install check nonce always reaches CCP, even with a fresh edge session at hand.
+    const check = installCheckOf(body);
     let edge: EdgeSession;
+    let checked = false;
     try {
-      edge = await ccp.edgeFor(visitorContext(req), visitorId, sealedEdge(previous), undefined, EDGE_RESEAL_MS);
+      if (check) ({ edge, check: checked } = await ccp.checkedEdgeFor(visitorContext(req), visitorId, sealedEdge(previous), check));
+      else edge = await ccp.edgeFor(visitorContext(req), visitorId, sealedEdge(previous), undefined, EDGE_RESEAL_MS);
     } catch (e) {
       return ccpFail(req, e, "session");
     }
     const token = await signVisitorToken(secret!, { v: visitorId, exp: expiresAt, es: edge.token, ese: edge.expiresAt });
-    const body2: SessionResponse = { visitorId, token, ...ccpSessionTimes(expiresAt, edge) };
+    const body2: SessionResponse = { visitorId, token, ...ccpSessionTimes(expiresAt, edge), ...(checked ? { check: true as const } : {}) };
     return json(req, body2);
   }
 
@@ -973,6 +993,8 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   async function handleIdentitySession(req: Request): Promise<Response> {
     const ip = clientIp(req);
     const body: any = await req.json().catch(() => ({}));
+    const check = installCheckOf(body);
+    if (check === null) return fail(req, 400, "Invalid request", "bad_request");
     // Fail closed: a signed-in user gets an identity session or no session at all. A login that could
     // not be read is not "signed out", so it never falls back to anonymous.
     const throttled = await preauthRefusal(req);
@@ -993,11 +1015,12 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (!(await turnstilePassed(body, ip))) return fail(req, 403, "Verification failed", "turnstile_failed");
       // CCP: the tab's reuse hint, checked against this user before anything in it is used.
       const hint = ccp && typeof body?.reuseHint === "string" ? await verifyReuseHint(secret!, body.reuseHint) : null;
-      return issueIdentitySession(req, user.subject, hint);
+      return issueIdentitySession(req, user.subject, hint, ccp ? check : undefined);
     }
     if (idn!.required) return identityFail(req, "IDENTITY_REQUIRED");
     const previous = await anonymousPrevious(body);
-    if (previous && previous.exp - Date.now() > ANON_REUSE_MS) {
+    // CCP with an install check: never handed back as is, so the nonce reaches CCP (below).
+    if (previous && previous.exp - Date.now() > ANON_REUSE_MS && !(ccp && check)) {
       if (!ccp) {
         const reused: SessionResponse = { visitorId: previous.v, token: body.token, expiresAt: previous.exp, expiresIn: Math.max(0, previous.exp - Date.now()) };
         return json(req, reused);
@@ -1031,6 +1054,8 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     if ("error" in input) return fail(req, input.error === "too_large" ? 413 : 400, input.error === "too_large" ? "Request is too large" : "Invalid request", input.error === "too_large" ? "too_long" : "bad_request");
     if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return fail(req, 400, "Invalid request", "bad_request");
     const body: any = input.body;
+    const check = installCheckOf(body);
+    if (check === null) return fail(req, 400, "Invalid request", "bad_request");
     const message = typeof body?.message === "string" ? body.message.trim() : "";
     if (/MEM-[A-Z2-7]{16}/i.test(JSON.stringify(body))) return fail(req, 400, "Use the member linking form for your verification code", "member_proof_in_message");
     const resumeId = body?.credentialRequestId;
@@ -1068,7 +1093,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (typeof body.page_context === "object" && Number.isInteger(body.page_context.version) && body.page_context.version !== 1) return fail(req, 400, "Page context is not supported", "page_context_unsupported");
       if (!validPageContext(body.page_context)) return fail(req, 400, "Invalid page context", "page_context_invalid");
     }
-    if (ccp) return ccpChat(req, claims, { message: pageBlock + message, rawMessage: message, conversationId, agent, actionsHash, pageContext: body?.page_context, credentialRequestId: resumeId });
+    if (ccp) return ccpChat(req, claims, { message: pageBlock + message, rawMessage: message, conversationId, agent, actionsHash, pageContext: body?.page_context, credentialRequestId: resumeId, check });
     if (!creds) return fail(req, 500, "Gateway is not configured", "not_configured"); // narrowing only: checked above
 
     // A signed-in user's session is checked before streaming starts, so an expired or revoked
@@ -1153,7 +1178,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   async function ccpChat(
     req: Request,
     claims: VisitorClaims,
-    turn: { message: string; rawMessage: string; conversationId: string; agent: string; actionsHash?: string; pageContext?: unknown; credentialRequestId?: string },
+    turn: { message: string; rawMessage: string; conversationId: string; agent: string; actionsHash?: string; pageContext?: unknown; credentialRequestId?: string; check?: string },
   ): Promise<Response> {
     const ctx = visitorContext(req);
     const visitorId = claims.v;
@@ -1194,6 +1219,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
         identitySession: claims.ids,
         pageContext: turn.pageContext ?? undefined,
         credentialRequestId: turn.credentialRequestId,
+        check: turn.check,
         signal: abort.signal,
       });
       held = await ccp!.heldControl(upstream);

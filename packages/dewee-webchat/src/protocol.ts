@@ -146,7 +146,18 @@ export interface SessionResponse {
    * skewed browser clock does not matter.
    */
   expiresIn?: number;
+  /**
+   * ccp transport only: true when the `/session` request carried an install check nonce (`check`) and
+   * the control plane accepted it for this integration and origin. Absent otherwise.
+   */
+  check?: true;
 }
+
+/**
+ * The install check nonce the control plane puts in a page URL (`?dewee_check=…`) and the widget sends
+ * as `check` on `/session` and on its one test message. Not a secret and grants nothing.
+ */
+export const INSTALL_CHECK_RE = /^[A-Za-z0-9_-]{22,64}$/;
 
 /** Error codes of `POST {basePath}/link` besides the identity codes. */
 export const LINK_ERROR_CODES = ["idempotency_key_reused", "link_in_progress", "linking_unavailable"] as const;
@@ -229,6 +240,8 @@ export interface ChatRequestBody {
   /** Ephemeral, untrusted content for this turn; distinct from the legacy page-action context. */
   page_context?: import("./widget/page-context").PageContextAttachment;
   credentialRequestId?: string;
+  /** The install check nonce, on the one test message of a page load whose `/session` answer said `check: true`. */
+  check?: string;
 }
 
 export const HEADER_GATEWAY_URL = "x-dewee-gateway-url";

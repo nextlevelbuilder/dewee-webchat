@@ -84,6 +84,8 @@ final class DeweeWebchat
     private const RATE_LIMITS = ['chat' => [20, 60_000], 'session' => [10, 600_000], 'preauth' => [120, 60_000], 'verified' => [30, 600_000], 'link' => [5, 600_000]];
     /** Conversation and visitor ids as the CCP ingress accepts them. */
     private const CCP_ID_RE = '/^[A-Za-z0-9_-]{8,64}$/';
+    /** The control plane's install check nonce (`check` on `/session` and `/chat`). Not a secret, grants nothing. */
+    private const INSTALL_CHECK_RE = '/^[A-Za-z0-9_-]{22,64}$/D';
     private const EDGE_TOKEN_RE = '/^dws1\.[A-Za-z0-9_.-]{1,1019}$/';
     private const EDGE_SEAL_INFO = 'dewee-webchat:edge-session:aes-256-gcm:v1';
     private const IDENTITY_SEAL_INFO = 'dewee-webchat:identity-session:aes-256-gcm:v1';
@@ -743,9 +745,23 @@ final class DeweeWebchat
         $this->json(self::withoutNulls($body));
     }
 
+    /**
+     * The install check nonce of a `/session` or `/chat` body: null when the body has none, false when it
+     * is not one (the request is then refused). Only the ccp transport forwards it.
+     *
+     * @param array<mixed> $body
+     */
+    private static function installCheckOf(array $body): string|false|null
+    {
+        if (!array_key_exists('check', $body)) return null;
+        return is_string($body['check']) && preg_match(self::INSTALL_CHECK_RE, $body['check']) === 1 ? $body['check'] : false;
+    }
+
     private function handleSession(): void
     {
         $ip = $this->clientIp();
+        $check = self::installCheckOf($this->readJsonBody() ?? []);
+        if ($check === false) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
         if ($this->identity !== null) {
             if (!$this->rateLimit($ip, 'preauth')) { $this->fail(429, 'Too many requests, slow down', 'rate_limited'); return; }
             try { $user = ($this->identity['authenticate'])(); }
@@ -753,13 +769,13 @@ final class DeweeWebchat
             if ($user !== null) {
                 if (!is_array($user) || !is_string($user['subject'] ?? null) || trim($user['subject']) === '') { $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured'); return; }
                 if (!$this->rateLimit('subject:' . $user['subject'], 'verified')) { $this->fail(429, 'Too many sessions, slow down', 'rate_limited'); return; }
-                $this->handleIdentitySession($user['subject'], $ip);
+                $this->handleIdentitySession($user['subject'], $ip, $check);
                 return;
             }
             if (!empty($this->identity['required'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
         }
         if ($this->ccp !== null) {
-            $this->handleCcpSession($ip);
+            $this->handleCcpSession($ip, $check);
             return;
         }
         if (!$this->rateLimit($ip, 'session')) {
@@ -793,7 +809,7 @@ final class DeweeWebchat
      * the same visitor, and the widget is told the edge session's end (`expiresAt`, `expiresIn`) so it
      * comes back for a new token before the next request would have to refresh or create one.
      */
-    private function handleCcpSession(string $ip): void
+    private function handleCcpSession(string $ip, ?string $check = null): void
     {
         $body = $this->readJsonBody() ?? [];
         $previous = isset($body['token']) && is_string($body['token']) ? self::verifyVisitorToken($this->secret, $body['token']) : null;
@@ -812,9 +828,10 @@ final class DeweeWebchat
         $visitorId = $previous['v'] ?? self::randomId(16);
         $now = self::nowMs();
         $expiresAt = $now + (int) $this->o['sessionTtlMs'];
-        // CCP admits the visitor (its own quotas) before a token is issued.
+        // CCP admits the visitor (its own quotas) before a token is issued. An install check nonce always
+        // reaches CCP, even with a fresh edge session at hand.
         try {
-            $edge = $this->edgeFor($this->visitorContext(), $visitorId, self::sealedEdge($previous), null, self::EDGE_RESEAL_MS);
+            $edge = $this->edgeFor($this->visitorContext(), $visitorId, self::sealedEdge($previous), null, self::EDGE_RESEAL_MS, $check);
         } catch (DeweeCcpError $e) {
             $this->ccpFail($e, 'session');
             return;
@@ -826,7 +843,7 @@ final class DeweeWebchat
             'expiresAt' => $refreshAt,
             // Counted from now, after CCP answered: the edge session's lifetime starts at its receipt.
             'expiresIn' => max(0, $refreshAt - self::nowMs()),
-        ]);
+        ] + (($edge['check'] ?? false) === true ? ['check' => true] : []));
     }
 
     private function identityFail(string $code, mixed $remediation = null): void
@@ -836,7 +853,7 @@ final class DeweeWebchat
     }
 
     /** A signed-in host user gets an identity session or an error, never an anonymous fallback. */
-    private function handleIdentitySession(string $subject, string $ip): void
+    private function handleIdentitySession(string $subject, string $ip, ?string $check = null): void
     {
         $body = $this->readJsonBody() ?? [];
         if (!empty($this->o['turnstile'])) {
@@ -849,6 +866,7 @@ final class DeweeWebchat
         catch (Throwable) { $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured'); return; }
         $ttl = $this->identity['sessionTtlSeconds'] ?? 3600;
         $edge = null;
+        $checked = false;
         try {
             if ($this->ccp !== null) {
                 $cfg = $this->ccpConfig();
@@ -858,7 +876,9 @@ final class DeweeWebchat
                 $digest = self::b64url(hash_hmac('sha256', 'dewee-webchat:subject:' . $subject, $this->secret, true));
                 $hint = is_string($body['reuseHint'] ?? null) ? self::verifyVisitorToken($this->secret, $body['reuseHint'], true, 'reuse') : null;
                 $reuse = is_array($hint) && isset($hint['ids'], $hint['ida'], $hint['sub']) && $hint['v'] === $visitor && $hint['ida'] === $agent && hash_equals($hint['sub'], $digest) && $hint['exp'] - self::nowMs() > 120000;
-                $edge = $this->edgeFor($ctx, $visitor, $reuse ? self::sealedEdge($hint) : null, null, self::EDGE_RESEAL_MS);
+                $edge = $this->edgeFor($ctx, $visitor, $reuse ? self::sealedEdge($hint) : null, null, self::EDGE_RESEAL_MS, $check);
+                // Read now: the exchange below may replace the edge session.
+                $checked = ($edge['check'] ?? false) === true;
                 if ($reuse) {
                     $session = $hint['ids'];
                     $principal = 'reused';
@@ -904,6 +924,7 @@ final class DeweeWebchat
             $refresh = $edge !== null ? min($expiresAt, $edge['expiresAt']) : $expiresAt;
             $answer = ['visitorId' => $visitor, 'token' => self::signVisitorToken($this->secret, $claims), 'expiresAt' => $refresh, 'expiresIn' => max(0, $refresh - self::nowMs()), 'verified' => true];
             if ($edge !== null) $answer['reuseHint'] = self::signVisitorToken($this->secret, $claims, 'reuse');
+            if ($checked) $answer['check'] = true;
             $this->json($answer);
         } catch (DeweeCcpError $e) {
             if (isset(self::IDENTITY_ERRORS[$e->ccpCode]) && $e->remediation !== null && $e->remediation['audience'] !== 'end_user') $this->fail(500, 'Signed-in chat is misconfigured on this server', 'identity_misconfigured');
@@ -1140,6 +1161,8 @@ final class DeweeWebchat
         $rawBody = is_string($raw) ? json_decode($raw) : null;
         $body = is_string($raw) ? json_decode($raw, true) : null;
         if (!$rawBody instanceof stdClass || !is_array($body)) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
+        $check = self::installCheckOf($body);
+        if ($check === false) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
         $message = is_string($body['message'] ?? null) ? self::jsTrim($body['message']) : '';
         if (preg_match('/MEM-[A-Z2-7]{16}/i', (string) json_encode($body))) { $this->fail(400, 'Use the member linking form for your verification code', 'member_proof_in_message'); return; }
         $resume = $body['credentialRequestId'] ?? null;
@@ -1198,7 +1221,7 @@ final class DeweeWebchat
             if (!self::validPageContext($context)) { $this->fail(400, 'Invalid page context', 'page_context_invalid'); return; }
         }
         if ($this->ccp !== null) {
-            $this->ccpChat($claims, $pageBlock . $message, $message, $conversationId, $agent, $actionsHash, $context, $resume);
+            $this->ccpChat($claims, $pageBlock . $message, $message, $conversationId, $agent, $actionsHash, $context, $resume, $check);
             return;
         }
         if ($creds === null) {
@@ -1405,7 +1428,7 @@ final class DeweeWebchat
      *
      * @param array{v: string, es?: string, ese?: int|float} $claims
      */
-    private function ccpChat(array $claims, string $message, string $rawMessage, string $conversationId, string $agent, ?string $actionsHash, mixed $context, ?string $resume = null): void
+    private function ccpChat(array $claims, string $message, string $rawMessage, string $conversationId, string $agent, ?string $actionsHash, mixed $context, ?string $resume = null, ?string $check = null): void
     {
         $visitorId = $claims['v'];
         $ctx = $this->visitorContext();
@@ -1424,7 +1447,7 @@ final class DeweeWebchat
             $this->fail(413, "Message exceeds {$cfg['maxMessageChars']} characters", 'too_long');
             return;
         }
-        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []) + ($context !== null ? ['page_context' => $context] : []) + ($resume !== null ? ['credential_request_id' => $resume] : []);
+        $body = ['message' => $message, 'conversation_id' => $conversationId] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []) + ($context !== null ? ['page_context' => $context] : []) + ($resume !== null ? ['credential_request_id' => $resume] : []) + ($check !== null ? ['check' => $check] : []);
         $edge = null;
         try {
             $fp = $this->withEdge($ctx, $visitorId, self::sealedEdge($claims), function (array $e) use ($ctx, $body, $claims, &$edge) {
@@ -1937,13 +1960,16 @@ final class DeweeWebchat
 
     /**
      * `POST session`: creates an edge session for the visitor, or refreshes $previous (same visitor).
+     * $check (an install check nonce) is added to the body only when given; the result then carries
+     * `check: true` when CCP accepted it. The flag is never sealed in a visitor token.
      *
      * @param array<string, mixed> $ctx
-     * @return array{token: string, expiresAt: int}
+     * @return array{token: string, expiresAt: int, check?: true}
      */
-    private function openEdge(array $ctx, string $visitorId, ?string $previous): array
+    private function openEdge(array $ctx, string $visitorId, ?string $previous, ?string $check = null): array
     {
-        $data = $this->ccp->json('session', $ctx + ($previous !== null ? ['body' => [], 'session' => $previous] : ['body' => ['visitor_id' => $visitorId]]));
+        $extra = $check !== null ? ['check' => $check] : [];
+        $data = $this->ccp->json('session', $ctx + ($previous !== null ? ['body' => $extra, 'session' => $previous] : ['body' => ['visitor_id' => $visitorId] + $extra]));
         $token = $data['session'] ?? null;
         if (!is_string($token) || !preg_match(self::EDGE_TOKEN_RE, $token)) {
             throw new DeweeCcpError(200, 'ccp_bad_response', 'CCP session: no edge session token');
@@ -1954,33 +1980,35 @@ final class DeweeWebchat
         // Lifetime from receipt on this server's clock; the absolute expiry is not trusted across clocks.
         $seconds = $data['expires_in'] ?? null;
         $lifetime = (is_int($seconds) || is_float($seconds)) && $seconds > 0 ? (int) min($seconds * 1000, self::EDGE_REFRESH_WINDOW_MS) : 3_600_000;
-        return ['token' => $token, 'expiresAt' => self::nowMs() + $lifetime];
+        $edge = ['token' => $token, 'expiresAt' => self::nowMs() + $lifetime];
+        return $check !== null && ($data['check'] ?? null) === true ? $edge + ['check' => true] : $edge;
     }
 
     /**
      * A usable edge session: the sealed one while it has more than $minRemainingMs left, else
-     * refreshed (while CCP still accepts it), else new.
+     * refreshed (while CCP still accepts it), else new. With an install check nonce ($check) CCP is
+     * always asked, so the nonce reaches the ingress on this page load (see openEdge).
      *
      * @param array<string, mixed> $ctx
      * @param array{token: string, expiresAt: int|float}|null $sealed
-     * @return array{token: string, expiresAt: int|float}
+     * @return array{token: string, expiresAt: int|float, check?: true}
      */
-    private function edgeFor(array $ctx, string $visitorId, ?array $sealed, ?string $force = null, int $minRemainingMs = self::EDGE_MARGIN_MS): array
+    private function edgeFor(array $ctx, string $visitorId, ?array $sealed, ?string $force = null, int $minRemainingMs = self::EDGE_MARGIN_MS, ?string $check = null): array
     {
         $now = self::nowMs();
-        if ($force === null && $sealed !== null && $sealed['expiresAt'] - $now > $minRemainingMs) {
+        if ($force === null && $check === null && $sealed !== null && $sealed['expiresAt'] - $now > $minRemainingMs) {
             return $sealed;
         }
         if ($force !== 'create' && $sealed !== null && $now - $sealed['expiresAt'] < self::EDGE_REFRESH_WINDOW_MS - self::EDGE_MARGIN_MS) {
             try {
-                return $this->openEdge($ctx, $visitorId, $sealed['token']);
+                return $this->openEdge($ctx, $visitorId, $sealed['token'], $check);
             } catch (DeweeCcpError $e) {
                 if ($e->ccpCode !== 'ingress_session_invalid' && $e->ccpCode !== 'ingress_session_expired') {
                     throw $e;
                 }
             }
         }
-        return $this->openEdge($ctx, $visitorId, null);
+        return $this->openEdge($ctx, $visitorId, null, $check);
     }
 
     /**

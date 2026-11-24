@@ -17,6 +17,8 @@ export interface Recorded {
   method: string;
   headers: Record<string, string | string[] | undefined>;
   body: any;
+  /** The body exactly as it arrived, to compare request bytes. */
+  raw: string;
   closedEarly?: boolean;
 }
 
@@ -42,6 +44,8 @@ export interface FakeCcpState {
   edgeTtlSeconds: number;
   credentialCard?: Record<string, unknown>;
   credentialHandoffUrl?: string;
+  /** The install check nonce the control plane accepts: a `session` carrying it as `check` answers `check: true`. */
+  checkNonce?: string;
 }
 
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
@@ -131,13 +135,14 @@ export async function startFakeCcp(): Promise<FakeCcp> {
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
     let body: any = undefined;
+    const raw = Buffer.concat(chunks).toString("utf8");
     try {
-      body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+      body = chunks.length ? JSON.parse(raw) : undefined;
     } catch {
       return error(res, 400, "invalid_request");
     }
     const route = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : `?${url.pathname}`;
-    const rec: Recorded = { route, method: req.method ?? "", headers: { ...req.headers }, body };
+    const rec: Recorded = { route, method: req.method ?? "", headers: { ...req.headers }, body, raw };
     seen.push(rec);
     res.on("close", () => {
       if (!res.writableFinished) rec.closedEarly = true;
@@ -155,15 +160,16 @@ export async function startFakeCcp(): Promise<FakeCcp> {
     }
     if (route === "config") return send(res, 200, state.config);
     if (route === "session") {
+      const checked = state.checkNonce !== undefined && body?.check === state.checkNonce ? { check: true } : {};
       const prev = req.headers["x-dewee-webchat-session"] as string | undefined;
       if (prev) {
         const e = readEdge(prev, true);
         if (typeof e === "string") return error(res, 401, "ingress_session_invalid");
-        return send(res, 200, { session: mintEdge(e.vis, state.edgeTtlSeconds), visitor_id: e.vis, expires_in: state.edgeTtlSeconds });
+        return send(res, 200, { session: mintEdge(e.vis, state.edgeTtlSeconds), visitor_id: e.vis, expires_in: state.edgeTtlSeconds, ...checked });
       }
       const vis = body?.visitor_id ?? randomBytes(16).toString("base64url");
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(vis)) return error(res, 400, "invalid_request");
-      return send(res, 200, { session: mintEdge(vis, state.edgeTtlSeconds), visitor_id: vis, expires_in: state.edgeTtlSeconds, expires_at: new Date(Date.now() + state.edgeTtlSeconds * 1000).toISOString() });
+      return send(res, 200, { session: mintEdge(vis, state.edgeTtlSeconds), visitor_id: vis, expires_in: state.edgeTtlSeconds, expires_at: new Date(Date.now() + state.edgeTtlSeconds * 1000).toISOString(), ...checked });
     }
     const edge = readEdge(req.headers["x-dewee-webchat-session"] as string | undefined);
     if (edge === "invalid") return error(res, 401, "ingress_session_invalid");
@@ -314,6 +320,7 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       state.control.clear();
       state.staffOnDuty = true;
       state.stopMidRun = false;
+      state.checkNonce = undefined;
     },
     routes: (name) => seen.filter((r) => r.route === name),
     close: () =>

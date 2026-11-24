@@ -158,6 +158,8 @@ export interface SessionResponse {
  * as `check` on `/session` and on its one test message. Not a secret and grants nothing.
  */
 export const INSTALL_CHECK_RE = /^[A-Za-z0-9_-]{22,64}$/;
+/** The page URL parameter that carries the install check nonce. */
+export const INSTALL_CHECK_PARAM = "dewee_check";
 
 /** Error codes of `POST {basePath}/link` besides the identity codes. */
 export const LINK_ERROR_CODES = ["idempotency_key_reused", "link_in_progress", "linking_unavailable"] as const;

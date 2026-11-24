@@ -11,9 +11,10 @@ export type CheckStep = "config" | "session" | "reply";
 /**
  * The control plane's install check (`?dewee_check=` on the page URL): `accepted` when the backend
  * confirmed the nonce (the widget then sends its one test message, and `reply` tells whether the agent
- * answered), `ignored` when it did not or no session could be opened.
+ * answered), `ignored` when it did not (or a Turnstile challenge would have been needed), `failed` when
+ * the session request carrying it was refused or failed.
  */
-export type InstallCheckOutcome = "accepted" | "ignored";
+export type InstallCheckOutcome = "accepted" | "ignored" | "failed";
 
 export interface CheckResult {
   state: CheckState;

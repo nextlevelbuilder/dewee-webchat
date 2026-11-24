@@ -4,6 +4,15 @@
 // card and one-time-code fields, hidden elements, `data-dewee-ignore` subtrees and the widget itself
 // are never listed or touched. Events are synthetic (isTrusted=false).
 import type { PageAction } from "./action-runner";
+import { INSTALL_CHECK_PARAM } from "../protocol";
+
+/** Path and query of the page, the install check nonce redacted (a widget may mount after the page read its URL). */
+function pageUrl(): string {
+  const params = new URLSearchParams(location.search);
+  if (!params.has(INSTALL_CHECK_PARAM)) return location.pathname + location.search;
+  params.set(INSTALL_CHECK_PARAM, "[REDACTED]");
+  return `${location.pathname}?${params}`;
+}
 
 export const DOM_ACTION_NAMES = ["page.snapshot", "page.scroll", "page.click", "page.fill"] as const;
 
@@ -94,7 +103,7 @@ export function createDomActions(o: DomActionsOptions): DomActions {
         refs.set(ref, el);
         lines.push(`${ref} ${line}`);
       }
-      return { generation, url: location.pathname + location.search, title: clip(document.title, MAX_NAME), total, offset, elements: lines, ...scrollState(root) };
+      return { generation, url: pageUrl(), title: clip(document.title, MAX_NAME), total, offset, elements: lines, ...scrollState(root) };
     },
   };
 

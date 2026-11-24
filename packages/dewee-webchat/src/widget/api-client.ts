@@ -17,6 +17,12 @@ import {
   type SessionResponse,
 } from "../protocol";
 
+/**
+ * Code of the error {@link ApiClient.checkedSession} rejects with when opening the session would need a
+ * Turnstile challenge: the install check gives up instead of rendering one into a widget nobody opened.
+ */
+export const INSTALL_CHECK_CHALLENGE = "install_check_challenge";
+
 /** Identity errors after which the signed-in session is dropped and `/session` is requested again. */
 const RENEW_CODES = new Set(["LINK_EXPIRED", "LINK_REVOKED"]);
 /** Signed-in sessions live minutes to hours: refresh this long before expiry, at most half the lifetime. */
@@ -261,6 +267,7 @@ export class ApiClient {
     const post = async () =>
       this.parse<SessionResponse>(await this.request(this.url("session"), { method: "POST", headers: await this.headers(), body: JSON.stringify(body) }));
     const challenge = async () => {
+      if (check) throw new ApiError("The install check does not run a challenge", 0, INSTALL_CHECK_CHALLENGE);
       if (!this.o.turnstile) throw new ApiError("Verification is required but no Turnstile handler is set", 403, "turnstile_required");
       body.turnstileToken = await this.o.turnstile(cfg.turnstileSiteKey!);
     };
@@ -338,7 +345,8 @@ export class ApiClient {
    * Opens a session whose `/session` request carries the control plane's install check nonce as
    * `check`, asking the backend even when the session held or stored is still fresh. Resolves whether
    * the backend accepted the nonce (`check: true` in its answer); rejects when no session could be
-   * opened. The nonce goes with one request only.
+   * opened, with {@link INSTALL_CHECK_CHALLENGE} when that would need a Turnstile challenge. The nonce
+   * goes with one request only.
    */
   async checkedSession(nonce: string): Promise<boolean> {
     // A session request already in flight does not carry the nonce: let it finish first.

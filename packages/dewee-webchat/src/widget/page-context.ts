@@ -1,3 +1,5 @@
+import { INSTALL_CHECK_PARAM } from "../protocol";
+
 /** A transient, untrusted attachment for one chat turn. Never stored in browser history. */
 export interface PageContextAttachment {
   version: 1;
@@ -18,7 +20,7 @@ export interface PageContextOptions {
 const BLOCKED = "script,style,noscript,template,svg,canvas,iframe,form,input,textarea,select,option,button,[contenteditable]:not([contenteditable='false']),[hidden],[aria-hidden='true'],[inert],dewee-chat";
 const MAX_CONTENT = 12000;
 
-/** Retain useful routing parameters but redact common credential-bearing query values. */
+/** Retain useful routing parameters but redact common credential-bearing query values and the install check nonce. */
 export function safePageUrl(href: string): string | undefined {
   try {
     const url = new URL(href);
@@ -29,7 +31,8 @@ export function safePageUrl(href: string): string | undefined {
       const joined = words.join("");
       const qualifiers = ["api", "access", "auth", "oauth", "secret", "private", "client", "session", "signing", "verification", "reset", "recovery", "activation", "confirmation", "invite", "license", "encryption"];
       const secret = words.some((word, index) => ["token", "secret", "password", "passwd", "pwd", "auth", "authorization", "cookie", "apikey", "session", "sid", "sig", "signature", "otp", "jwt", "credential", "credentials", "nonce", "bearer", "ticket"].includes(word) || (["code", "key", "state"].includes(word) && (words.length === 1 || (index > 0 && qualifiers.includes(words[index - 1]))))) || /token|secret|passw|apikey|credential|sessid|session|authorization|samlresponse/.test(joined);
-      if (secret) url.searchParams.set(key, "[REDACTED]");
+      // The install check nonce of the control plane, for a widget that mounts after the page read its URL.
+      if (secret || key.toLowerCase() === INSTALL_CHECK_PARAM) url.searchParams.set(key, "[REDACTED]");
     }
     return new TextEncoder().encode(url.href).length <= 2048 ? url.href : undefined;
   } catch { return undefined; }

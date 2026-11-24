@@ -240,12 +240,21 @@ describe("Astro Node SSR: TOSE-style backend routes the page actions call", () =
     const replay = await b.request("/api/payments", { cookie: lan, body: { quote: quote.quote } });
     expect(replay.status).toBe(409);
     expect(replay.json().error.code).toBe("quote_used");
+
+    // Reconciliation read for a client that lost the POST answer: the owner sees the same payment,
+    // another user and an order without a payment see nothing.
+    const reconciled = await b.request("/api/payments?orderId=ord_1001a", { cookie: lan });
+    expect(reconciled.status).toBe(200);
+    expect(reconciled.json()).toEqual(payment);
+    expect((await b.request("/api/payments?orderId=ord_1001a", { cookie: minh })).status).toBe(404);
+    expect((await b.request("/api/payments?orderId=ord_1001b", { cookie: lan })).status).toBe(404);
+    expect((await b.request("/api/payments?orderId=ord_1001a")).status).toBe(401);
   });
 
   it("chat carries the page-action manifest to CCP; a malformed manifest is refused locally", async () => {
     const b = open();
     const { token } = (await b.request("/api/dewee/session", { body: {} })).json();
-    const { actions } = tosePageActions({ fetch, approvePayment: async () => false, showCheckout: () => {} });
+    const { actions } = tosePageActions({ fetch, approvePayment: async () => false, showCheckout: () => false });
     const manifest = actions.map(({ handler: _handler, ...entry }) => entry);
     const res = await chat(b, token, undefined, { actions: manifest, pageContext: { url: `${target.visitorOrigin}/orders`, title: "Orders" } });
     expect(res.status).toBe(200);

@@ -16,7 +16,7 @@ function setup(approve: boolean) {
     return json({ error: { code: "not_found" } }, 404);
   }) as unknown as typeof globalThis.fetch;
   const approvePayment = vi.fn(async () => approve);
-  const showCheckout = vi.fn();
+  const showCheckout = vi.fn(() => true);
   const { actions, confirm } = tosePageActions({ fetch, approvePayment, showCheckout });
   const byName = (name: string) => actions.find((a) => a.name === name)!;
   const ctx = (callId: string) => ({ callId, signal: new AbortController().signal }) as never;
@@ -49,7 +49,7 @@ describe("TOSE-style page actions", () => {
     expect(await s.confirm({ ...pay, callId: "c2" }, { orderId: "ord_1001a" })).toBe(true);
     await expect(pay.handler({ orderId: "ord_1001a" }, s.ctx("other-call"))).rejects.toThrow(/not approved/);
     const result = await pay.handler({ orderId: "ord_1001a" }, s.ctx("c2"));
-    expect(result).toEqual({ paymentId: "pay_1", status: "checkout_shown_to_customer" });
+    expect(result).toEqual({ paymentId: "pay_1", status: "checkout_link_shown" });
     const post = s.calls.find((c) => c.url === "/api/payments")!;
     expect(JSON.parse(String(post.init!.body))).toEqual({ quote: "signed.quote" });
     expect(s.showCheckout).toHaveBeenCalledWith(expect.objectContaining({ checkoutUrl: "https://pay.example.test/checkout/pay_1" }));

@@ -4,6 +4,7 @@ export { DeweeChatElement, type DeweeChatConfig };
 export { ApiClient, ApiError, RESERVED_HEADERS, type ApiClientOptions, type RequestHeadersOption } from "./widget/api-client";
 export { renderMarkdown } from "./widget/markdown";
 export type { ActionManifestEntry, ActionSensitivity, AdmissionErrorCode, AgentInfo, ChatRequestBody, ChatStreamEvent, HistoryMessage, IdentityErrorCode, LinkResponse, LinkTarget, PublicConfig, Remediation, SessionResponse, ToolCallView } from "./protocol";
+export { ActionError } from "./actions/action-runner";
 export type { ActionCallStatus, ActionConfirmHook, PageAction, PageActionContext, PageActionInfo } from "./actions/action-runner";
 export type { ActionResult, ActionResultStatus } from "./actions/directives";
 export { DOM_ACTION_NAMES, type DomActionsRoot } from "./actions/dom-actions";

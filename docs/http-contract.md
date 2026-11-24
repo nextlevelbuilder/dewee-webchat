@@ -187,8 +187,25 @@ sends the results back as a new (hidden) message:
 ```
 ````
 
-`status` is `ok`, `denied` (visitor declined) or `error` (unknown action, invalid args, handler error,
-timeout, malformed block). Automatic result turns are bounded per visitor message (default 5). Result
+`status` is one of:
+
+| `status` | Meaning |
+|---|---|
+| `ok` | The handler resolved. Whatever it returned is in `result`, including a returned `{ "error": … }` object, which is data. |
+| `denied` | The visitor declined. Nothing ran. |
+| `error` | The call did not succeed: unknown action, invalid args or malformed block (the handler never ran), a handler that reported failure by throwing, or a `read`/`navigate` handler that timed out or was stopped. A write handler that cannot tell whether its write happened must throw `ActionError` with `outcome: "unknown"` instead; the widget cannot know that for it. |
+| `unknown` | The action may or may not have taken effect: a handler threw `ActionError(code, message, { outcome: "unknown" })`, or a `mutate`/`destructive` handler timed out or was stopped while running. Not a success and not a failure. |
+
+`error` and `unknown` results carry `error` (text) and, when the handler threw an `ActionError`, its
+`code` (`^[a-z][a-z0-9_.-]{0,63}$`):
+
+```json
+{"id":"call-2","name":"payments.create","status":"unknown","error":"…","code":"payment_outcome_unknown"}
+```
+
+The page block tells the agent that only `ok` is a success and that an `unknown` action must not be
+called again. Backends and agents written against the three older statuses should treat an unlisted
+status as "not a success". Automatic result turns are bounded per visitor message (default 5). Result
 messages are ordinary chat messages, so rate limits and `maxMessageLength` apply.
 
 **Errors** (JSON, before streaming): `400 invalid_actions`, `413 actions_too_large`, `413 context_too_large`.

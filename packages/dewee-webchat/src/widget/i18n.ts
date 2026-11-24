@@ -22,7 +22,7 @@ export interface Strings {
   poweredBy: string;
   errorGeneric: string;
   stopped: string;
-  actionStatus: Record<"pending" | "awaiting-confirmation" | "running" | "done" | "denied" | "error", string>;
+  actionStatus: Record<"pending" | "awaiting-confirmation" | "running" | "done" | "denied" | "error" | "unknown", string>;
   confirmTitle: string;
   confirmDestructive: string;
   allow: string;
@@ -85,7 +85,7 @@ const en: Strings = {
   poweredBy: "Powered by",
   errorGeneric: "Something went wrong. Please try again.",
   stopped: "Stopped.",
-  actionStatus: { pending: "queued", "awaiting-confirmation": "needs approval", running: "running", done: "done", denied: "declined", error: "failed" },
+  actionStatus: { pending: "queued", "awaiting-confirmation": "needs approval", running: "running", done: "done", denied: "declined", error: "failed", unknown: "not confirmed" },
   confirmTitle: "Allow this action?",
   confirmDestructive: "This can't be undone.",
   allow: "Allow",
@@ -159,7 +159,7 @@ const vi: Strings = {
   poweredBy: "Vận hành bởi",
   errorGeneric: "Có lỗi xảy ra. Bạn thử lại giúp mình nhé.",
   stopped: "Đã dừng.",
-  actionStatus: { pending: "chờ", "awaiting-confirmation": "cần xác nhận", running: "đang chạy", done: "xong", denied: "đã từ chối", error: "lỗi" },
+  actionStatus: { pending: "chờ", "awaiting-confirmation": "cần xác nhận", running: "đang chạy", done: "xong", denied: "đã từ chối", error: "lỗi", unknown: "chưa xác nhận" },
   confirmTitle: "Cho phép thao tác này?",
   confirmDestructive: "Thao tác này không thể hoàn tác.",
   allow: "Cho phép",

@@ -22,13 +22,20 @@ export interface ParsedDirectives {
   calls: ParsedCall[];
 }
 
-export type ActionResultStatus = "ok" | "denied" | "error";
+/**
+ * `unknown`: the action may or may not have taken effect (a write whose answer was lost, or one that
+ * was stopped while running). It is neither a success nor a failure: reconcile before running it again.
+ */
+export type ActionResultStatus = "ok" | "denied" | "error" | "unknown";
+export const ACTION_RESULT_STATUSES: readonly ActionResultStatus[] = ["ok", "denied", "error", "unknown"];
 export interface ActionResult {
   id: string;
   name: string;
   status: ActionResultStatus;
   result?: unknown;
   error?: string;
+  /** Machine-readable reason a handler gave by throwing an `ActionError` (e.g. `not_found`). */
+  code?: string;
 }
 
 interface Block { start: number; end: number; body: string[]; closed: boolean }
@@ -139,7 +146,7 @@ export function parseActionResults(content: string): ActionResult[] {
   for (const body of bodies) {
     try {
       const r = JSON.parse(body);
-      if (r && typeof r.id === "string" && ["ok", "denied", "error"].includes(r.status)) out.push(r as ActionResult);
+      if (r && typeof r.id === "string" && ACTION_RESULT_STATUSES.includes(r.status)) out.push(r as ActionResult);
     } catch { /* ignore */ }
   }
   return out;
@@ -160,7 +167,7 @@ export function formatActionResults(results: ActionResult[], maxLength = 4000): 
     const preview = JSON.stringify(safe.result ?? null);
     const room = budget - block({ ...safe, result: { truncated: true, preview: "" } }).length - 8;
     const shrunk = block({ ...safe, result: { truncated: true, preview: preview.slice(0, Math.max(0, room)) } });
-    return shrunk.length <= budget ? shrunk : block({ id: r.id, name: r.name.slice(0, 64), status: r.status, result: { truncated: true } });
+    return shrunk.length <= budget ? shrunk : block({ id: r.id, name: r.name.slice(0, 64), status: r.status, ...(r.code ? { code: r.code } : {}), result: { truncated: true } });
   });
   return fitted.join("\n\n").slice(0, maxLength);
 }

@@ -88,6 +88,10 @@ const money = (n: number) => `${n.toLocaleString("vi-VN")} ₫`;
           // component fed by this same value.
           link.href = p.checkoutUrl;
           section.hidden = false;
+          section.scrollIntoView({ block: "nearest" });
+          // Reported to the agent as "checkout link shown": only when the tab is in front and the
+          // link is laid out. Whether the customer opens it or pays is not known here.
+          return document.visibilityState === "visible" && link.getClientRects().length > 0;
         },
       });
 

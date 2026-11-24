@@ -51,6 +51,14 @@ lets visitors ask for a person when the integration allows it, exactly like the 
 at startup, and so is the option with the legacy gateway transport. Without it the backend behaves as
 before. Turn it on only with widget 0.5.0-beta.7 or later on the pages that embed it. See the [HTTP contract](../docs/http-contract.md#talking-to-a-person-human-takeover).
 
+## Install check
+
+Nothing to configure. When the control plane checks the install (`?dewee_check=<nonce>` on the page),
+the widget sends the nonce as `check` on `/session` and on its one test message; with CCP this backend
+forwards it to the ingress exactly like the TypeScript handler and answers `check: true` when CCP
+accepted it. A malformed `check` is `400 bad_request`; requests without it are unchanged. Needs widget
+and backend 0.5.0-beta.7 or later. See the [HTTP contract](../docs/http-contract.md#install-check).
+
 ## Install
 
 Copy `dewee-webchat.php` into your project and create an endpoint, for example `api/dewee.php`:

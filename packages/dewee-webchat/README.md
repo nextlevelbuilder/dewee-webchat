@@ -226,6 +226,22 @@ await chat.send("ping");       // then `reply` shows whether the agent answered
   element carries `data-connection="connecting" | "ready" | "unavailable"` for your own styling.
 - React: `onStatus`. Vue: `@status`.
 
+### Install check
+
+The control plane's **Check on my website** opens your page with `?dewee_check=<nonce>`. The widget
+then boots (even when closed), sends the nonce with its `/session` request, and, only when the backend
+confirms it (`check: true`, which CCP decides for your integration and origin), sends one fixed test
+message ("Install check: please reply to confirm this chat works.", localized) so the check sees a
+real reply. Nothing is sent without that confirmation, and at most once per page load: not after
+`renewSession()`, a re-boot or for a second widget. A malformed value is ignored, as is any nonce for a
+widget configured with `gatewayUrl` and `gatewayToken`. On such a page load `diagnostics()` adds
+`check: "accepted" | "ignored"`; the nonce itself never appears in a snapshot, an event or storage.
+Visitors without the parameter see no change.
+
+Needs widget **and** backend **0.5.0-beta.7** or later (the TypeScript handler and the PHP backend
+alike). The nonce is not a secret and grants nothing; the backend forwards it to CCP only over transport
+`ccp`. See the [HTTP contract](../../docs/http-contract.md#install-check).
+
 ## Markdown images
 
 Replies may include `![Product](https://cdn.example.com/photo.jpg)` or a same-origin relative image

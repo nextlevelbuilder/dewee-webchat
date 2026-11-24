@@ -39,7 +39,8 @@ Public, cacheable for a short time. Never contains secrets.
 
 ## `POST {base}/session`
 
-Body: `{ "token"?: string, "turnstileToken"?: string }`. Returns a signed visitor token.
+Body: `{ "token"?: string, "turnstileToken"?: string, "check"?: string }` (`check`: see
+[Install check](#install-check)). Returns a signed visitor token.
 Sending a still-valid previous `token` refreshes it and keeps the same `visitorId`, so history survives.
 
 ```json
@@ -65,7 +66,8 @@ Visitor token = `base64url(JSON{"v": visitorId, "exp": epochMs})` + `.` + `base6
 Headers: `Authorization: Bearer <visitor token>`.
 Body: `{ "message": string, "agent"?: string, "conversationId"?: string, "actions"?: ActionManifestEntry[], "actionsHash"?: string, "pageContext"?: any }`.
 The last three are only sent by pages that register [page actions](#page-actions); without them the
-request and the gateway message are exactly as before.
+request and the gateway message are exactly as before. An optional `check` marks the one test message
+of an [install check](#install-check).
 `conversationId` matches `^[A-Za-z0-9_-]{6,64}$`; when missing or invalid the server picks one and
 announces it in the `start` event.
 
@@ -444,6 +446,34 @@ person with its tool) or ends `cancelled` makes the widget read the history and 
 **Widget version.** A host with `humanHandoff: true` needs widget **0.5.0-beta.7** or later: an older
 widget does not understand the `202` held answer. Pin at least that version, or keep the option off
 until the pages that embed the widget use it.
+
+## Install check
+
+The control plane's "Check on my website" opens the site with `?dewee_check=<nonce>` in the page URL,
+so the one test turn of that page load can be told apart from real visitors. The nonce matches
+`^[A-Za-z0-9_-]{22,64}$`; it is not a secret and grants nothing. Needs widget **and** host
+**0.5.0-beta.7** or later; the TypeScript and PHP backends behave identically.
+
+- **Widget.** With a valid nonce in the URL it boots (even when closed) and sends it as `check` in the
+  body of one `POST {base}/session`, also when its stored session is still fresh. Only when the answer
+  carries `"check": true` does it send one fixed, localized test message ("Install check: please reply
+  to confirm this chat works.") with the same `check` in the `POST {base}/chat` body. Without that
+  answer it sends nothing. At most once per page load: not after `renewSession()`, a re-boot or a second
+  widget. A malformed value is ignored, and so is any nonce for a widget given `gatewayUrl` and
+  `gatewayToken`. `diagnostics()` adds `check: "accepted" | "ignored"` on such a page load only; the
+  nonce itself never appears in a snapshot, an event or storage.
+- **Backend.** `check` is optional on `/session` and `/chat`; any value other than a matching string is
+  `400 bad_request`. Over transport `ccp` it is forwarded to the ingress as body field `check` on its
+  `session` and `chat` calls, only when the widget sent it, and never in a URL or a log line with the
+  visitor's text. A `/session` with `check` always calls the ingress (refreshing the visitor's edge
+  session, or opening one), and answers `"check": true` when the ingress accepted the nonce for this
+  integration and origin; the flag is never sealed in the visitor token. The legacy gateway transport
+  validates `check` and ignores it. Requests without `check` are unchanged, down to the bytes sent to
+  the ingress.
+
+```json
+{ "visitorId": "Qx3…", "token": "<body>.<sig>", "expiresAt": 1791621449203, "expiresIn": 3600000, "check": true }
+```
 
 ## Extra request headers
 

@@ -75,7 +75,7 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
     mkdirSync(join(dir, "tmp"));
     writeFileSync(
       join(dir, "router.php"),
-      `<?php\nrequire ${JSON.stringify(phpFile)};\n$f = basename((string) ($_SERVER['HTTP_X_TEST_OPTIONS'] ?? ''));\n$o = preg_match('/^options-\\d+\\.json$/', $f) ? json_decode((string) file_get_contents(__DIR__ . '/' . $f), true) : null;\nif (!is_array($o)) { http_response_code(599); exit; }\nDeweeWebchat::handle($o);\n`,
+      `<?php\nrequire ${JSON.stringify(phpFile)};\n$f = basename((string) ($_SERVER['HTTP_X_TEST_OPTIONS'] ?? ''));\n$o = preg_match('/^options-\\d+\\.json$/', $f) ? json_decode((string) file_get_contents(__DIR__ . '/' . $f), true) : null;\nif (!is_array($o)) { http_response_code(599); exit; }\nif (($_SERVER['HTTP_X_TEST_ONCHAT'] ?? '') !== '') $o['onChat'] = static function (array $e): void { file_put_contents(__DIR__ . '/onchat.jsonl', json_encode($e) . PHP_EOL, FILE_APPEND); };\nDeweeWebchat::handle($o);\n`,
     );
     setOptions();
     const port = await freePort();
@@ -679,6 +679,88 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env]);`,
         expect(r.text).not.toMatch(/postgres|0193/);
       }
       expect((await chat(s.token, { agent: "shop", message: "still here" })).status).toBe(200);
+    });
+  });
+
+  describe("install check", () => {
+    // Built by concatenation: fixtures shaped like tokens are never literal.
+    const NONCE = "chk_" + "P4hP".repeat(6);
+    const ts = () => createDeweeHandler({ ccp: ccpOptions(), secret: VISITOR_SECRET, rateLimit: false });
+    const tsCall = async (h: ReturnType<typeof ts>, path: string, body: unknown, token?: string) => {
+      const res = await h(new Request(`https://shop.example/api/dewee${path}`, { method: "POST", headers: token ? { authorization: `Bearer ${token}` } : {}, body: JSON.stringify(body) }));
+      return { status: res.status, text: await res.text() };
+    };
+
+    it("forwards the nonce on session like the TS handler and answers check: true only when the ingress accepted it", async () => {
+      ccp.state.checkNonce = NONCE;
+      const s = await session({ check: NONCE });
+      expect(s.check).toBe(true);
+      expect(ccp.routes("session")[0].raw).toBe(`{"visitor_id":"${s.visitorId}","check":"${NONCE}"}`);
+      const tsSession = JSON.parse((await tsCall(ts(), "/session", { check: NONCE })).text);
+      expect(ccp.routes("session")[1].raw).toBe(`{"visitor_id":"${tsSession.visitorId}","check":"${NONCE}"}`);
+      const shape = (o: Record<string, unknown>) => Object.keys(o).sort();
+      expect(shape(s)).toEqual(shape(tsSession));
+      expect(tsSession.check).toBe(true);
+
+      // An unknown nonce is forwarded but never confirmed; the token never carries the flag.
+      ccp.state.checkNonce = "chk_" + "Other".repeat(5);
+      const ignored = await session({ check: NONCE });
+      expect(ignored.check).toBeUndefined();
+      expect(JSON.stringify(await verifyVisitorToken(VISITOR_SECRET, s.token))).not.toContain("check");
+    });
+
+    it("asks the ingress with the nonce even when the sealed edge session is fresh", async () => {
+      const first = await session();
+      await session({ token: first.token });
+      expect(ccp.routes("session")).toHaveLength(1);
+      ccp.state.checkNonce = NONCE;
+      const checked = await session({ token: first.token, check: NONCE });
+      expect(checked).toMatchObject({ visitorId: first.visitorId, check: true });
+      const refresh = ccp.routes("session")[1];
+      expect(refresh.raw).toBe(`{"check":"${NONCE}"}`);
+      expect(typeof refresh.headers["x-dewee-webchat-session"]).toBe("string");
+    });
+
+    it("refuses a malformed nonce with the TS handler's 400, before calling the ingress", async () => {
+      const s = await session();
+      const tsSession = JSON.parse((await tsCall(ts(), "/session", {})).text);
+      ccp.reset();
+      for (const check of [null, 42, "", "short", "A".repeat(65), NONCE + "\n", "chk." + "A".repeat(22), ["x"]]) {
+        const php = await call("/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ check }) });
+        const tsAnswer = await tsCall(ts(), "/session", { check });
+        expect([JSON.stringify(check), php.status, php.json()]).toEqual([JSON.stringify(check), 400, JSON.parse(tsAnswer.text)]);
+        expect(tsAnswer.status).toBe(400);
+        const phpChat = await chat(s.token, { check });
+        const tsChat = await tsCall(ts(), "/chat", { message: "hi", conversationId: "conv_php_0001", check }, tsSession.token);
+        expect([JSON.stringify(check), phpChat.status, phpChat.json()]).toEqual([JSON.stringify(check), 400, JSON.parse(tsChat.text)]);
+      }
+      expect(ccp.seen).toHaveLength(0);
+    });
+
+    it("marks the test turn in onChat with check: true like the TS handler, never with the nonce", async () => {
+      const file = join(dir, "onchat.jsonl");
+      rmSync(file, { force: true });
+      const s = await session();
+      const send = (body: Record<string, unknown>) => call("/chat", { method: "POST", headers: { authorization: `Bearer ${s.token}`, "content-type": "application/json", "x-test-onchat": "1" }, body: JSON.stringify({ message: "hi", conversationId: "conv_php_0001", agent: "shop", ...body }) });
+      expect((await send({ check: NONCE })).status).toBe(200);
+      expect((await send({})).status).toBe(200);
+      const seen = readFileSync(file, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+      expect(seen.map((e) => e.check)).toEqual([true, undefined]);
+      expect(JSON.stringify(seen)).not.toContain(NONCE);
+    });
+
+    it("forwards check last in the chat body; without it the ingress gets the same bytes as from the TS handler", async () => {
+      const s = await session();
+      expect(ccp.routes("session")[0].raw).toBe(`{"visitor_id":"${s.visitorId}"}`);
+      expect((await chat(s.token, { agent: "shop", check: NONCE })).status).toBe(200);
+      expect(ccp.routes("chat")[0].raw).toBe(`{"message":"hi","conversation_id":"conv_php_0001","agent":"shop","check":"${NONCE}"}`);
+      expect((await chat(s.token, { agent: "shop" })).status).toBe(200);
+      const plain = ccp.routes("chat")[1].raw;
+      expect(plain).toBe(`{"message":"hi","conversation_id":"conv_php_0001","agent":"shop"}`);
+      const h = ts();
+      const tsSession = JSON.parse((await tsCall(h, "/session", {})).text);
+      await tsCall(h, "/chat", { message: "hi", conversationId: "conv_php_0001", agent: "shop" }, tsSession.token);
+      expect(ccp.routes("chat")[2].raw).toBe(plain);
     });
   });
 

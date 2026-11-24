@@ -13,8 +13,9 @@ import {
 } from "../actions/directives";
 import { createDomActions, type DomActions, type DomActionsRoot } from "../actions/dom-actions";
 import { ACTION_LIMITS, stripPageBlock } from "../actions/page-block";
-import { ApiClient, ApiError, type RequestHeadersOption } from "./api-client";
-import { Diagnostics, errorCode, type CheckResult, type CheckState, type CheckStep, type WidgetDiagnostics } from "./diagnostics";
+import { ApiClient, ApiError, INSTALL_CHECK_CHALLENGE, type RequestHeadersOption } from "./api-client";
+import { beginInstallCheckRun, endInstallCheckRun, installCheckUsed, markInstallCheckUsed, pageInstallCheck } from "./install-check";
+import { Diagnostics, errorCode, type CheckResult, type CheckState, type CheckStep, type InstallCheckOutcome, type WidgetDiagnostics } from "./diagnostics";
 import { JobAccessPopupError, openJobAccessTicket } from "./job-access";
 import { showConfirmDialog } from "./confirm-dialog";
 import { icons, pickStrings, type Strings } from "./i18n";
@@ -38,6 +39,8 @@ const POLL_MAX_MS = 30_000;
 const POLL_IDLE_LIMIT_MS = 60 * 60_000;
 /** A request nobody on duty took is still watched this long, in case someone comes on duty and accepts it. */
 const UNATTENDED_WATCH_MS = 10 * 60_000;
+/** While the install check waits for a turn, a page capture or a cooldown to end, it looks again this often. */
+const INSTALL_CHECK_WAIT_MS = 250;
 
 export interface DeweeChatConfig {
   /** Backend base URL (the server handler). Default: "/api/dewee". */
@@ -176,6 +179,8 @@ interface ViewMessage extends HistoryMessage {
   /** Visitor of the session that answered with `actionsHash`: the ack is stored for that conversation. */
   ackVisitor?: string;
   actions?: ActionCallView[];
+  /** The install check's test turn: it runs in its own conversation and never moves the visitor's. */
+  installCheck?: boolean;
 }
 
 const BOOL_ATTRS = ["show-reasoning", "show-tool-calls", "allow-agent-switch", "open", "persist", "hide-branding", "launcher-avatar", "dom-actions"];
@@ -259,6 +264,8 @@ export class DeweeChatElement extends ElementBase {
   private activating: Promise<void> | null = null;
   /** Bumped when the backend changes: a boot started for the previous one must not report. */
   private bootSeq = 0;
+  /** The last boot that finished (reported `dewee:ready`). */
+  private bootedSeq = -1;
   private replyBefore: CheckResult = { state: "idle" };
   /** The retry panel, kept across renders so a screen reader hears the alert once. */
   private unavailablePanel: HTMLElement | null = null;
@@ -371,13 +378,18 @@ export class DeweeChatElement extends ElementBase {
   }
 
   open(): void {
+    this.openPanel(true);
+  }
+
+  /** Opens the panel; `focus` moves the keyboard focus into the composer (not for the install check). */
+  private openPanel(focus: boolean): void {
     if (this.config.mode === "inline") return;
     this.setAttribute("data-open", "");
     this.removeAttribute("data-unread");
     this.els.launcher.setAttribute("aria-expanded", "true");
     this.activate();
     if (this.activated) this.resumePolling();
-    setTimeout(() => this.els.input.focus(), 120);
+    if (focus) setTimeout(() => this.els.input.focus(), 120);
     this.emit("dewee:open");
   }
 
@@ -465,14 +477,18 @@ export class DeweeChatElement extends ElementBase {
     }
   }
 
-  /** One request/response with the agent. */
-  private async runTurn(message: string, hidden: boolean, attachment?: PageContextAttachment): Promise<ViewMessage> {
+  /**
+   * One request/response with the agent. `check`: the install check's test turn, in its own conversation
+   * (never persisted, never the visitor's), with no page context or action manifest.
+   */
+  private async runTurn(message: string, hidden: boolean, attachment?: PageContextAttachment, check?: { nonce: string; conversationId: string }): Promise<ViewMessage> {
     const generation = this.credentialGeneration;
+    const conversationId = check ? check.conversationId : this.conversationId;
     this.pushMessage({ role: "user", content: message, hidden });
-    const reply: ViewMessage = { role: "assistant", content: "", status: "streaming", startedAt: Date.now() };
+    const reply: ViewMessage = { role: "assistant", content: "", status: "streaming", startedAt: Date.now(), ...(check ? { installCheck: true } : {}) };
     this.pushMessage(reply);
     this.setRunning(new AbortController());
-    this.emit("dewee:send", { message, agent: this.agentId, conversationId: this.conversationId, auto: hidden || undefined });
+    this.emit("dewee:send", { message, agent: this.agentId, conversationId, auto: hidden || undefined, ...(check ? { check: true } : {}) });
     let sessionOpen = false;
     // A hidden page-action follow-up is not the turn the visitor saw: it leaves the reply step alone.
     if (!hidden) this.replyBefore = this.diag.get("reply");
@@ -485,16 +501,19 @@ export class DeweeChatElement extends ElementBase {
       this.setCheck("session", "ok");
       if (!hidden) this.setCheck("reply", "pending");
       let held: HeldChatResponse | undefined;
-      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal, (h) => { held = h; });
+      const body = check
+        ? { message, agent: this.agentId, conversationId, check: check.nonce }
+        : { ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) };
+      await this.client().chat(body, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal, (h) => { held = h; });
       // On a takeover backend a run with nothing to show can be the agent asking for a person with its
       // tool: the history read after the turn says whether a takeover started.
-      if (!held && !reply.yielded && reply.status !== "error" && this.server?.humanHandoff === true && !reply.content.trim() && !reply.toolCalls?.length && this.credentialCards.size === cards) reply.yielded = "empty";
+      if (!check && !held && !reply.yielded && reply.status !== "error" && this.server?.humanHandoff === true && !reply.content.trim() && !reply.toolCalls?.length && this.credentialCards.size === cards) reply.yielded = "empty";
       if (held || reply.yielded) {
         // No agent answer is coming: the message was kept for staff, or the agent yielded to a person.
         // Neither is a failed reply; the transcript is redrawn from what the server stored.
         this.dropReply(reply);
         if (!hidden) this.restoreReplyCheck();
-        if (held && generation === this.credentialGeneration) {
+        if (held && !check && generation === this.credentialGeneration) {
           // One announcement: the message was kept, and (the first time) who answers now.
           const changed = held.control !== this.control;
           this.setControl(held.control, false);
@@ -527,10 +546,10 @@ export class DeweeChatElement extends ElementBase {
       this.finishThinking(reply);
       this.updateMessage(reply);
       this.setRunning(null);
-      if (reply.yielded && generation === this.credentialGeneration) void this.followYield(reply.yielded);
+      if (reply.yielded && !check && generation === this.credentialGeneration) void this.followYield(reply.yielded);
       if (reply.status === "done" && !reply.dropped) {
         if (reply.actionsHash && reply.ackVisitor && !reply.stopped) this.setAck(reply.actionsHash, reply.ackVisitor);
-        this.emit("dewee:reply", { content: reply.content, agent: this.agentId, conversationId: this.conversationId });
+        this.emit("dewee:reply", { content: reply.content, agent: this.agentId, conversationId });
         if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
       }
     }
@@ -1083,6 +1102,8 @@ export class DeweeChatElement extends ElementBase {
     }
     document.addEventListener("visibilitychange", this.onVisibility);
     this.addEventListener("focusin", this.resumePolling);
+    // The control plane is checking this install: boot now (even closed) so the check can run.
+    if (this.installCheckNonce()) void this.activate().catch(() => {});
     // Moved back into the page: the server says again who answers, and a takeover is watched again.
     if (this.activated) this.resumeHandoff();
   }
@@ -1495,6 +1516,99 @@ export class DeweeChatElement extends ElementBase {
     const config = this.diag.snapshot().config;
     const ok = config.state === "ok";
     this.emit("dewee:ready", { agent: this.agentId, config: ok ? this.server : null, ok, ...(ok ? {} : { error: { code: config.code } }) });
+    this.bootedSeq = seq;
+    if (ok) void this.runInstallCheck(seq);
+  }
+
+  /**
+   * The page URL's install check nonce (read, and removed from the address bar, once per page load), or
+   * null: none, or a widget that talks to a gateway directly (`gatewayUrl` + `gatewayToken`), which has
+   * no control plane host to confirm it.
+   */
+  private installCheckNonce(): string | null {
+    const nonce = pageInstallCheck();
+    const c = this.config;
+    return nonce && !(c.gatewayUrl && c.gatewayToken) ? nonce : null;
+  }
+
+  /**
+   * The control plane's install check: one session request that carries the nonce, then, only when the
+   * backend answered `check: true`, one fixed test message carrying it too. Once per page load, and once
+   * per tab for a nonce (see install-check.ts). A boot superseded before the message is handed to the
+   * send path leaves the check to the next boot. The nonce is never shown, emitted or put in a snapshot.
+   */
+  private async runInstallCheck(seq: number): Promise<void> {
+    const nonce = this.installCheckNonce();
+    if (!nonce || !beginInstallCheckRun()) return;
+    let settled = false;
+    const current = () => seq === this.bootSeq && this.isConnected;
+    try {
+      if (await installCheckUsed(nonce)) {
+        settled = true;
+        return;
+      }
+      if (!current()) return;
+      const before = this.diag.get("session");
+      const restore = () => this.setCheck("session", before.state === "pending" ? "idle" : before.state, before.code);
+      if (before.state !== "ok") this.setCheck("session", "pending");
+      let outcome: InstallCheckOutcome;
+      try {
+        outcome = (await this.client().checkedSession(nonce)) ? "accepted" : "ignored";
+        this.setCheck("session", "ok");
+      } catch (e) {
+        if (e instanceof ApiError && e.code === INSTALL_CHECK_CHALLENGE) {
+          // Opening the session would need a Turnstile challenge: none is rendered for the check.
+          outcome = "ignored";
+          restore();
+        } else {
+          // The request carrying the nonce was refused or failed: chat on this page load gets a session
+          // without it, as it would have without the check. An `ok` step is never downgraded.
+          outcome = "failed";
+          try {
+            await this.client().ensureSession();
+            this.setCheck("session", "ok");
+          } catch (retry) {
+            if (before.state === "ok") restore();
+            else this.setCheck("session", "failed", errorCode(retry));
+          }
+        }
+      }
+      if (!current()) return;
+      this.setInstallCheck(outcome);
+      if (outcome !== "accepted") {
+        settled = true;
+        return;
+      }
+      await this.sendInstallCheck(nonce, current, () => {
+        settled = true;
+        void markInstallCheckUsed(nonce);
+      });
+    } finally {
+      endInstallCheckRun(settled);
+      // Superseded before the message was sent: a newer boot that already finished takes the check over.
+      if (!settled && seq !== this.bootSeq && this.isConnected && this.bootedSeq === this.bootSeq && this.diag.state("config") === "ok") void this.runInstallCheck(this.bootSeq);
+    }
+  }
+
+  /**
+   * The check's test message, on its own send path: it waits for a turn, a page capture or a cooldown in
+   * progress instead of being dropped, and leaves the visitor's draft, page-share choice and focus alone.
+   * The panel opens (the site owner sees the reply) without taking the focus. `claim` runs right before
+   * the message is handed to the send path; nothing is sent once the boot was superseded.
+   */
+  private async sendInstallCheck(nonce: string, current: () => boolean, claim: () => void): Promise<void> {
+    while (this.running || this.preparingPage || this.cooldown.active) {
+      if (!current()) return;
+      await new Promise((r) => setTimeout(r, INSTALL_CHECK_WAIT_MS));
+    }
+    if (!current() || this.diag.state("config") !== "ok") return;
+    claim();
+    if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.openPanel(false);
+    await this.runTurn(this.strings.installCheck, false, undefined, { nonce, conversationId: randomConversationId() });
+  }
+
+  private setInstallCheck(outcome: InstallCheckOutcome) {
+    if (this.diag.setInstallCheck(outcome)) this.emit("dewee:status", this.diag.snapshot());
   }
 
   private async switchAgent(id: string) {
@@ -1900,7 +2014,7 @@ export class DeweeChatElement extends ElementBase {
           // The session that served this run; a renewal after the stream must not move the ack.
           m.ackVisitor = this.client().visitorId() ?? undefined;
         }
-        if (e.conversationId && e.conversationId !== this.conversationId) {
+        if (e.conversationId && e.conversationId !== this.conversationId && !m.installCheck) {
           this.conversationId = e.conversationId;
           if (this.config.persist !== false) store.set(this.convKey(), e.conversationId);
         }

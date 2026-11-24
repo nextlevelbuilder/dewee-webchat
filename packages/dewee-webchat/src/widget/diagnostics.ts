@@ -8,6 +8,13 @@
 export type CheckState = "idle" | "pending" | "ok" | "failed";
 export type CheckStep = "config" | "session" | "reply";
 
+/**
+ * The control plane's install check (`?dewee_check=` on the page URL): `accepted` when the backend
+ * confirmed the nonce (the widget then sends its one test message, and `reply` tells whether the agent
+ * answered), `ignored` when it did not or no session could be opened.
+ */
+export type InstallCheckOutcome = "accepted" | "ignored";
+
 export interface CheckResult {
   state: CheckState;
   /** Why the step failed, e.g. `ORIGIN_NOT_ALLOWED`, `http_503`, `network_error`, `empty_reply`. */
@@ -23,6 +30,8 @@ export interface WidgetDiagnostics {
   reply: CheckResult;
   /** The backend's package version, once its config loaded. */
   version?: string;
+  /** Present only on a page load that carried an install check nonce, once the backend answered. Never the nonce. */
+  check?: InstallCheckOutcome;
 }
 
 // Codes are short words joined by underscores (`ORIGIN_NOT_ALLOWED`, `http_503`). Anything longer or
@@ -40,6 +49,7 @@ export function errorCode(e: unknown): string {
 export class Diagnostics {
   private steps: Record<CheckStep, CheckResult> = { config: { state: "idle" }, session: { state: "idle" }, reply: { state: "idle" } };
   private version?: string;
+  private installCheck?: InstallCheckOutcome;
 
   state(step: CheckStep): CheckState {
     return this.steps[step].state;
@@ -62,6 +72,13 @@ export class Diagnostics {
     this.version = typeof version === "string" && /^[A-Za-z0-9_.+-]{1,64}$/.test(version) ? version : undefined;
   }
 
+  /** Records the install check outcome. Returns false when nothing changed. */
+  setInstallCheck(outcome: InstallCheckOutcome): boolean {
+    if (this.installCheck === outcome) return false;
+    this.installCheck = outcome;
+    return true;
+  }
+
   snapshot(): WidgetDiagnostics {
     return {
       embedded: true,
@@ -69,6 +86,7 @@ export class Diagnostics {
       session: { ...this.steps.session },
       reply: { ...this.steps.reply },
       ...(this.version ? { version: this.version } : {}),
+      ...(this.installCheck ? { check: this.installCheck } : {}),
     };
   }
 }

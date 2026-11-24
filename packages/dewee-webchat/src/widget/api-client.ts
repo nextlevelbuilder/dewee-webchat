@@ -84,6 +84,10 @@ export class ApiClient {
   private sessionPromise: Promise<SessionResponse> | null = null;
   private supersededSessions = new Map<number, Promise<SessionResponse>>();
   private sessionGeneration = 0;
+  /** An install check nonce waiting for the next `/session` request, which carries it once. */
+  private pendingCheck: string | null = null;
+  /** Whether the `/session` answer to the last request carrying a nonce said `check: true`. */
+  private checkAccepted = false;
 
   constructor(private o: ApiClientOptions) {}
 
@@ -211,7 +215,7 @@ export class ApiClient {
   /** Returns a valid visitor session, creating or refreshing it when needed. */
   ensureSession(): Promise<SessionResponse> {
     if (this.sessionPromise) return this.sessionPromise;
-    if (this.session && this.fresh(this.session)) return Promise.resolve(this.session);
+    if (this.session && this.fresh(this.session) && !this.pendingCheck) return Promise.resolve(this.session);
     const generation = this.sessionGeneration;
     const promise = this.loadSession(generation).catch((error) => {
       if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
@@ -229,7 +233,7 @@ export class ApiClient {
       if (s) {
         // A backend that signs users in decides who the visitor is on every page load: the
         // stored anonymous token only seeds the visitor id when the user is not signed in.
-        if (this.fresh(s)) {
+        if (this.fresh(s) && !this.pendingCheck) {
           const cfg = await this.getConfig();
           if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
           if (!cfg.identity) return (this.session = s);
@@ -246,6 +250,10 @@ export class ApiClient {
     const body: Record<string, string> = {};
     const previous = this.session && !this.session.verified ? this.session : this.stored();
     if (previous?.token) body.token = previous.token;
+    // The install check nonce goes with this one request, whatever its outcome.
+    const check = this.pendingCheck;
+    this.pendingCheck = null;
+    if (check) body.check = check;
     if (cfg.identity) {
       const hint = this.session?.verified ? this.session.reuseHint : tabStore.get(this.reuseKey);
       if (hint) body.reuseHint = hint;
@@ -279,7 +287,10 @@ export class ApiClient {
     if (generation !== this.sessionGeneration) return this.supersededSessions.get(generation)!;
     // obtainedAt lets fresh() size the refresh margin to the server's token lifetime.
     const now = Date.now();
-    const held: HeldSession = { ...s, obtainedAt: now };
+    if (check) this.checkAccepted = s.check === true;
+    // The answer to an install check is never held or stored: a later page load must ask again.
+    const { check: _answer, ...answer } = s;
+    const held: HeldSession = { ...answer, obtainedAt: now };
     this.session = held;
     // A signed-in session is used from memory only: the next page load asks the backend again, so a
     // sign-out or a different user never inherits it. Only its reuse hint, when the backend sent one,
@@ -321,6 +332,25 @@ export class ApiClient {
     const next = this.ensureSession();
     if (previous) this.supersededSessions.set(previousGeneration, next);
     return next;
+  }
+
+  /**
+   * Opens a session whose `/session` request carries the control plane's install check nonce as
+   * `check`, asking the backend even when the session held or stored is still fresh. Resolves whether
+   * the backend accepted the nonce (`check: true` in its answer); rejects when no session could be
+   * opened. The nonce goes with one request only.
+   */
+  async checkedSession(nonce: string): Promise<boolean> {
+    // A session request already in flight does not carry the nonce: let it finish first.
+    await this.sessionPromise?.catch(() => {});
+    this.pendingCheck = nonce;
+    this.checkAccepted = false;
+    try {
+      await this.ensureSession();
+    } finally {
+      this.pendingCheck = null;
+    }
+    return this.checkAccepted;
   }
 
   /** Requests a single-use launch ticket. Does not refresh or swap the signed-in session after refusal. */

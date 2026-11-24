@@ -63,6 +63,8 @@ export interface Strings {
   memberLinkError: string;
   memberLinkSignIn: string;
   memberLinkPrivate: string;
+  /** The one test message the widget sends when the control plane checks the install (`?dewee_check=`). */
+  installCheck: string;
   pageShare: string;
   pageChanged: string;
   pageUnavailable: string;
@@ -151,6 +153,7 @@ const en: Strings = {
   memberLinkError: "The code could not be verified. Check it or start again in your workspace.",
   memberLinkSignIn: "Sign in to this website, then choose Link workspace account again.",
   memberLinkPrivate: "Enter your verification code only in the Link workspace account form, not in chat or shared page content.",
+  installCheck: "Install check: please reply to confirm this chat works.",
   jobAccessOpened: "Job access opened in a new window. Review and confirm any permissions there.",
   jobAccessUnavailable: "Job access could not be opened. Sign in again or retry.",
   jobAccessPopupBlocked: "Allow popups for this site, then choose Job access again.",
@@ -242,6 +245,7 @@ const vi: Strings = {
   memberLinkError: "Không xác minh được mã. Hãy kiểm tra hoặc bắt đầu lại trong workspace.",
   memberLinkSignIn: "Hãy đăng nhập vào website, rồi chọn Liên kết tài khoản workspace lần nữa.",
   memberLinkPrivate: "Chỉ nhập mã xác minh vào biểu mẫu Liên kết tài khoản workspace, không đưa vào chat hoặc nội dung trang chia sẻ.",
+  installCheck: "Kiểm tra cài đặt: vui lòng trả lời để xác nhận khung chat này hoạt động.",
   jobAccessOpened: "Đã mở cửa sổ quyền công việc. Hãy xem lại và xác nhận quyền tại đó.",
   jobAccessUnavailable: "Chưa mở được quyền công việc. Hãy đăng nhập lại hoặc thử lại.",
   jobAccessPopupBlocked: "Cho phép cửa sổ bật lên cho trang này rồi chọn Quyền công việc lần nữa.",

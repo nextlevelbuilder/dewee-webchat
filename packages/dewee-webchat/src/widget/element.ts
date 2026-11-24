@@ -1,5 +1,5 @@
 // <dewee-chat> — framework-agnostic chat widget (Shadow DOM, zero dependencies).
-import { isAdmissionErrorCode, isIdentityErrorCode, isLinkErrorCode, type ActionSensitivity, type AgentInfo, type ChatRequestBody, type ChatStreamEvent, type HandoffControl, type HeldChatResponse, type HistoryMessage, type LinkResponse, type PublicConfig, type ToolCallView } from "../protocol";
+import { INSTALL_CHECK_RE, isAdmissionErrorCode, isIdentityErrorCode, isLinkErrorCode, type ActionSensitivity, type AgentInfo, type ChatRequestBody, type ChatStreamEvent, type HandoffControl, type HeldChatResponse, type HistoryMessage, type LinkResponse, type PublicConfig, type ToolCallView } from "../protocol";
 import { ActionRegistry, runActionCall, type ActionCallStatus, type ActionConfirmHook, type PageAction, type PageActionInfo } from "../actions/action-runner";
 import {
   formatActionResults,
@@ -14,7 +14,7 @@ import {
 import { createDomActions, type DomActions, type DomActionsRoot } from "../actions/dom-actions";
 import { ACTION_LIMITS, stripPageBlock } from "../actions/page-block";
 import { ApiClient, ApiError, type RequestHeadersOption } from "./api-client";
-import { Diagnostics, errorCode, type CheckResult, type CheckState, type CheckStep, type WidgetDiagnostics } from "./diagnostics";
+import { Diagnostics, errorCode, type CheckResult, type CheckState, type CheckStep, type InstallCheckOutcome, type WidgetDiagnostics } from "./diagnostics";
 import { JobAccessPopupError, openJobAccessTicket } from "./job-access";
 import { showConfirmDialog } from "./confirm-dialog";
 import { icons, pickStrings, type Strings } from "./i18n";
@@ -38,6 +38,21 @@ const POLL_MAX_MS = 30_000;
 const POLL_IDLE_LIMIT_MS = 60 * 60_000;
 /** A request nobody on duty took is still watched this long, in case someone comes on duty and accepts it. */
 const UNATTENDED_WATCH_MS = 10 * 60_000;
+/**
+ * Install check nonces already used in this page load. A nonce is used once, however many widgets the
+ * page holds and however often one is moved, re-booted or renews its session.
+ */
+const claimedInstallChecks = new Set<string>();
+
+/** The control plane's install check nonce in the page URL (`?dewee_check=`), or null. Anything malformed is ignored. */
+function installCheckFromUrl(): string | null {
+  try {
+    const nonce = new URLSearchParams(location.search).get("dewee_check");
+    return nonce !== null && INSTALL_CHECK_RE.test(nonce) ? nonce : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface DeweeChatConfig {
   /** Backend base URL (the server handler). Default: "/api/dewee". */
@@ -263,6 +278,8 @@ export class DeweeChatElement extends ElementBase {
   /** The retry panel, kept across renders so a screen reader hears the alert once. */
   private unavailablePanel: HTMLElement | null = null;
   private diag = new Diagnostics();
+  /** The page URL's install check nonce, read once (undefined until read). */
+  private checkNonce: string | null | undefined;
   private probedPage = false;
   private strings: Strings = pickStrings();
   private mql: MediaQueryList | null = null;
@@ -394,6 +411,11 @@ export class DeweeChatElement extends ElementBase {
 
   /** Sends a message programmatically (opens the widget first). */
   async send(text: string): Promise<void> {
+    return this.submit(text);
+  }
+
+  /** {@link send}; `check` (the install check nonce) goes with the visible message only, never a follow-up. */
+  private async submit(text: string, check?: string): Promise<void> {
     const message = text.trim();
     if (!message || this.running || this.preparingPage || this.cooldown.active) return;
     if (/MEM-[A-Z2-7]{16}/i.test(message)) {
@@ -441,7 +463,7 @@ export class DeweeChatElement extends ElementBase {
       if (/MEM-[A-Z2-7]{16}/i.test(next.message) || (attachment && /MEM-[A-Z2-7]{16}/i.test(JSON.stringify(attachment)))) {
         this.showNotice(this.strings.memberLinkPrivate); break;
       }
-      const reply = await this.runTurn(next.message, next.hidden, round === 0 ? attachment : undefined);
+      const reply = await this.runTurn(next.message, next.hidden, round === 0 ? attachment : undefined, round === 0 ? check : undefined);
       next = null;
       if (last || reply.status !== "done" || reply.stopped || reply.dropped || !this.actionRegistry().size) break;
       const { calls } = parseDirectives(reply.content);
@@ -466,7 +488,7 @@ export class DeweeChatElement extends ElementBase {
   }
 
   /** One request/response with the agent. */
-  private async runTurn(message: string, hidden: boolean, attachment?: PageContextAttachment): Promise<ViewMessage> {
+  private async runTurn(message: string, hidden: boolean, attachment?: PageContextAttachment, check?: string): Promise<ViewMessage> {
     const generation = this.credentialGeneration;
     this.pushMessage({ role: "user", content: message, hidden });
     const reply: ViewMessage = { role: "assistant", content: "", status: "streaming", startedAt: Date.now() };
@@ -485,7 +507,7 @@ export class DeweeChatElement extends ElementBase {
       this.setCheck("session", "ok");
       if (!hidden) this.setCheck("reply", "pending");
       let held: HeldChatResponse | undefined;
-      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal, (h) => { held = h; });
+      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}), ...(check ? { check } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal, (h) => { held = h; });
       // On a takeover backend a run with nothing to show can be the agent asking for a person with its
       // tool: the history read after the turn says whether a takeover started.
       if (!held && !reply.yielded && reply.status !== "error" && this.server?.humanHandoff === true && !reply.content.trim() && !reply.toolCalls?.length && this.credentialCards.size === cards) reply.yielded = "empty";
@@ -1083,6 +1105,8 @@ export class DeweeChatElement extends ElementBase {
     }
     document.addEventListener("visibilitychange", this.onVisibility);
     this.addEventListener("focusin", this.resumePolling);
+    // The control plane is checking this install: boot now (even closed) so the check can run.
+    if (this.pendingInstallCheck()) void this.activate().catch(() => {});
     // Moved back into the page: the server says again who answers, and a takeover is watched again.
     if (this.activated) this.resumeHandoff();
   }
@@ -1495,6 +1519,45 @@ export class DeweeChatElement extends ElementBase {
     const config = this.diag.snapshot().config;
     const ok = config.state === "ok";
     this.emit("dewee:ready", { agent: this.agentId, config: ok ? this.server : null, ok, ...(ok ? {} : { error: { code: config.code } }) });
+    if (ok) void this.runInstallCheck(seq);
+  }
+
+  /**
+   * The install check nonce this element may still use, or null: none in the page URL, already used
+   * in this page load, or a widget that talks to a gateway directly (`gatewayUrl` + `gatewayToken`),
+   * which has no control plane host to confirm it.
+   */
+  private pendingInstallCheck(): string | null {
+    if (this.checkNonce === undefined) this.checkNonce = installCheckFromUrl();
+    const c = this.config;
+    if (!this.checkNonce || claimedInstallChecks.has(this.checkNonce) || (c.gatewayUrl && c.gatewayToken)) return null;
+    return this.checkNonce;
+  }
+
+  /**
+   * The control plane's install check: a session that carries the nonce, then, only when the backend
+   * answered `check: true`, one fixed test message carrying it too. Once per page load, never again
+   * after `renewSession()` or a new boot. The nonce is never shown, emitted or put in a snapshot.
+   */
+  private async runInstallCheck(seq: number): Promise<void> {
+    const nonce = this.pendingInstallCheck();
+    if (!nonce) return;
+    claimedInstallChecks.add(nonce);
+    let accepted = false;
+    if (this.diag.state("session") !== "ok") this.setCheck("session", "pending");
+    try {
+      accepted = await this.client().checkedSession(nonce);
+      this.setCheck("session", "ok");
+    } catch (e) {
+      this.setCheck("session", "failed", errorCode(e));
+    }
+    this.setInstallCheck(accepted ? "accepted" : "ignored");
+    if (!accepted || seq !== this.bootSeq || !this.isConnected) return;
+    await this.submit(this.strings.installCheck, nonce);
+  }
+
+  private setInstallCheck(outcome: InstallCheckOutcome) {
+    if (this.diag.setInstallCheck(outcome)) this.emit("dewee:status", this.diag.snapshot());
   }
 
   private async switchAgent(id: string) {

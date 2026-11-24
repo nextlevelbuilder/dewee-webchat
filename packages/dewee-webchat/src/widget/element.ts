@@ -30,7 +30,8 @@ const CREDENTIAL_GONE_CODES = new Set(["credential_requests_unavailable", "crede
 /**
  * History polling during a human takeover: from 4 s, slower by half each time nothing changed, up to
  * 30 s (CCP allows 60 history reads a minute per visitor). It stops once the agent answers again, and
- * after an hour without a change (the next message or request starts it again).
+ * after an hour without a change (the next message or request, opening or focusing the widget, or
+ * showing the tab starts it again). It pauses while the tab is hidden.
  */
 const POLL_MIN_MS = 4_000;
 const POLL_MAX_MS = 30_000;
@@ -165,8 +166,12 @@ interface ViewMessage extends HistoryMessage {
    * stopped because a person took the conversation over. Removed from the transcript, never reported.
    */
   dropped?: boolean;
-  /** The run ended with `cancelled` on a takeover backend: the agent yielded to a person. */
-  yielded?: boolean;
+  /**
+   * On a takeover backend, the run may have handed the conversation to a person: it ended `cancelled`
+   * (a person took it over mid-run) or `empty` (the agent asked for a person and wrote nothing). The
+   * server's history decides.
+   */
+  yielded?: "cancelled" | "empty";
   actionsHash?: string;
   /** Visitor of the session that answered with `actionsHash`: the ack is stored for that conversation. */
   ackVisitor?: string;
@@ -237,9 +242,16 @@ export class DeweeChatElement extends ElementBase {
   private handoffBusy = false;
   /** The backend said this visitor cannot be handed to a person: the button stays hidden. */
   private handoffUnavailable = false;
+  /** Redraws the status once an unattended request is no longer watched. */
+  private unattendedTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Until when history is polled although the server last said the agent answers (its answer was not read). */
+  private followUntil = 0;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
-  private pollInFlight = false;
+  /** The polling generation whose history read is in flight; a stopped generation's read never blocks a new one. */
+  private pollInFlight: number | undefined;
   private pollGeneration = 0;
+  /** Bumped by every local change to the transcript: a history read started before it is stale. */
+  private transcriptRevision = 0;
   private pollDelay = POLL_MIN_MS;
   private pollChangedAt = 0;
   private activated = false;
@@ -364,6 +376,7 @@ export class DeweeChatElement extends ElementBase {
     this.removeAttribute("data-unread");
     this.els.launcher.setAttribute("aria-expanded", "true");
     this.activate();
+    if (this.activated) this.resumePolling();
     setTimeout(() => this.els.input.focus(), 120);
     this.emit("dewee:open");
   }
@@ -473,14 +486,19 @@ export class DeweeChatElement extends ElementBase {
       if (!hidden) this.setCheck("reply", "pending");
       let held: HeldChatResponse | undefined;
       await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal, (h) => { held = h; });
+      // On a takeover backend a run with nothing to show can be the agent asking for a person with its
+      // tool: the history read after the turn says whether a takeover started.
+      if (!held && !reply.yielded && reply.status !== "error" && this.server?.humanHandoff === true && !reply.content.trim() && !reply.toolCalls?.length && this.credentialCards.size === cards) reply.yielded = "empty";
       if (held || reply.yielded) {
         // No agent answer is coming: the message was kept for staff, or the agent yielded to a person.
         // Neither is a failed reply; the transcript is redrawn from what the server stored.
         this.dropReply(reply);
         if (!hidden) this.restoreReplyCheck();
         if (held && generation === this.credentialGeneration) {
-          this.setControl(held.control);
-          this.els.announcer.textContent = this.strings.handoff.held;
+          // One announcement: the message was kept, and (the first time) who answers now.
+          const changed = held.control !== this.control;
+          this.setControl(held.control, false);
+          this.els.announcer.textContent = changed ? `${this.strings.handoff.held} ${this.controlText(held.control)}` : this.strings.handoff.held;
           this.updatePolling(true);
         }
       } else if (reply.status === "streaming") reply.status = "done";
@@ -509,7 +527,7 @@ export class DeweeChatElement extends ElementBase {
       this.finishThinking(reply);
       this.updateMessage(reply);
       this.setRunning(null);
-      if (reply.yielded && generation === this.credentialGeneration) void this.refreshFromHistory().catch(() => { /* the next poll or message shows it */ });
+      if (reply.yielded && generation === this.credentialGeneration) void this.followYield(reply.yielded);
       if (reply.status === "done" && !reply.dropped) {
         if (reply.actionsHash && reply.ackVisitor && !reply.stopped) this.setAck(reply.actionsHash, reply.ackVisitor);
         this.emit("dewee:reply", { content: reply.content, agent: this.agentId, conversationId: this.conversationId });
@@ -632,19 +650,41 @@ export class DeweeChatElement extends ElementBase {
     reply.status = "done";
     reply.content = "";
     this.messages = this.messages.filter((m) => m !== reply);
+    this.transcriptRevision++;
     reply.view?.root.remove();
     reply.view = undefined;
   }
 
-  /** Follows the control the server returned, announcing a change. Polling follows it too. */
-  private setControl(next: HandoffControl) {
+  /**
+   * After a run that may have handed the conversation to a person: the history read follows the
+   * server's control (and starts polling for a takeover). When it cannot be read, the conversation is
+   * watched for a while instead of guessed. A `cancelled` run that was no takeover (a Stop from
+   * another tab) is shown as stopped rather than silently dropped.
+   */
+  private async followYield(kind: NonNullable<ViewMessage["yielded"]>): Promise<void> {
+    const generation = this.credentialGeneration;
+    const read = await this.refreshFromHistory().catch(() => undefined);
+    if (generation !== this.credentialGeneration) return;
+    if (read === undefined) {
+      this.followUntil = Date.now() + UNATTENDED_WATCH_MS;
+      this.updatePolling(true);
+      return;
+    }
+    if (kind === "cancelled" && this.control === "agent") this.pushMessage({ role: "assistant", content: `_${this.strings.stopped}_`, status: "done", stopped: true });
+  }
+
+  private controlText(control: HandoffControl): string {
+    const s = this.strings.handoff;
+    return control === "waiting_human" ? s.waiting : control === "human_active" ? s.active : s.returned;
+  }
+
+  /** Follows the control the server returned, announcing a change (unless the caller announces it). Polling follows it too. */
+  private setControl(next: HandoffControl, announce = true) {
     const previous = this.control;
     this.control = next;
-    if (next !== "agent") this.unattendedUntil = 0; // someone accepted, or the request holds the conversation
+    if (next !== "agent") this.clearUnattended(); // someone accepted, or the request holds the conversation
     if (previous !== next) {
-      const s = this.strings.handoff;
-      const text = next === "waiting_human" ? s.waiting : next === "human_active" ? s.active : s.returned;
-      this.els.announcer.textContent = text;
+      if (announce) this.els.announcer.textContent = this.controlText(next);
       this.pollDelay = POLL_MIN_MS;
       this.pollChangedAt = Date.now();
     }
@@ -652,14 +692,50 @@ export class DeweeChatElement extends ElementBase {
     this.updatePolling();
   }
 
+  /** Nobody on duty took the request: it is watched for a while, and the status is redrawn when that ends. */
+  private watchUnattended() {
+    this.clearUnattended();
+    this.unattendedUntil = Date.now() + UNATTENDED_WATCH_MS;
+    this.unattendedTimer = setTimeout(() => {
+      this.unattendedTimer = undefined;
+      this.renderHandoff();
+      this.updatePolling();
+    }, UNATTENDED_WATCH_MS + 50);
+  }
+
+  private clearUnattended() {
+    if (this.unattendedTimer !== undefined) clearTimeout(this.unattendedTimer);
+    this.unattendedTimer = undefined;
+    this.unattendedUntil = 0;
+  }
+
   /** Forgets the takeover state of the previous conversation (another conversation, agent or visitor). */
   private resetHandoff() {
     this.stopPolling();
     this.control = "agent";
-    this.unattendedUntil = 0;
+    this.clearUnattended();
+    this.followUntil = 0;
     this.handoffBusy = false;
     if (this.els) this.renderHandoff();
   }
+
+  /** Back in the page: the request in flight was abandoned, and the server says who answers now. */
+  private resumeHandoff() {
+    if (this.server?.humanHandoff !== true) return;
+    this.updatePolling(true);
+    if (this.messages.length && !this.running) void this.refreshFromHistory().catch(() => { /* the next poll shows it */ });
+  }
+
+  /** The visitor came back (opened or focused the widget, or showed the tab): a live takeover is watched again after an idle stop. */
+  private readonly resumePolling = () => {
+    if (this.pollTimer === undefined && this.pollInFlight !== this.pollGeneration) this.updatePolling(true);
+  };
+
+  /** Not polled while the tab is hidden. */
+  private readonly onVisibility = () => {
+    if (document.visibilityState === "hidden") this.stopPolling();
+    else this.resumePolling();
+  };
 
   /** The status line and the "talk to a person" button, shown only when the backend offers takeovers. */
   private renderHandoff() {
@@ -695,7 +771,7 @@ export class DeweeChatElement extends ElementBase {
       if (generation !== this.credentialGeneration) return;
       this.handoffBusy = false;
       // Nobody on duty: the agent keeps answering; the request is watched for a while in case someone accepts it.
-      if (result.control === "agent") this.unattendedUntil = Date.now() + UNATTENDED_WATCH_MS;
+      if (result.control === "agent") this.watchUnattended();
       this.setControl(result.control);
       if (result.control === "agent") this.els.announcer.textContent = s.unattended;
       this.updatePolling(true);
@@ -707,7 +783,8 @@ export class DeweeChatElement extends ElementBase {
       if (code === "human_handoff_unavailable") {
         this.handoffUnavailable = true;
         this.showNotice(s.unavailable);
-      } else if (code === "rate_limited" || code === "RATE_LIMITED") this.showNotice(s.limited);
+      } else if (isAdmissionErrorCode(code)) this.showNotice(this.strings.admissionErrors[code]);
+      else if (code === "rate_limited") this.showNotice(s.limited);
       else if (isIdentityErrorCode(code)) this.showError(null, error as Error);
       else this.showNotice(s.failed);
       this.els.announcer.textContent = "";
@@ -721,7 +798,9 @@ export class DeweeChatElement extends ElementBase {
 
   /** History is polled while staff are asked or hold the conversation, never on a backend without takeovers. */
   private shouldPoll(): boolean {
-    return this.isConnected && this.server?.humanHandoff === true && (this.control !== "agent" || Date.now() < this.unattendedUntil) && Date.now() - this.pollChangedAt < POLL_IDLE_LIMIT_MS;
+    const now = Date.now();
+    return this.isConnected && this.server?.humanHandoff === true && document.visibilityState !== "hidden"
+      && (this.control !== "agent" || now < this.unattendedUntil || now < this.followUntil) && now - this.pollChangedAt < POLL_IDLE_LIMIT_MS;
   }
 
   private updatePolling(restart = false) {
@@ -730,7 +809,7 @@ export class DeweeChatElement extends ElementBase {
       this.pollChangedAt = Date.now();
     }
     if (!this.shouldPoll()) return this.stopPolling();
-    if (this.pollTimer === undefined && !this.pollInFlight) this.pollTimer = setTimeout(() => void this.pollHistory(), this.pollDelay);
+    if (this.pollTimer === undefined && this.pollInFlight !== this.pollGeneration) this.pollTimer = setTimeout(() => void this.pollHistory(), this.pollDelay);
   }
 
   private stopPolling() {
@@ -745,11 +824,11 @@ export class DeweeChatElement extends ElementBase {
     const generation = this.pollGeneration;
     let changed = false;
     if (!this.running) {
-      this.pollInFlight = true;
+      this.pollInFlight = generation;
       try {
-        changed = await this.refreshFromHistory();
+        changed = (await this.refreshFromHistory()) === true;
       } catch { /* a failed read backs off like an unchanged one */ }
-      finally { this.pollInFlight = false; }
+      finally { if (this.pollInFlight === generation) this.pollInFlight = undefined; }
     }
     if (generation !== this.pollGeneration) return;
     if (changed) this.pollChangedAt = Date.now();
@@ -760,20 +839,25 @@ export class DeweeChatElement extends ElementBase {
   /**
    * Reads the conversation and shows what changed: new turns (staff replies, notices, a staff message
    * written first) are appended so a screen reader hears only them; anything else redraws the log.
-   * Follows the server's control. Returns whether the transcript changed.
+   * Follows the server's control. Returns whether the transcript changed, or `undefined` when the read
+   * was discarded as stale.
    */
-  private async refreshFromHistory(): Promise<boolean> {
+  private async refreshFromHistory(): Promise<boolean | undefined> {
     const generation = this.credentialGeneration;
     const conversation = this.conversationId;
+    const revision = this.transcriptRevision;
     const history = await this.client().historyDetails(this.agentId, conversation);
-    if (generation !== this.credentialGeneration || conversation !== this.conversationId || this.running) return false;
+    // Another visitor or conversation, a reply streaming, or a message shown meanwhile: the read is stale.
+    if (generation !== this.credentialGeneration || conversation !== this.conversationId || this.running || revision !== this.transcriptRevision) return undefined;
+    this.followUntil = 0;
     const next = decorateHistory(history.messages.map((m) => ({ ...m, status: "done" as const })));
-    const same = (a: ViewMessage, b: ViewMessage) => a.role === b.role && (a.authorKind ?? "") === (b.authorKind ?? "") && a.content === b.content;
-    const known = this.messages.length;
+    const added = appendedTurns(this.messages, next);
     let changed = false;
-    if (known <= next.length && this.messages.every((m, i) => same(m, next[i]))) {
-      const added = next.slice(known);
-      for (const m of added) this.pushMessage(m);
+    if (added) {
+      // A visitor who scrolled up to read is not pulled to the bottom by a polled turn.
+      const stick = this.nearBottom();
+      for (const m of added) this.pushMessage(m, false);
+      if (added.length && stick) this.scrollToBottom(true);
       changed = added.length > 0;
       if (added.some((m) => m.role === "assistant" && !m.hidden) && this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
     } else {
@@ -997,13 +1081,20 @@ export class DeweeChatElement extends ElementBase {
       if (this.config.mode !== "inline") this.open();
       else this.activate();
     }
-    // Moved back into the page during a takeover: watching the conversation resumes.
-    if (this.activated) this.updatePolling(true);
+    document.addEventListener("visibilitychange", this.onVisibility);
+    this.addEventListener("focusin", this.resumePolling);
+    // Moved back into the page: the server says again who answers, and a takeover is watched again.
+    if (this.activated) this.resumeHandoff();
   }
 
   disconnectedCallback(): void {
+    document.removeEventListener("visibilitychange", this.onVisibility);
+    this.removeEventListener("focusin", this.resumePolling);
     this.stopPolling();
     this.clearCredentials();
+    // A request for a person in flight is abandoned with this page view: its answer is never applied.
+    this.handoffBusy = false;
+    this.renderHandoff();
     this.pageGeneration++;
     this.sharedPage = undefined;
     this.els.pageChoice.checked = false;
@@ -1642,11 +1733,12 @@ export class DeweeChatElement extends ElementBase {
     return w;
   }
 
-  private pushMessage(m: ViewMessage) {
+  private pushMessage(m: ViewMessage, scroll = true) {
     if (!this.messages.length) this.els.log.replaceChildren();
     this.messages.push(m);
+    this.transcriptRevision++;
     this.els.log.appendChild(this.renderMessage(m));
-    this.scrollToBottom(true);
+    if (scroll) this.scrollToBottom(true);
     this.renderHandoff();
   }
 
@@ -1844,7 +1936,7 @@ export class DeweeChatElement extends ElementBase {
         // On a takeover backend a run the visitor did not stop ends `cancelled` when a person took the
         // conversation over: the partial text was never stored, so it is dropped (see runTurn).
         if (e.code === "cancelled" && this.server?.humanHandoff === true) {
-          m.yielded = true;
+          m.yielded = "cancelled";
           m.status = "done";
           break;
         }
@@ -1959,6 +2051,23 @@ export class DeweeChatElement extends ElementBase {
       holder.remove();
     }
   }
+}
+
+/**
+ * The turns a history read adds after what is shown, or null when the two do not line up (then the log
+ * is redrawn). History is a window of the latest turns, so in a long conversation it starts after the
+ * first shown turns: the largest overlap between the end of `shown` and the start of `latest` wins.
+ */
+function appendedTurns(shown: ViewMessage[], latest: ViewMessage[]): ViewMessage[] | null {
+  if (!shown.length) return latest;
+  const same = (a: ViewMessage, b: ViewMessage) => a.role === b.role && (a.authorKind ?? "") === (b.authorKind ?? "") && a.content === b.content;
+  for (let start = Math.max(0, shown.length - latest.length); start < shown.length; start++) {
+    const overlap = shown.length - start;
+    let aligned = true;
+    for (let i = 0; i < overlap && aligned; i++) aligned = same(shown[start + i], latest[i]);
+    if (aligned) return latest.slice(overlap);
+  }
+  return null;
 }
 
 /** Hides automatic action-result messages and restores action chips when loading history. */

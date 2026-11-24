@@ -19,8 +19,12 @@ function backend(opts: { handoff?: boolean; history?: Turn[]; control?: Control 
     messages: [...(opts.history ?? [])] as Turn[],
     control: (opts.control ?? "agent") as Control,
     staffOnDuty: true,
-    requestHuman: undefined as undefined | (() => Response),
+    requestHuman: undefined as undefined | (() => Response | Promise<Response>),
     chatStream: undefined as undefined | (() => Response),
+    /** History reads answer what the conversation held when they arrived, after this gate opens. */
+    historyGate: undefined as undefined | Promise<void>,
+    /** The next history reads fail with a 502. */
+    historyFailures: 0,
     calls: [] as Array<{ path: string; body: any }>,
   };
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
@@ -30,7 +34,16 @@ function backend(opts: { handoff?: boolean; history?: Turn[]; control?: Control 
     state.calls.push({ path, body });
     if (path === "config") return json(opts.handoff ? { ...CONFIG, humanHandoff: true } : CONFIG);
     if (path === "session") return json({ visitorId: "v1", token: "visitor-token", expiresAt: Date.now() + 86_400_000 });
-    if (path === "history") return json({ messages: state.messages, ...(opts.handoff ? { control: state.control } : { control: "human_active" }) });
+    if (path === "history") {
+      if (state.historyFailures > 0) {
+        state.historyFailures--;
+        return json({ error: { code: "gateway_error", message: "Dewee is unavailable, try again later" } }, 502);
+      }
+      // Like CCP: the latest 50 turns.
+      const snapshot = { messages: state.messages.slice(-50), ...(opts.handoff ? { control: state.control } : { control: "human_active" }) };
+      if (state.historyGate) await state.historyGate;
+      return json(snapshot);
+    }
     if (path === "request-human") {
       if (state.requestHuman) return state.requestHuman();
       if (state.control !== "agent") return json({ control: state.control, staffOnDuty: true });
@@ -293,5 +306,255 @@ describe("<dewee-chat> human takeover", () => {
     expect(button(el).hidden).toBe(true);
     expect(events.filter((e) => e.name === "dewee:error")).toEqual([]);
     expect(count(state, "request-human")).toBe(2);
+  });
+
+  it("shows the localized refusal when the request for a person is refused as an admission error", async () => {
+    const state = backend({ handoff: true });
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    state.requestHuman = () => json({ error: { code: "RATE_LIMITED", message: "Too many messages, please wait a moment.", retryAfterMs: 5000 } }, 429);
+    button(el).click();
+    await settle();
+    expect([...el.shadowRoot!.querySelectorAll(".notice")].at(-1)!.textContent).toBe("You're sending messages too quickly.");
+    state.requestHuman = () => json({ error: { code: "POLICY_DENIED", message: "This message can't be sent." } }, 403);
+    button(el).click();
+    await settle();
+    expect([...el.shadowRoot!.querySelectorAll(".notice")].at(-1)!.textContent).toBe("This message can't be sent. Try shortening or rephrasing it.");
+    expect(button(el).hidden).toBe(false);
+  });
+});
+
+const deferred = <T = void>() => {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+};
+
+describe("<dewee-chat> human takeover: runs, polling and page lifecycle", () => {
+  it("follows a takeover the agent starts with its tool: an empty run, then history says waiting and staff answer by polling", async () => {
+    const state = backend({ handoff: true });
+    const { el, events } = await mount();
+    await el.send("hi");
+    await settle();
+    state.chatStream = () => {
+      // The agent called its request-a-person tool: the run ends without text, the request is recorded.
+      state.control = "waiting_human";
+      state.messages.push({ role: "assistant", content: "Your request was received.", authorKind: "system" });
+      return sse([{ type: "start", conversationId: "c", agent: "support" }, { type: "done", content: "" }]);
+    };
+    const replyBefore = el.diagnostics().reply;
+    vi.useFakeTimers();
+    events.length = 0;
+    await el.send("I want to talk to a person");
+    await tick(0);
+    expect(bubbles(el)).toEqual(["msg user: hi", "msg assistant: Agent answer", "msg user: I want to talk to a person", "msg assistant system: Your request was received."]);
+    expect(el.diagnostics().reply).toEqual(replyBefore);
+    expect(el.diagnostics().reply.code).not.toBe("empty_reply");
+    expect(events).toEqual([]);
+    expect(status(el).textContent).toBe("Waiting for a support staff member to join…");
+    state.control = "human_active";
+    state.messages.push({ role: "assistant", content: "Hello from support.", authorKind: "human" });
+    await tick(4_000);
+    expect(bubbles(el).at(-1)).toBe("msg assistant human: Support staffHello from support.");
+    expect(status(el).textContent).toBe("You're chatting with support staff.");
+  });
+
+  it("shows a cancelled run that was no takeover as stopped, and does not poll", async () => {
+    const state = backend({ handoff: true });
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    // Stopped from another tab: the server keeps the agent in control and stored no partial text.
+    state.chatStream = () => sse([{ type: "start", conversationId: "c", agent: "support" }, { type: "delta", text: "partial agent text" }, { type: "error", code: "cancelled", message: "Cancelled" }]);
+    vi.useFakeTimers();
+    await el.send("one more thing");
+    await tick(0);
+    expect(bubbles(el).slice(-2)).toEqual(["msg user: one more thing", "msg assistant: Stopped."]);
+    expect(el.shadowRoot!.textContent).not.toContain("partial agent text");
+    const reads = count(state, "history");
+    await tick(120_000);
+    expect(count(state, "history")).toBe(reads);
+  });
+
+  it("watches the conversation when the history read after a takeover fails", async () => {
+    const state = backend({ handoff: true });
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    state.chatStream = () => {
+      state.control = "human_active";
+      state.messages.push({ role: "assistant", content: "Staff joined.", authorKind: "system" });
+      state.historyFailures = 1;
+      return sse([{ type: "start", conversationId: "c", agent: "support" }, { type: "delta", text: "partial agent text" }, { type: "error", code: "cancelled", message: "Cancelled" }]);
+    };
+    vi.useFakeTimers();
+    await el.send("one more thing");
+    await tick(0);
+    expect(status(el).hidden).toBe(true); // not known yet
+    await tick(4_000);
+    expect(status(el).textContent).toBe("You're chatting with support staff.");
+    expect(bubbles(el).at(-1)).toBe("msg assistant system: Staff joined.");
+  });
+
+  it("keeps polling after the widget is moved while a history read is in flight", async () => {
+    const state = backend({ handoff: true });
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    vi.useFakeTimers();
+    button(el).click();
+    await tick(0);
+    const gate = deferred();
+    state.historyGate = gate.promise;
+    await tick(4_000); // a poll is waiting for its answer
+    el.remove();
+    document.body.appendChild(el);
+    await settle();
+    state.historyGate = undefined;
+    gate.resolve();
+    await settle();
+    state.control = "human_active";
+    state.messages.push({ role: "assistant", content: "Hello from support.", authorKind: "human" });
+    await tick(4_000);
+    expect(status(el).textContent).toBe("You're chatting with support staff.");
+    expect(bubbles(el).at(-1)).toBe("msg assistant human: Support staffHello from support.");
+    const reads = count(state, "history");
+    await tick(30_000);
+    expect(count(state, "history")).toBeGreaterThan(reads);
+  });
+
+  it("does not leave 'Contacting support staff…' behind when the widget is moved during the request", async () => {
+    const state = backend({ handoff: true });
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    const answer = deferred<Response>();
+    state.requestHuman = () => answer.promise;
+    button(el).click();
+    await settle();
+    expect(status(el).textContent).toBe("Contacting support staff…");
+    el.remove();
+    document.body.appendChild(el);
+    await settle();
+    expect(status(el).hidden).toBe(true);
+    expect(button(el).hidden).toBe(false);
+    expect(button(el).getAttribute("aria-disabled")).toBe("false");
+    // The abandoned request's late answer changes nothing; a new click works.
+    answer.resolve(json({ control: "agent", staffOnDuty: false }));
+    await settle();
+    expect(button(el).getAttribute("aria-disabled")).toBe("false");
+    state.requestHuman = undefined;
+    button(el).click();
+    await settle();
+    expect(status(el).textContent).toBe("Waiting for a support staff member to join…");
+  });
+
+  it("discards a history read older than a message sent meanwhile", async () => {
+    const state = backend({ handoff: true });
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    vi.useFakeTimers();
+    button(el).click();
+    await tick(0);
+    const gate = deferred();
+    state.historyGate = gate.promise;
+    await tick(4_000); // a poll read the conversation before the next message
+    await el.send("are you there?");
+    await tick(0);
+    state.historyGate = undefined;
+    gate.resolve();
+    await settle();
+    expect(bubbles(el).at(-1)).toBe("msg user: are you there?");
+  });
+
+  it("appends a staff reply to a long conversation without a redraw, and leaves a visitor who scrolled up where they are", async () => {
+    localStorage.setItem("dewee-webchat:conv:/api/dewee::support", "conv_long_0001");
+    const history: Turn[] = Array.from({ length: 60 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `turn ${i}` }));
+    const state = backend({ handoff: true, control: "human_active", history });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { el } = await mount({ persist: "true" });
+    expect(bubbles(el)).toHaveLength(50);
+    const log = $(el, ".log")!;
+    let top = 100;
+    Object.defineProperty(log, "scrollHeight", { configurable: true, get: () => 5000 });
+    Object.defineProperty(log, "clientHeight", { configurable: true, get: () => 300 });
+    Object.defineProperty(log, "scrollTop", { configurable: true, get: () => top, set: (v: number) => { top = v; } });
+    const first = el.shadowRoot!.querySelector(".log .msg")!;
+    state.messages.push({ role: "assistant", content: "Hello from support.", authorKind: "human" });
+    await tick(4_000);
+    expect(bubbles(el)).toHaveLength(51);
+    expect(bubbles(el).at(-1)).toBe("msg assistant human: Support staffHello from support.");
+    expect(first.isConnected).toBe(true); // appended, not redrawn
+    expect(top).toBe(100);
+  });
+
+  it("redraws the status when an unattended request is no longer watched", async () => {
+    const state = backend({ handoff: true });
+    state.staffOnDuty = false;
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    vi.useFakeTimers();
+    button(el).click();
+    await tick(0);
+    expect(status(el).textContent).toBe("No one is available right now. The assistant will keep helping you.");
+    await tick(10 * 60_000 + 1_000);
+    expect(status(el).hidden).toBe(true);
+    expect(button(el).hidden).toBe(false);
+  });
+
+  it("pauses polling while the tab is hidden and resumes when it is shown", async () => {
+    let visibility = "visible";
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+    try {
+      const state = backend({ handoff: true });
+      const { el } = await mount();
+      await el.send("hi");
+      await settle();
+      vi.useFakeTimers();
+      button(el).click();
+      await tick(0);
+      visibility = "hidden";
+      document.dispatchEvent(new Event("visibilitychange"));
+      const reads = count(state, "history");
+      await tick(120_000);
+      expect(count(state, "history")).toBe(reads);
+      visibility = "visible";
+      document.dispatchEvent(new Event("visibilitychange"));
+      await tick(4_000);
+      expect(count(state, "history")).toBe(reads + 1);
+      expect(el.isConnected).toBe(true);
+    } finally {
+      delete (document as unknown as { visibilityState?: string }).visibilityState;
+    }
+  });
+
+  it("restarts polling of a live takeover when the visitor comes back after the idle stop", async () => {
+    const state = backend({ handoff: true });
+    const { el } = await mount();
+    await el.send("hi");
+    await settle();
+    vi.useFakeTimers();
+    button(el).click();
+    await tick(0);
+    await tick(61 * 60_000); // an hour without a change: polling stops
+    const reads = count(state, "history");
+    await tick(120_000);
+    expect(count(state, "history")).toBe(reads);
+    el.dispatchEvent(new Event("focusin"));
+    await tick(4_000);
+    expect(count(state, "history")).toBe(reads + 1);
+  });
+
+  it("announces one combined message when the first message is held", async () => {
+    backend({ handoff: true, control: "human_active" });
+    const { el } = await mount();
+    vi.useFakeTimers();
+    await el.send("hi");
+    await tick(0);
+    expect(announcer(el)).toBe("Message sent. Support staff will see it. You're chatting with support staff.");
+    expect(status(el).textContent).toBe("You're chatting with support staff.");
   });
 });

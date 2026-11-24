@@ -464,6 +464,10 @@ the conversation. The widget then follows what the server says:
 | Either backend, `legacy-gateway` | No: the option is refused at startup |
 | Older versions of either backend | No: no button, no feature header, no polling |
 
+Turn the option on only with widget **0.5.0-beta.7** or later on every page that embeds it (a pinned
+older widget does not understand the `202` answer to a held message). The `/config` flag reflects the
+integration's default agent.
+
 Routes and payloads: [HTTP contract](../../docs/http-contract.md#talking-to-a-person-human-takeover).
 
 ## Signed-in users

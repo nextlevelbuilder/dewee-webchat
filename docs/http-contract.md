@@ -404,7 +404,8 @@ With the option on, the backend advertises `human-handoff` to CCP on chat, histo
 (joined with `credential-requests` when that is also on), and:
 
 - `GET {base}/config` adds `"humanHandoff": true` when the integration also allows it (CCP config
-  `human_handoff`). The widget offers **Talk to a person** only then.
+  `human_handoff`, which reflects the integration's default agent). The widget offers **Talk to a
+  person** only then.
 - `POST {base}/request-human` with a visitor bearer and `{conversationId, agent?, summary?}` (`summary`
   at most 1000 characters, trimmed) asks for a person in one of the visitor's own conversations. It
   answers `{control, staffOnDuty}`: `control` is `"waiting_human"`, `"human_active"`, or `"agent"` with
@@ -412,6 +413,11 @@ With the option on, the backend advertises `human-handoff` to CCP on chat, histo
   CCP's case id is never forwarded. Another visitor's or an unknown conversation is `404 not_found`;
   an integration or agent that cannot hand over is `403 human_handoff_unavailable` (the widget then
   hides the button); the backend allows 5 requests per visitor per 10 minutes (`429 rate_limited`).
+  The control plane does not yet expose a distinct code for "cannot hand over": both backends treat
+  its `PERMISSION_DENIED` without a `remediation` as `human_handoff_unavailable`, while a
+  `PERMISSION_DENIED` that carries a remediation stays the identity refusal it is. Admission refusals
+  (`POLICY_DENIED`, `RATE_LIMITED`) keep their typed code, as on `/chat`, and the widget shows its
+  localized refusal.
 - `POST {base}/chat` while a person holds the conversation answers `202` with JSON
   `{ "held": true, "control": "waiting_human" | "human_active" }` instead of a stream: the message was
   kept for the staff, no agent ran and there is no reply to show. A run that a person takes over
@@ -431,7 +437,13 @@ With the option on, the backend advertises `human-handoff` to CCP on chat, histo
 
 While a request waits or a person holds the conversation, the widget polls `/history` (every 4 s,
 backing off to 30 s while nothing changes, for at most an hour) and stops when the agent answers again
-or the widget is removed from the page.
+or the widget is removed from the page. It pauses while the tab is hidden, and opening or focusing the
+widget or showing the tab resumes it. A run that ends with nothing to show (the agent asked for a
+person with its tool) or ends `cancelled` makes the widget read the history and follow its `control`.
+
+**Widget version.** A host with `humanHandoff: true` needs widget **0.5.0-beta.7** or later: an older
+widget does not understand the `202` held answer. Pin at least that version, or keep the option off
+until the pages that embed the widget use it.
 
 ## Extra request headers
 

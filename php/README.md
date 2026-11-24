@@ -49,7 +49,7 @@ lets visitors ask for a person when the integration allows it, exactly like the 
 `POST request-human`, a `202 {held, control}` answer to messages a person holds, and `control` and
 `authorKind` in history (never the staff member's identity). A non-boolean option is refused
 at startup, and so is the option with the legacy gateway transport. Without it the backend behaves as
-before. See the [HTTP contract](../docs/http-contract.md#talking-to-a-person-human-takeover).
+before. Turn it on only with widget 0.5.0-beta.7 or later on the pages that embed it. See the [HTTP contract](../docs/http-contract.md#talking-to-a-person-human-takeover).
 
 ## Install
 

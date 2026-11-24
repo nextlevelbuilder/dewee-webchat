@@ -1,5 +1,5 @@
 // <dewee-chat> — framework-agnostic chat widget (Shadow DOM, zero dependencies).
-import { isAdmissionErrorCode, isIdentityErrorCode, isLinkErrorCode, type ActionSensitivity, type AgentInfo, type ChatRequestBody, type ChatStreamEvent, type HistoryMessage, type LinkResponse, type PublicConfig, type ToolCallView } from "../protocol";
+import { isAdmissionErrorCode, isIdentityErrorCode, isLinkErrorCode, type ActionSensitivity, type AgentInfo, type ChatRequestBody, type ChatStreamEvent, type HandoffControl, type HeldChatResponse, type HistoryMessage, type LinkResponse, type PublicConfig, type ToolCallView } from "../protocol";
 import { ActionRegistry, runActionCall, type ActionCallStatus, type ActionConfirmHook, type PageAction, type PageActionInfo } from "../actions/action-runner";
 import {
   formatActionResults,
@@ -27,6 +27,16 @@ import type { CredentialRequestView } from "../credential-request";
 /** Pause after a RATE_LIMITED refusal that says nothing about when to retry. */
 const DEFAULT_COOLDOWN_MS = 5_000;
 const CREDENTIAL_GONE_CODES = new Set(["credential_requests_unavailable", "credential_request_not_found"]);
+/**
+ * History polling during a human takeover: from 4 s, slower by half each time nothing changed, up to
+ * 30 s (CCP allows 60 history reads a minute per visitor). It stops once the agent answers again, and
+ * after an hour without a change (the next message or request starts it again).
+ */
+const POLL_MIN_MS = 4_000;
+const POLL_MAX_MS = 30_000;
+const POLL_IDLE_LIMIT_MS = 60 * 60_000;
+/** A request nobody on duty took is still watched this long, in case someone comes on duty and accepts it. */
+const UNATTENDED_WATCH_MS = 10 * 60_000;
 
 export interface DeweeChatConfig {
   /** Backend base URL (the server handler). Default: "/api/dewee". */
@@ -150,6 +160,13 @@ interface ViewMessage extends HistoryMessage {
   refusal?: string;
   /** The visitor pressed Stop: never execute directives from a cut-off answer. */
   stopped?: boolean;
+  /**
+   * Placeholder of an agent reply that never came: the message was held for staff (`202`), or the run
+   * stopped because a person took the conversation over. Removed from the transcript, never reported.
+   */
+  dropped?: boolean;
+  /** The run ended with `cancelled` on a takeover backend: the agent yielded to a person. */
+  yielded?: boolean;
   actionsHash?: string;
   /** Visitor of the session that answered with `actionsHash`: the ack is stored for that conversation. */
   ackVisitor?: string;
@@ -212,6 +229,19 @@ export class DeweeChatElement extends ElementBase {
   private credentialBusy = new Set<string>();
   private credentialPopups = new Map<string, { popup: Window; controller: AbortController; timer?: ReturnType<typeof setTimeout> }>();
   private credentialRequestsInFlight = new Set<AbortController>();
+  /** Who answers the conversation, as the server last said (human takeover). Never guessed here. */
+  private control: HandoffControl = "agent";
+  /** Until when an unattended request (nobody on duty) is still watched; 0 = none. */
+  private unattendedUntil = 0;
+  /** A request for a person is in flight: a second click sends nothing. */
+  private handoffBusy = false;
+  /** The backend said this visitor cannot be handed to a person: the button stays hidden. */
+  private handoffUnavailable = false;
+  private pollTimer: ReturnType<typeof setTimeout> | undefined;
+  private pollInFlight = false;
+  private pollGeneration = 0;
+  private pollDelay = POLL_MIN_MS;
+  private pollChangedAt = 0;
   private activated = false;
   /** The boot in flight, so `retry()` and `checkConnection()` can wait for it. */
   private activating: Promise<void> | null = null;
@@ -237,6 +267,7 @@ export class DeweeChatElement extends ElementBase {
     status: HTMLElement; avatar: HTMLElement; select: HTMLSelectElement; input: HTMLTextAreaElement; send: HTMLButtonElement;
     newChat: HTMLButtonElement; jobAccess: HTMLButtonElement; memberLink: HTMLButtonElement; close: HTMLButtonElement; foot: HTMLElement; cooldown: HTMLElement; announcer: HTMLElement;
     pageChoice: HTMLInputElement; pageWrap: HTMLElement; pageLabel: HTMLElement; pagePreview: HTMLElement;
+    handoff: HTMLElement; handoffStatus: HTMLElement; handoffRequest: HTMLButtonElement;
   };
 
   constructor() {
@@ -399,7 +430,7 @@ export class DeweeChatElement extends ElementBase {
       }
       const reply = await this.runTurn(next.message, next.hidden, round === 0 ? attachment : undefined);
       next = null;
-      if (last || reply.status !== "done" || reply.stopped || !this.actionRegistry().size) break;
+      if (last || reply.status !== "done" || reply.stopped || reply.dropped || !this.actionRegistry().size) break;
       const { calls } = parseDirectives(reply.content);
       if (!calls.length) break;
       reply.actions = calls.map((c) => ({ id: c.id, name: c.name, args: c.ok ? c.args : undefined, status: "pending" as const }));
@@ -440,8 +471,19 @@ export class DeweeChatElement extends ElementBase {
       sessionOpen = true;
       this.setCheck("session", "ok");
       if (!hidden) this.setCheck("reply", "pending");
-      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal);
-      if (reply.status === "streaming") reply.status = "done";
+      let held: HeldChatResponse | undefined;
+      await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal, (h) => { held = h; });
+      if (held || reply.yielded) {
+        // No agent answer is coming: the message was kept for staff, or the agent yielded to a person.
+        // Neither is a failed reply; the transcript is redrawn from what the server stored.
+        this.dropReply(reply);
+        if (!hidden) this.restoreReplyCheck();
+        if (held && generation === this.credentialGeneration) {
+          this.setControl(held.control);
+          this.els.announcer.textContent = this.strings.handoff.held;
+          this.updatePolling(true);
+        }
+      } else if (reply.status === "streaming") reply.status = "done";
     } catch (e) {
       if ((e as Error).name === "AbortError") {
         reply.status = "done";
@@ -467,7 +509,8 @@ export class DeweeChatElement extends ElementBase {
       this.finishThinking(reply);
       this.updateMessage(reply);
       this.setRunning(null);
-      if (reply.status === "done") {
+      if (reply.yielded && generation === this.credentialGeneration) void this.refreshFromHistory().catch(() => { /* the next poll or message shows it */ });
+      if (reply.status === "done" && !reply.dropped) {
         if (reply.actionsHash && reply.ackVisitor && !reply.stopped) this.setAck(reply.actionsHash, reply.ackVisitor);
         this.emit("dewee:reply", { content: reply.content, agent: this.agentId, conversationId: this.conversationId });
         if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
@@ -580,6 +623,169 @@ export class DeweeChatElement extends ElementBase {
     this.scrollToBottom(true);
   }
 
+  // ---------- human takeover ----------
+
+  /** Removes the placeholder of an agent reply that is not coming (held message, or the agent yielded). */
+  private dropReply(reply: ViewMessage) {
+    reply.dropped = true;
+    reply.hidden = true;
+    reply.status = "done";
+    reply.content = "";
+    this.messages = this.messages.filter((m) => m !== reply);
+    reply.view?.root.remove();
+    reply.view = undefined;
+  }
+
+  /** Follows the control the server returned, announcing a change. Polling follows it too. */
+  private setControl(next: HandoffControl) {
+    const previous = this.control;
+    this.control = next;
+    if (next !== "agent") this.unattendedUntil = 0; // someone accepted, or the request holds the conversation
+    if (previous !== next) {
+      const s = this.strings.handoff;
+      const text = next === "waiting_human" ? s.waiting : next === "human_active" ? s.active : s.returned;
+      this.els.announcer.textContent = text;
+      this.pollDelay = POLL_MIN_MS;
+      this.pollChangedAt = Date.now();
+    }
+    this.renderHandoff();
+    this.updatePolling();
+  }
+
+  /** Forgets the takeover state of the previous conversation (another conversation, agent or visitor). */
+  private resetHandoff() {
+    this.stopPolling();
+    this.control = "agent";
+    this.unattendedUntil = 0;
+    this.handoffBusy = false;
+    if (this.els) this.renderHandoff();
+  }
+
+  /** The status line and the "talk to a person" button, shown only when the backend offers takeovers. */
+  private renderHandoff() {
+    const e = this.els;
+    if (!e) return;
+    const s = this.strings.handoff;
+    const offered = this.server?.humanHandoff === true;
+    const unattended = Date.now() < this.unattendedUntil;
+    const status = !offered ? "" : this.handoffBusy ? s.requesting : this.control === "waiting_human" ? s.waiting : this.control === "human_active" ? s.active : unattended ? s.unattended : "";
+    // Only for an existing conversation the agent answers, and not while a request already waits.
+    const button = offered && !this.handoffUnavailable && this.control === "agent" && !unattended && this.messages.some((m) => !m.hidden);
+    const hadFocus = this.root.activeElement === e.handoffRequest;
+    e.handoff.hidden = !status && !button;
+    e.handoffStatus.textContent = status;
+    e.handoffStatus.hidden = !status;
+    e.handoffRequest.hidden = !button;
+    e.handoffRequest.textContent = s.request;
+    // aria-disabled, not disabled: a disabled button drops keyboard focus.
+    e.handoffRequest.setAttribute("aria-disabled", String(this.handoffBusy));
+    if (hadFocus && !button) e.input.focus();
+  }
+
+  /** The visitor asks for a person. One request at a time; a failure leaves the chat working and the button retryable. */
+  private async requestHandoff(): Promise<void> {
+    if (this.handoffBusy || this.server?.humanHandoff !== true || this.control !== "agent") return;
+    const s = this.strings.handoff;
+    const generation = this.credentialGeneration;
+    this.handoffBusy = true;
+    this.renderHandoff();
+    this.els.announcer.textContent = s.requesting;
+    try {
+      const result = await this.client().requestHuman(this.agentId, this.conversationId);
+      if (generation !== this.credentialGeneration) return;
+      this.handoffBusy = false;
+      // Nobody on duty: the agent keeps answering; the request is watched for a while in case someone accepts it.
+      if (result.control === "agent") this.unattendedUntil = Date.now() + UNATTENDED_WATCH_MS;
+      this.setControl(result.control);
+      if (result.control === "agent") this.els.announcer.textContent = s.unattended;
+      this.updatePolling(true);
+      // The request's notice (`request_received` or `nobody_on_duty`) is in the history now.
+      await this.refreshFromHistory().catch(() => { /* the next poll shows it */ });
+    } catch (error) {
+      if (generation !== this.credentialGeneration) return;
+      const code = (error as ApiError).code;
+      if (code === "human_handoff_unavailable") {
+        this.handoffUnavailable = true;
+        this.showNotice(s.unavailable);
+      } else if (code === "rate_limited" || code === "RATE_LIMITED") this.showNotice(s.limited);
+      else if (isIdentityErrorCode(code)) this.showError(null, error as Error);
+      else this.showNotice(s.failed);
+      this.els.announcer.textContent = "";
+    } finally {
+      if (generation === this.credentialGeneration) {
+        this.handoffBusy = false;
+        this.renderHandoff();
+      }
+    }
+  }
+
+  /** History is polled while staff are asked or hold the conversation, never on a backend without takeovers. */
+  private shouldPoll(): boolean {
+    return this.isConnected && this.server?.humanHandoff === true && (this.control !== "agent" || Date.now() < this.unattendedUntil) && Date.now() - this.pollChangedAt < POLL_IDLE_LIMIT_MS;
+  }
+
+  private updatePolling(restart = false) {
+    if (restart) {
+      this.pollDelay = POLL_MIN_MS;
+      this.pollChangedAt = Date.now();
+    }
+    if (!this.shouldPoll()) return this.stopPolling();
+    if (this.pollTimer === undefined && !this.pollInFlight) this.pollTimer = setTimeout(() => void this.pollHistory(), this.pollDelay);
+  }
+
+  private stopPolling() {
+    if (this.pollTimer !== undefined) clearTimeout(this.pollTimer);
+    this.pollTimer = undefined;
+    this.pollGeneration++;
+  }
+
+  private async pollHistory(): Promise<void> {
+    this.pollTimer = undefined;
+    if (!this.shouldPoll()) return this.stopPolling();
+    const generation = this.pollGeneration;
+    let changed = false;
+    if (!this.running) {
+      this.pollInFlight = true;
+      try {
+        changed = await this.refreshFromHistory();
+      } catch { /* a failed read backs off like an unchanged one */ }
+      finally { this.pollInFlight = false; }
+    }
+    if (generation !== this.pollGeneration) return;
+    if (changed) this.pollChangedAt = Date.now();
+    this.pollDelay = changed ? POLL_MIN_MS : Math.min(Math.round(this.pollDelay * 1.5), POLL_MAX_MS);
+    this.updatePolling();
+  }
+
+  /**
+   * Reads the conversation and shows what changed: new turns (staff replies, notices, a staff message
+   * written first) are appended so a screen reader hears only them; anything else redraws the log.
+   * Follows the server's control. Returns whether the transcript changed.
+   */
+  private async refreshFromHistory(): Promise<boolean> {
+    const generation = this.credentialGeneration;
+    const conversation = this.conversationId;
+    const history = await this.client().historyDetails(this.agentId, conversation);
+    if (generation !== this.credentialGeneration || conversation !== this.conversationId || this.running) return false;
+    const next = decorateHistory(history.messages.map((m) => ({ ...m, status: "done" as const })));
+    const same = (a: ViewMessage, b: ViewMessage) => a.role === b.role && (a.authorKind ?? "") === (b.authorKind ?? "") && a.content === b.content;
+    const known = this.messages.length;
+    let changed = false;
+    if (known <= next.length && this.messages.every((m, i) => same(m, next[i]))) {
+      const added = next.slice(known);
+      for (const m of added) this.pushMessage(m);
+      changed = added.length > 0;
+      if (added.some((m) => m.role === "assistant" && !m.hidden) && this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
+    } else {
+      this.messages = next;
+      this.renderLog();
+      changed = true;
+    }
+    if (history.control) this.setControl(history.control);
+    else this.renderHandoff();
+    return changed;
+  }
+
   /** Stops the running reply. */
   stop(): void {
     this.running?.abort();
@@ -624,6 +830,7 @@ export class DeweeChatElement extends ElementBase {
   async renewSession(): Promise<void> {
     this.stop();
     this.clearCredentials();
+    this.resetHandoff();
     // Another visitor: what was learned about the previous one's session and answers is void.
     this.setCheck("session", "idle");
     this.setCheck("reply", "idle");
@@ -773,6 +980,7 @@ export class DeweeChatElement extends ElementBase {
   newConversation(): void {
     this.stop();
     this.clearCredentials();
+    this.resetHandoff();
     this.conversationId = randomConversationId();
     if (this.config.persist !== false) store.set(this.convKey(), this.conversationId);
     this.messages = [];
@@ -789,9 +997,12 @@ export class DeweeChatElement extends ElementBase {
       if (this.config.mode !== "inline") this.open();
       else this.activate();
     }
+    // Moved back into the page during a takeover: watching the conversation resumes.
+    if (this.activated) this.updatePolling(true);
   }
 
   disconnectedCallback(): void {
+    this.stopPolling();
     this.clearCredentials();
     this.pageGeneration++;
     this.sharedPage = undefined;
@@ -837,6 +1048,7 @@ export class DeweeChatElement extends ElementBase {
     this.activated = false;
     if (newBackend) {
       this.server = null;
+      this.resetHandoff();
       this.probedPage = false;
       this.diag.setVersion(undefined);
       for (const step of ["reply", "session", "config"] as const) this.setCheck(step, "idle");
@@ -926,6 +1138,7 @@ export class DeweeChatElement extends ElementBase {
     e.foot.hidden = !!c.hideBranding;
     e.foot.querySelector(".by")!.textContent = s.poweredBy + " ";
     this.renderSubtitle();
+    this.renderHandoff();
     this.updateSendButton();
 
     // Credentials or endpoint changed after activation: reload server config.
@@ -960,6 +1173,7 @@ export class DeweeChatElement extends ElementBase {
         <div class="log" part="log" role="log" aria-live="polite"></div>
         <div class="challenge"><slot name="challenge"></slot></div>
         <form class="composer" part="composer">
+          <div class="handoff" part="handoff" hidden><span class="handoff-status" hidden></span><button type="button" class="btn handoff-request" hidden></button></div>
           <div class="page-context" hidden><label><input type="checkbox" class="page-choice"> <span class="page-label"></span></label><pre class="page-preview" hidden></pre></div>
           <div class="cooldown" part="cooldown" aria-hidden="true" hidden></div>
           <div class="sr-only announcer" role="status" aria-live="polite"></div>
@@ -976,8 +1190,10 @@ export class DeweeChatElement extends ElementBase {
       status: $(".status"), avatar: $(".avatar"), select: $(".agent-select"), input: $("textarea"), send: $(".send"),
       newChat: $(".new"), jobAccess: $(".job-access"), memberLink: $(".member-link"), close: $(".close"), foot: $(".foot"), cooldown: $(".cooldown"), announcer: $(".announcer"),
       pageChoice: $(".page-choice"), pageWrap: $(".page-context"), pageLabel: $(".page-label"), pagePreview: $(".page-preview"),
+      handoff: $(".handoff"), handoffStatus: $(".handoff-status"), handoffRequest: $(".handoff-request"),
     };
     const e = this.els;
+    e.handoffRequest.addEventListener("click", () => { void this.requestHandoff(); });
     e.launcher.addEventListener("click", () => this.toggle());
     e.close.addEventListener("click", () => this.close());
     // Follow the stream until the visitor scrolls up; content growth alone fires no scroll event.
@@ -1165,6 +1381,7 @@ export class DeweeChatElement extends ElementBase {
       this.renderLog();
     } else {
       this.server = loaded;
+      this.handoffUnavailable = false;
       this.diag.setVersion(loaded.version);
       this.setCheck("config", "ok");
       this.els.input.maxLength = loaded.maxMessageLength;
@@ -1199,6 +1416,7 @@ export class DeweeChatElement extends ElementBase {
 
   private async loadConversation() {
     this.clearCredentials();
+    this.resetHandoff();
     const generation = this.credentialGeneration;
     const persist = this.config.persist !== false;
     const saved = persist ? store.get(this.convKey()) : null;
@@ -1213,6 +1431,8 @@ export class DeweeChatElement extends ElementBase {
       this.messages = decorateHistory(history.messages.map((m) => ({ ...m, status: "done" as const })));
       for (const card of history.credentialRequests) this.credentialCards.set(card.id, card);
       this.renderLog();
+      // A takeover survives a reload: the widget follows the server's control and watches it again.
+      if (history.control) this.setControl(history.control);
     } catch {
       /* history is a nicety: a fresh conversation still works */
     }
@@ -1231,6 +1451,7 @@ export class DeweeChatElement extends ElementBase {
     if (unavailable) log.appendChild(this.renderUnavailable());
     for (const card of this.credentialCards.values()) log.appendChild(this.renderCredential(card));
     log.scrollTop = log.scrollHeight;
+    this.renderHandoff();
   }
 
   private clearCredentials() {
@@ -1426,12 +1647,20 @@ export class DeweeChatElement extends ElementBase {
     this.messages.push(m);
     this.els.log.appendChild(this.renderMessage(m));
     this.scrollToBottom(true);
+    this.renderHandoff();
   }
 
   private renderMessage(m: ViewMessage): HTMLElement {
     const root = document.createElement("div");
-    root.className = `msg ${m.role}${m.status === "error" ? " error" : ""}`;
+    // A staff reply or a takeover notice is never shown as the agent's: `human` / `system`.
+    const author = m.role === "assistant" && m.authorKind ? ` ${m.authorKind}` : "";
+    root.className = `msg ${m.role}${author}${m.status === "error" ? " error" : ""}`;
     root.hidden = !!m.hidden;
+    if (m.role === "assistant" && m.authorKind === "human") {
+      const label = document.createElement("div");
+      label.className = "author";
+      root.appendChild(label);
+    }
     const bubble = document.createElement("div");
     bubble.className = "bubble";
     root.appendChild(bubble);
@@ -1467,6 +1696,13 @@ export class DeweeChatElement extends ElementBase {
       else note?.remove();
       return;
     }
+    if (m.authorKind === "system") {
+      // A runtime notice: plain, neutral text.
+      v.md.textContent = m.content;
+      v.trace.hidden = true;
+      return;
+    }
+    if (m.authorKind === "human") v.root.querySelector(".author")!.textContent = this.strings.handoff.staff;
     v.root.classList.toggle("error", m.status === "error");
 
     // reasoning
@@ -1605,6 +1841,13 @@ export class DeweeChatElement extends ElementBase {
         m.status = "done";
         break;
       case "error": {
+        // On a takeover backend a run the visitor did not stop ends `cancelled` when a person took the
+        // conversation over: the partial text was never stored, so it is dropped (see runTurn).
+        if (e.code === "cancelled" && this.server?.humanHandoff === true) {
+          m.yielded = true;
+          m.status = "done";
+          break;
+        }
         m.status = "error";
         // Only the visitor's own turn is tracked (it set the step to pending): not a hidden follow-up
         // or a credential stream, and not a refusal that never reached the agent.
@@ -1726,7 +1969,8 @@ function decorateHistory(messages: ViewMessage[]): ViewMessage[] {
       if (isActionResultMessage(m.content)) m.hidden = true;
       return;
     }
-    if (!m.content.includes("```dewee-action")) return;
+    // Page actions come from the agent only; a staff reply or a notice never runs or shows one.
+    if (m.authorKind || !m.content.includes("```dewee-action")) return;
     const { calls } = parseDirectives(m.content);
     if (!calls.length) return;
     const next = messages[i + 1];

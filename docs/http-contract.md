@@ -392,6 +392,47 @@ conversation. Gateway enforces one continuation; `credential_request_not_ready` 
 `credential_requests_unavailable` is 403. Anonymous sessions and unconfigured backends cannot use
 these routes. The request and SSE responses use `no-store`.
 
+## Talking to a person (human takeover)
+
+Transport `ccp` only, and only when the backend opts in with `humanHandoff: true` (TypeScript option or
+`DEWEE_WEBCHAT_HUMAN_HANDOFF=true`; PHP option `humanHandoff` or the same variable). The TypeScript and
+PHP backends answer identically. A backend without the option is unchanged: it never sends CCP the
+`X-Dewee-Webchat-Features: human-handoff` token, `/config` has no `humanHandoff`, `/history` has no
+`control`, `/request-human` is `404 not_found`, and the widget shows no button and never polls.
+
+With the option on, the backend advertises `human-handoff` to CCP on chat, history and request-human
+(joined with `credential-requests` when that is also on), and:
+
+- `GET {base}/config` adds `"humanHandoff": true` when the integration also allows it (CCP config
+  `human_handoff`). The widget offers **Talk to a person** only then.
+- `POST {base}/request-human` with a visitor bearer and `{conversationId, agent?, summary?}` (`summary`
+  at most 1000 characters, trimmed) asks for a person in one of the visitor's own conversations. It
+  answers `{control, staffOnDuty}`: `control` is `"waiting_human"`, `"human_active"`, or `"agent"` with
+  `staffOnDuty: false` when nobody is on duty (the request is recorded but the agent keeps answering).
+  CCP's case id is never forwarded. Another visitor's or an unknown conversation is `404 not_found`;
+  an integration or agent that cannot hand over is `403 human_handoff_unavailable` (the widget then
+  hides the button); the backend allows 5 requests per visitor per 10 minutes (`429 rate_limited`).
+- `POST {base}/chat` while a person holds the conversation answers `202` with JSON
+  `{ "held": true, "control": "waiting_human" | "human_active" }` instead of a stream: the message was
+  kept for the staff, no agent ran and there is no reply to show. A run that a person takes over
+  mid-stream ends with `{type: "error", code: "cancelled"}`; the widget drops the partial text and
+  redraws from history.
+- `GET {base}/history` adds `control` (an unknown value counts as `"agent"`) and marks assistant turns
+  written by a person or by the system with `authorKind: "human" | "system"`. A staff member's name, id
+  or email is never forwarded; the widget labels such turns "Support staff" / "Nhân viên hỗ trợ" and
+  shows system turns as neutral notices.
+
+```json
+{ "control": "human_active", "messages": [
+  { "role": "assistant", "content": "A support staff member will join shortly.", "authorKind": "system" },
+  { "role": "assistant", "content": "Hi, I can help with the refund.", "authorKind": "human" }
+] }
+```
+
+While a request waits or a person holds the conversation, the widget polls `/history` (every 4 s,
+backing off to 30 s while nothing changes, for at most an hour) and stops when the agent answers again
+or the widget is removed from the page.
+
 ## Extra request headers
 
 Hosts may configure the widget to add headers (for example `x-csrf-token`) to every request, and to use a

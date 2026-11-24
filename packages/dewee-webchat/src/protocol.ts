@@ -86,6 +86,36 @@ export interface PublicConfig {
    * `identity` the widget still challenges: a signed-in user's `/session` always needs a token.
    */
   refreshWithoutTurnstile?: boolean;
+  /**
+   * Present (true) when a visitor can ask for a person: the backend opted in (`humanHandoff`) and the
+   * integration allows it. The widget shows its "talk to a person" button only then.
+   */
+  humanHandoff?: boolean;
+}
+
+/**
+ * Who answers a conversation (human takeover): the agent, a takeover waiting for staff, or staff who
+ * took it over. Always the server's answer; the widget never guesses it.
+ */
+export type HandoffControl = "agent" | "waiting_human" | "human_active";
+
+export const HANDOFF_CONTROLS: readonly HandoffControl[] = ["agent", "waiting_human", "human_active"];
+
+export function isHandoffControl(value: unknown): value is HandoffControl {
+  return typeof value === "string" && (HANDOFF_CONTROLS as readonly string[]).includes(value);
+}
+
+/** Response of `POST {basePath}/request-human`. No case id or staff identity is ever included. */
+export interface RequestHumanResponse {
+  control: HandoffControl;
+  /** False when nobody was on duty: the request waits unattended and the agent keeps answering (`control: "agent"`). */
+  staffOnDuty: boolean;
+}
+
+/** `202` answer of `POST {basePath}/chat` while a person holds the conversation: the message is kept, no agent runs. */
+export interface HeldChatResponse {
+  held: true;
+  control: Exclude<HandoffControl, "agent">;
 }
 
 /** Response of `POST {basePath}/session`. */
@@ -161,6 +191,18 @@ export interface HistoryMessage {
   thinking?: string;
   toolCalls?: ToolCallView[];
   createdAt?: string;
+  /**
+   * Assistant turns not written by the agent: `human` for a support staff reply, `system` for a
+   * takeover notice. Absent means the agent. A staff member's name, id or email is never included.
+   */
+  authorKind?: "human" | "system";
+}
+
+/** Response of `GET {basePath}/history`. */
+export interface HistoryResponse {
+  messages: HistoryMessage[];
+  /** Present only on backends with `humanHandoff`: who answers the conversation now. */
+  control?: HandoffControl;
 }
 
 /** How much an agent-invoked page action can change. `mutate`/`destructive` always need user approval. */

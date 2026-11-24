@@ -9,7 +9,7 @@
 import { stripPageBlock } from "../actions/page-block";
 import { parseCredentialRequest, type CredentialRequestView } from "../credential-request";
 import { parseJobAccessLaunch, type JobAccessLaunch } from "../job-access";
-import { isAdmissionErrorCode, isIdentityErrorCode, type AdmissionErrorCode, type AgentInfo, type ChatStreamEvent, type HistoryMessage, type IdentityErrorCode, type LinkResponse, type Remediation, type ToolCallView } from "../protocol";
+import { isAdmissionErrorCode, isHandoffControl, isIdentityErrorCode, type AdmissionErrorCode, type AgentInfo, type ChatStreamEvent, type HandoffControl, type HistoryMessage, type IdentityErrorCode, type LinkResponse, type Remediation, type RequestHumanResponse, type ToolCallView } from "../protocol";
 import { CcpClient, CcpError, knownRemediation, readSseJson, type CcpRequest, type CcpRoute } from "./ccp-client";
 import { DEAD_SESSION_CODES, IDENTITY_ERRORS } from "./identity-errors";
 import { admissionErrorEvent } from "./admission-errors";
@@ -61,6 +61,8 @@ export interface CcpConfig {
   showToolActivity: boolean;
   maxMessageChars: number;
   pageContextVersions: number[];
+  /** A visitor of the default agent can ask for a person (the host must also advertise `human-handoff`). */
+  humanHandoff?: boolean;
 }
 
 /** Per browser request: what CCP is told about the visitor. */
@@ -106,6 +108,9 @@ export function browserErrorFor(e: unknown, route: CcpRoute): BrowserError {
     return GENERIC_UNAVAILABLE;
   }
   const log = (level: "warn" | "error", hint: string) => console[level](`[dewee-webchat] ccp ${route}: ${e.code} (HTTP ${e.status}) ${hint}`);
+  // The visitor cannot be handed to a person (no Human Oversight config, or the feature is off): the
+  // ingress names it with the generic PERMISSION_DENIED. The widget hides its button for this code.
+  if (route === "request-human" && (e.code === "human_handoff_unavailable" || e.code === "PERMISSION_DENIED")) return { status: 403, code: "human_handoff_unavailable", message: "Talking to a person is not available" };
   if (isIdentityErrorCode(e.code)) return { status: IDENTITY_ERRORS[e.code].status, code: e.code, message: IDENTITY_ERRORS[e.code].message, identity: e.code, remediation: e.remediation };
   const retryAfterMs = e.retryAfterSeconds ? e.retryAfterSeconds * 1000 : undefined;
   // A refused message is an admission error, the same typed refusal the legacy gateway gives, so the
@@ -217,7 +222,13 @@ function parseConfig(data: Record<string, any>): CcpConfig {
     showToolActivity: data.show_tool_activity === true,
     maxMessageChars: Number.isInteger(max) && max > 0 ? max : Number.POSITIVE_INFINITY,
     pageContextVersions: Array.isArray(data.page_context?.versions) && data.page_context.versions.includes(1) ? [1] : [],
+    humanHandoff: data.human_handoff === true,
   };
+}
+
+/** Who wrote an assistant turn, kept only for the two non-agent authors. Anything else is the agent. */
+function authorKindOf(raw: unknown): "human" | "system" | undefined {
+  return raw === "human" || raw === "system" ? raw : undefined;
 }
 
 function numericUsage(raw: unknown): Record<string, number> | undefined {
@@ -241,7 +252,11 @@ export interface CcpExchangeResult {
 
 export type CcpTransport = ReturnType<typeof createCcpTransport>;
 
-export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps, credentialRequests = false) {
+/**
+ * `humanHandoff`: the host can show a conversation handed to a person, so `human-handoff` is advertised
+ * on `chat`, `history` and `request-human`. Off: the header never carries it and nothing changes.
+ */
+export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps, credentialRequests = false, humanHandoff = false) {
   let config: { value: CcpConfig; at: number } | undefined;
   let pendingConfig: Promise<CcpConfig> | undefined;
   const edges = new Map<string, EdgeSession>();
@@ -350,7 +365,38 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
         ...(input.pageContext !== undefined ? { page_context: input.pageContext } : {}),
         ...(input.credentialRequestId ? { credential_request_id: input.credentialRequestId } : {}),
       };
-      return withEdge(ctx, visitorId, sealed, (edge) => client.send("chat", { ...base(ctx), body, session: edge.token, accept: "text/event-stream", signal: input.signal, credentialRequests: credentialRequests && !!input.identitySession }));
+      return withEdge(ctx, visitorId, sealed, (edge) => client.send("chat", { ...base(ctx), body, session: edge.token, accept: "text/event-stream", signal: input.signal, credentialRequests: credentialRequests && !!input.identitySession, humanHandoff }));
+    },
+
+    /**
+     * A `202 {held, control}` answer of `chat`: a person holds the conversation, the message was kept
+     * and no run started. Returns the control, or null for a stream. A 202 of any other shape is
+     * `ccp_bad_response`.
+     */
+    async heldControl(res: Response): Promise<"waiting_human" | "human_active" | null> {
+      if (res.status !== 202) return null;
+      const data: any = await res.json().catch(() => null);
+      if (data?.held === true && (data.control === "waiting_human" || data.control === "human_active")) return data.control;
+      throw new CcpError(202, "ccp_bad_response", "CCP chat: a held answer without a known control");
+    },
+
+    /**
+     * `POST request-human`: the visitor asks for a person in one of their conversations. The case id
+     * and anything else CCP sends stay here; the browser learns only who answers now and whether staff
+     * were on duty.
+     */
+    async requestHuman(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { conversationId: string; agent?: string; identitySession?: string; summary?: string }): Promise<RequestHumanResponse> {
+      const body = {
+        conversation_id: input.conversationId,
+        ...(input.summary ? { summary: input.summary } : {}),
+        ...withAgent(input.agent),
+        ...(input.identitySession ? { identity_session: input.identitySession } : {}),
+      };
+      const data = await withEdge(ctx, visitorId, sealed, (edge) => client.json<Record<string, unknown>>("request-human", { ...base(ctx), body, session: edge.token, humanHandoff: true }));
+      if (!isHandoffControl(data.control)) throw new CcpError(200, "ccp_bad_response", "CCP request-human: no known control");
+      // Nobody on duty is `control: "agent"`; an answer without the flag says so through its control.
+      const staffOnDuty = typeof data.staff_on_duty === "boolean" ? data.staff_on_duty : data.control !== "agent";
+      return { control: data.control, staffOnDuty };
     },
 
     /**
@@ -424,7 +470,7 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
     },
 
     /** The visitor's own conversation, folded for the widget. An unknown or foreign conversation is empty. */
-    async history(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { conversationId: string; agent?: string; identitySession?: string }): Promise<{ messages: HistoryMessage[]; credentialRequests?: CredentialRequestView[] }> {
+    async history(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { conversationId: string; agent?: string; identitySession?: string }): Promise<{ messages: HistoryMessage[]; control?: HandoffControl; credentialRequests?: CredentialRequestView[] }> {
       const cfg = await getConfig();
       const body = {
         conversation_id: input.conversationId,
@@ -434,9 +480,9 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
       };
       let data: Record<string, any>;
       try {
-        data = await withEdge(ctx, visitorId, sealed, (edge) => client.json("history", { ...base(ctx), body, session: edge.token, credentialRequests: credentialRequests && !!input.identitySession }));
+        data = await withEdge(ctx, visitorId, sealed, (edge) => client.json("history", { ...base(ctx), body, session: edge.token, credentialRequests: credentialRequests && !!input.identitySession, humanHandoff }));
       } catch (e) {
-        if (e instanceof CcpError && e.code === "not_found") return { messages: [] };
+        if (e instanceof CcpError && e.code === "not_found") return { messages: [], ...(humanHandoff ? { control: "agent" as const } : {}) };
         throw e;
       }
       const out: HistoryMessage[] = [];
@@ -444,6 +490,9 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
         if (m?.role !== "user" && m?.role !== "assistant") continue;
         const content = typeof m.content === "string" ? (m.role === "user" ? stripPageBlock(m.content) : m.content) : "";
         const msg: HistoryMessage = { role: m.role, content };
+        // Only the kind of author: a staff member's name, id or email is never read, even when sent.
+        const authorKind = m.role === "assistant" ? authorKindOf(m.author_kind) : undefined;
+        if (authorKind) msg.authorKind = authorKind;
         if (cfg.showThinking && typeof m.thinking === "string" && m.thinking) msg.thinking = m.thinking;
         if (cfg.showToolActivity && Array.isArray(m.tool_calls)) {
           const calls: ToolCallView[] = [];
@@ -461,7 +510,9 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
       const cards = credentialRequests && input.identitySession && Array.isArray(data.credential_requests)
         ? data.credential_requests.slice(0, 100).map((view: unknown) => parseCredentialRequest(view, input.agent || cfg.defaultAgent)).filter((view: CredentialRequestView | null): view is CredentialRequestView => view !== null)
         : [];
-      return { messages: out, ...(cards.length ? { credentialRequests: cards } : {}) };
+      // Who answers now, for a host that shows takeovers; an unknown value counts as the agent (contract).
+      const control = humanHandoff ? (isHandoffControl(data.control) ? data.control : "agent") : undefined;
+      return { messages: out, ...(control ? { control } : {}), ...(cards.length ? { credentialRequests: cards } : {}) };
     },
 
     async credentialRequest(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, route: "credential-request" | "credential-request-handoff" | "credential-request-cancel", input: { conversationId: string; requestId: string; agent: string; identitySession: string }): Promise<unknown> {

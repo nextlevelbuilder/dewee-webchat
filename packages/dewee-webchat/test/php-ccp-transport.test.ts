@@ -502,8 +502,170 @@ echo json_encode(['token' => $t, 'fromTs' => DeweeWebchat::verifyVisitorToken($i
     20_000,
   );
 
+  describe("human takeover (option humanHandoff)", () => {
+    const auth = (token: string) => ({ authorization: `Bearer ${token}`, "content-type": "application/json" });
+    const requestHuman = (token: string, body: Record<string, unknown> = { conversationId: "conv_php_0001", agent: "shop" }) =>
+      call("/request-human", { method: "POST", headers: auth(token), body: JSON.stringify(body) });
+    const history = (token: string) => call(`/history?agent=shop&conversationId=conv_php_0001`, { headers: { authorization: `Bearer ${token}` } });
+    const key = (visitorId: string) => `wcv:${INTEGRATION_ID}:${visitorId}|conv_php_0001`;
+    beforeEach(() => {
+      ccp.state.config = { ...ccp.state.config, human_handoff: true };
+    });
+
+    it("refuses an unsafe option at startup and reads the environment only as true", () => {
+      const url = `http://127.0.0.1:1/api/public/webchat/v1/${INTEGRATION_ID}`;
+      const ccpOk = { chatUrl: url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET };
+      const out = php(
+        `$r = [];
+$class = new ReflectionClass(DeweeWebchat::class);
+foreach ($in['cases'] as $o) {
+  $h = $class->newInstanceWithoutConstructor();
+  $ctor = $class->getConstructor();
+  $ctor->setAccessible(true);
+  try { $ctor->invoke($h, $o); $r[] = 'ok'; } catch (DeweeConfigError $e) { $r[] = 'refused: ' . $e->getMessage(); }
+}
+$env = [];
+foreach ($in['env'] as $v) $env[] = DeweeWebchat::optionsFromEnv(['DEWEE_WEBCHAT_HUMAN_HANDOFF' => $v])['humanHandoff'] ?? null;
+echo json_encode(['cases' => $r, 'env' => $env]);`,
+        {
+          cases: [
+            { ccp: ccpOk, secret: VISITOR_SECRET, humanHandoff: true },
+            { ccp: ccpOk, secret: VISITOR_SECRET, humanHandoff: "yes" },
+            { gatewayUrl: "https://gw.example", token: "t", secret: VISITOR_SECRET, humanHandoff: true },
+            { gatewayUrl: "https://gw.example", token: "t", secret: VISITOR_SECRET, humanHandoff: false },
+          ],
+          env: ["true", " true ", "", "1", "false", "yes"],
+        },
+      );
+      expect(out.cases[0]).toBe("ok");
+      expect(out.cases[1]).toMatch(/refused: .*humanHandoff must be true or false/);
+      expect(out.cases[2]).toMatch(/refused: .*humanHandoff requires the ccp transport/);
+      expect(out.cases[3]).toBe("ok");
+      expect(out.env).toEqual([true, true, null, null, null, null]);
+    });
+
+    it("joins the feature tokens like the TS client", () => {
+      const out = php(`echo json_encode([DeweeCcpClient::featuresHeader(false, false), DeweeCcpClient::featuresHeader(false, true), DeweeCcpClient::featuresHeader(true, false), DeweeCcpClient::featuresHeader(true, true)]);`);
+      expect(out).toEqual([null, "credential-requests", "human-handoff", "human-handoff, credential-requests"]);
+    });
+
+    it("without the option: no offer, no feature header, no route and no control, even when the integration allows it", async () => {
+      expect((await call("/config")).json().humanHandoff).toBeUndefined();
+      const s = await session();
+      expect((await chat(s.token, { agent: "shop" })).status).toBe(200);
+      expect(Object.keys((await history(s.token)).json())).toEqual(["messages"]);
+      for (const r of [...ccp.routes("chat"), ...ccp.routes("history")]) expect(r.headers["x-dewee-webchat-features"]).toBeUndefined();
+      const refused = await requestHuman(s.token);
+      expect([refused.status, refused.json().error.code]).toEqual([404, "not_found"]);
+      expect(ccp.routes("request-human")).toHaveLength(0);
+    });
+
+    it("matches the TS handler's config, and offers it only when the integration allows it too", async () => {
+      setOptions({ humanHandoff: true });
+      const ts = createDeweeHandler({ ccp: ccpOptions(), secret: VISITOR_SECRET, rateLimit: false, humanHandoff: true });
+      const { version: _v, ...tsConfig } = await (await ts(new Request("https://shop.example/api/dewee/config"))).json();
+      expect(tsConfig.humanHandoff).toBe(true);
+      expect((await call("/config")).json()).toEqual({ ...tsConfig, version: packageVersion });
+      ccp.state.config = { ...ccp.state.config, human_handoff: false };
+      dropConfigCache();
+      expect((await call("/config")).json().humanHandoff).toBeUndefined();
+    });
+
+    it("asks for a person, holds the next message without a run, and reloads the takeover with author kinds only", async () => {
+      setOptions({ humanHandoff: true });
+      const s = await session();
+      expect((await chat(s.token, { agent: "shop" })).status).toBe(200);
+      expect(ccp.routes("chat")[0].headers["x-dewee-webchat-features"]).toBe("human-handoff");
+
+      const asked = await requestHuman(s.token, { conversationId: "conv_php_0001", agent: "shop", summary: "  Refund for order 1042  " });
+      expect([asked.status, asked.json()]).toEqual([200, { control: "waiting_human", staffOnDuty: true }]);
+      expect(asked.text).not.toContain("case_0193");
+      const sent = ccp.routes("request-human")[0];
+      expect(sent.body).toEqual({ conversation_id: "conv_php_0001", summary: "Refund for order 1042", agent: "shop" });
+      expect(sent.headers["x-dewee-webchat-features"]).toBe("human-handoff");
+
+      const held = await chat(s.token, { agent: "shop", message: "are you there?" });
+      expect([held.status, held.headers.get("content-type"), held.json()]).toEqual([202, "application/json; charset=utf-8", { held: true, control: "waiting_human" }]);
+
+      const conv = ccp.state.conversations.get(key(s.visitorId))!;
+      conv.push({ role: "assistant", content: "Staff joined the conversation.", author_kind: "system" });
+      conv.push({ role: "assistant", content: "Hi, I can help with the refund.", author_kind: "human", author_name: "Lan Nguyen", author_email: "lan@shop.example", author_id: "usr_0193" });
+      ccp.state.control.set(key(s.visitorId), "human_active");
+      const hist = await history(s.token);
+      expect(hist.json()).toEqual({
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: `hello wcv:${INTEGRATION_ID}:${s.visitorId}` },
+          { role: "assistant", content: "A support staff member will join shortly.", authorKind: "system" },
+          { role: "user", content: "are you there?" },
+          { role: "assistant", content: "Staff joined the conversation.", authorKind: "system" },
+          { role: "assistant", content: "Hi, I can help with the refund.", authorKind: "human" },
+        ],
+        control: "human_active",
+      });
+      expect(hist.text).not.toMatch(/Lan Nguyen|lan@shop|usr_0193/);
+      expect(ccp.routes("history").at(-1)?.headers["x-dewee-webchat-features"]).toBe("human-handoff");
+
+      // Staff hand the conversation back: the agent answers again.
+      ccp.state.control.set(key(s.visitorId), "agent");
+      expect((await history(s.token)).json().control).toBe("agent");
+      expect((await chat(s.token, { agent: "shop", message: "thanks" })).status).toBe(200);
+    });
+
+    it("with nobody on duty, keeps the conversation with the agent", async () => {
+      setOptions({ humanHandoff: true });
+      ccp.state.staffOnDuty = false;
+      const s = await session();
+      await chat(s.token, { agent: "shop" });
+      expect((await requestHuman(s.token)).json()).toEqual({ control: "agent", staffOnDuty: false });
+      const next = await chat(s.token, { agent: "shop", message: "ok" });
+      expect([next.status, next.headers.get("content-type")]).toEqual([200, expect.stringMatching(/text\/event-stream/)]);
+      const hist = (await history(s.token)).json();
+      expect(hist.control).toBe("agent");
+      expect(hist.messages).toContainEqual({ role: "assistant", content: "Nobody is on duty right now. Please leave your contact details.", authorKind: "system" });
+    });
+
+    it("passes a stopped run on as cancelled, and refuses another visitor's conversation as not found", async () => {
+      setOptions({ humanHandoff: true });
+      const owner = await session();
+      ccp.state.stopMidRun = true;
+      const stopped = await chat(owner.token, { agent: "shop" });
+      expect(sse(stopped.text).at(-1)).toEqual({ type: "error", code: "cancelled", message: "Cancelled" });
+      expect(stopped.text).not.toContain("case 0193");
+      ccp.state.stopMidRun = false;
+      await chat(owner.token, { agent: "shop" });
+      const other = await session();
+      const r = await requestHuman(other.token);
+      expect([r.status, r.json()]).toEqual([404, { error: { message: "Not found", code: "not_found" } }]);
+      expect(ccp.state.control.size).toBe(0);
+    });
+
+    it("validates the request before calling CCP and maps CCP refusals without CCP's text", async () => {
+      setOptions({ humanHandoff: true });
+      const s = await session();
+      await chat(s.token, { agent: "shop" });
+      for (const body of [{ conversationId: "short" }, { conversationId: "conv_php_0001", extra: 1 }, { conversationId: "conv_php_0001", summary: "x".repeat(1001) }, { conversationId: "conv_php_0001", summary: "code MEM-ABCDEFGHIJKLMNOP" }, { conversationId: "conv_php_0001", agent: "../x" }]) {
+        expect((await requestHuman(s.token, body)).status, JSON.stringify(body)).toBe(400);
+      }
+      expect((await call("/request-human", { method: "POST", body: JSON.stringify({ conversationId: "conv_php_0001" }) })).status).toBe(401);
+      expect(ccp.routes("request-human")).toHaveLength(0);
+      const cases: Array<[number, string, number, string]> = [
+        [403, "PERMISSION_DENIED", 403, "human_handoff_unavailable"],
+        [403, "human_handoff_unavailable", 403, "human_handoff_unavailable"],
+        [502, "upstream_failed", 502, "gateway_error"],
+      ];
+      for (const [status, code, want, wantCode] of cases) {
+        ccp.state.failNext.set("request-human", { status, code });
+        const r = await requestHuman(s.token);
+        expect([code, r.status, r.json().error.code]).toEqual([code, want, wantCode]);
+        expect(r.text).not.toMatch(/postgres|0193/);
+      }
+      expect((await chat(s.token, { agent: "shop", message: "still here" })).status).toBe(200);
+    });
+  });
+
   it("never sends the integration secret, edge session or internal URLs to a browser", () => {
     const all = browserOutput.join("\n");
-    for (const needle of [INTEGRATION_SECRET, VISITOR_SECRET, "dws1.", ccp.origin, "postgres://", "runtime.internal", "gw-token"]) expect(all, needle).not.toContain(needle);
+    for (const needle of [INTEGRATION_SECRET, VISITOR_SECRET, "dws1.", ccp.origin, "postgres://", "runtime.internal", "gw-token", "case_0193", "lan@shop", "usr_0193"]) expect(all, needle).not.toContain(needle);
   });
 });

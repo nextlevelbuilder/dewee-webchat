@@ -31,8 +31,14 @@ export interface FakeCcpState {
   /** Chat emits frames CCP should have filtered (reasoning, tool arguments): checks the adapter drops them. */
   leaky: boolean;
   identitySessions: Map<string, { principal: string; agent: string; revoked: boolean }>;
-  /** Conversations by `${actor}|${conversationId}`. */
-  conversations: Map<string, Array<{ role: string; content: string; thinking?: string; tool_calls?: unknown[] }>>;
+  /** Conversations by `${actor}|${conversationId}`. Tests may add staff or system turns (`author_kind`). */
+  conversations: Map<string, Array<{ role: string; content: string; thinking?: string; tool_calls?: unknown[]; author_kind?: string; [extra: string]: unknown }>>;
+  /** Human takeover control by `${actor}|${conversationId}`; absent = the agent answers. */
+  control: Map<string, "agent" | "waiting_human" | "human_active">;
+  /** Whether a staff member is on duty when a visitor asks for a person. */
+  staffOnDuty: boolean;
+  /** Chat streams some text, then ends with `chat.stopped` (a person took the conversation over mid-run). */
+  stopMidRun: boolean;
   edgeTtlSeconds: number;
   credentialCard?: Record<string, unknown>;
   credentialHandoffUrl?: string;
@@ -106,6 +112,9 @@ export async function startFakeCcp(): Promise<FakeCcp> {
     leaky: false,
     identitySessions: new Map(),
     conversations: new Map(),
+    control: new Map(),
+    staffOnDuty: true,
+    stopMidRun: false,
     edgeTtlSeconds: 3600,
   };
 
@@ -176,6 +185,11 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       return error(res, 401, "IDENTITY_REQUIRED", "sign in", { remediation: { action: "reauthenticate", audience: "end_user" } });
     }
 
+    // `X-Dewee-Webchat-Features`: comma-separated, case-insensitive host capabilities (contract §1.2).
+    const features = String(req.headers["x-dewee-webchat-features"] ?? "").split(",").map((t) => t.trim().toLowerCase());
+    const credentialFeature = features.includes("credential-requests");
+    const handoffFeature = features.includes("human-handoff");
+
     if (route === "chat") {
       if (state.redirectTo) {
         res.writeHead(307, { location: state.redirectTo });
@@ -187,10 +201,17 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       const conv = state.conversations.get(key) ?? [];
       state.conversations.set(key, conv);
       conv.push({ role: "user", content: message });
+      const held = state.control.get(key);
+      if (held && held !== "agent") return send(res, 202, { held: true, control: held });
       res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store, no-transform" });
       const frame = (o: unknown) => res.write(`data: ${JSON.stringify(o)}\n\n`);
       frame({ type: "start", runId: "run-42", conversationId: body.conversation_id, agent });
       res.write(": ping\n\n");
+      if (state.stopMidRun) {
+        frame({ type: "delta", text: "partial agent text" });
+        frame({ type: "error", code: "cancelled", message: "stopped: staff accepted case 0193" });
+        return res.end();
+      }
       if (message.endsWith("slow")) {
         frame({ type: "delta", text: "thinking about it" });
         return; // never finishes; the test aborts
@@ -208,7 +229,7 @@ export async function startFakeCcp(): Promise<FakeCcp> {
         return res.end();
       }
       if (cfg.show_thinking || state.leaky) frame({ type: "thinking", text: "secret plan" });
-      if (state.credentialCard && actor.startsWith("tuc:") && req.headers["x-dewee-webchat-features"] === "credential-requests") frame({ type: "credential_request", credential_request: state.credentialCard });
+      if (state.credentialCard && actor.startsWith("tuc:") && credentialFeature) frame({ type: "credential_request", credential_request: state.credentialCard });
       if (cfg.show_tool_activity || state.leaky) {
         frame({ type: "tool_call", id: "t1", name: "search_products", arguments: { q: "internal" } });
         frame({ type: "tool_result", id: "t1", name: "search_products", isError: false, result: "internal rows" });
@@ -222,7 +243,20 @@ export async function startFakeCcp(): Promise<FakeCcp> {
     if (route === "history") {
       const conv = state.conversations.get(`${actor}|${body?.conversation_id}`);
       if (!conv) return error(res, 404, "not_found");
-      return send(res, 200, { conversation_id: body.conversation_id, messages: [...conv, { role: "tool", content: "raw tool output" }], ...(state.credentialCard && actor.startsWith("tuc:") && req.headers["x-dewee-webchat-features"] === "credential-requests" ? { credential_requests: [state.credentialCard] } : {}) });
+      const control = state.control.get(`${actor}|${body?.conversation_id}`) ?? "agent";
+      return send(res, 200, { conversation_id: body.conversation_id, messages: [...conv, { role: "tool", content: "raw tool output" }], control, ...(state.credentialCard && actor.startsWith("tuc:") && credentialFeature ? { credential_requests: [state.credentialCard] } : {}) });
+    }
+    if (route === "request-human") {
+      if (!handoffFeature) return error(res, 403, "PERMISSION_DENIED", "human_handoff_unavailable for tenant 0193");
+      const key = `${actor}|${body?.conversation_id}`;
+      const conv = state.conversations.get(key);
+      if (!conv) return error(res, 404, "not_found");
+      const current = state.control.get(key);
+      if (current && current !== "agent") return send(res, 200, { case_id: "case_0193_internal", control: current, staff_on_duty: true });
+      const control = state.staffOnDuty ? "waiting_human" : "agent";
+      state.control.set(key, control);
+      conv.push({ role: "assistant", content: state.staffOnDuty ? "A support staff member will join shortly." : "Nobody is on duty right now. Please leave your contact details.", author_kind: "system" });
+      return send(res, 200, { case_id: "case_0193_internal", control, staff_on_duty: state.staffOnDuty });
     }
     if (route === "abort") return send(res, 200, { aborted: true });
     if (route === "identity/exchange") {
@@ -252,7 +286,7 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       return send(res, 200, { bootstrap_url: "https://access.example/identity/job-access/launch", launch_token: "one_time_ticket_0123456789", expires_at: new Date(Date.now() + 45_000).toISOString() });
     }
     if (["credential-request", "credential-request-handoff", "credential-request-cancel"].includes(route)) {
-      if (!actor.startsWith("tuc:") || req.headers["x-dewee-webchat-features"] !== "credential-requests" || !state.credentialCard || !state.conversations.has(`${actor}|${body?.conversation_id}`) || body?.credential_request_id !== state.credentialCard.id) return error(res, 404, "credential_request_not_found");
+      if (!actor.startsWith("tuc:") || !credentialFeature || !state.credentialCard || !state.conversations.has(`${actor}|${body?.conversation_id}`) || body?.credential_request_id !== state.credentialCard.id) return error(res, 404, "credential_request_not_found");
       if (route === "credential-request-handoff") return send(res, 200, { credential_request_id: state.credentialCard.id, url: state.credentialHandoffUrl ?? "https://app.example/credential-requests/open?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", expires_at: state.credentialCard.expires_at });
       return send(res, 200, { credential_request: { ...state.credentialCard, ...(route === "credential-request-cancel" ? { status: "cancelled" } : {}) } });
     }
@@ -277,6 +311,9 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       state.edgeTtlSeconds = 3600;
       state.credentialCard = undefined;
       state.credentialHandoffUrl = undefined;
+      state.control.clear();
+      state.staffOnDuty = true;
+      state.stopMidRun = false;
     },
     routes: (name) => seen.filter((r) => r.route === name),
     close: () =>

@@ -123,6 +123,44 @@ describe("<dewee-chat> page actions", () => {
     expect(chips).toEqual([["error", "failed"], ["unknown", "not confirmed"]]);
   });
 
+  it("still tells the agent about a write the visitor stopped mid-run, once, and runs nothing further", async () => {
+    const chats = mockBackend((_b, n) => ({ content: n === 1 ? directive("payments.create") : directive("payments.create", {}, "c2") }));
+    const el = await mount();
+    el.configure({ confirm: async () => true });
+    let runs = 0;
+    let started!: () => void;
+    const running = new Promise<void>((r) => (started = r));
+    el.registerActions([{ name: "payments.create", description: "Pay", sensitivity: "mutate", handler: (_a, { signal }) => {
+      runs++;
+      started();
+      return new Promise((_res, rej) => signal.addEventListener("abort", () => rej(new Error("aborted"))));
+    } }]);
+    const sent = el.send("pay");
+    await running;
+    el.stop();
+    await sent;
+    expect(chats).toHaveLength(2);
+    expect(chats[1].message).toContain('"status":"unknown"');
+    expect(runs).toBe(1); // the answer to that report asked for the action again: it is not run
+    expect(el.shadowRoot!.querySelector<HTMLElement>(".action")!.dataset.status).toBe("unknown");
+  });
+
+  it("sends nothing after a Stop that left no write in doubt", async () => {
+    const chats = mockBackend(() => ({ content: directive("orders.status") }));
+    const el = await mount();
+    let started!: () => void;
+    const running = new Promise<void>((r) => (started = r));
+    el.registerActions([{ name: "orders.status", description: "Look up", sensitivity: "read", handler: (_a, { signal }) => {
+      started();
+      return new Promise((_res, rej) => signal.addEventListener("abort", () => rej(new Error("aborted"))));
+    } }]);
+    const sent = el.send("status");
+    await running;
+    el.stop();
+    await sent;
+    expect(chats).toHaveLength(1);
+  });
+
   it("restores an unconfirmed action as unconfirmed after reload", async () => {
     const history = [
       { role: "assistant", content: directive("payments.create", {}) },

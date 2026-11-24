@@ -381,13 +381,14 @@ export class DeweeChatElement extends ElementBase {
     // Agent turn, then (when the answer calls page actions) run them and send the results back,
     // at most `maxActionRounds` times per visitor message.
     let next: { message: string; hidden: boolean } | null = { message, hidden: false };
+    let last = false;
     for (let round = 0; next; round++) {
       if (/MEM-[A-Z2-7]{16}/i.test(next.message) || (attachment && /MEM-[A-Z2-7]{16}/i.test(JSON.stringify(attachment)))) {
         this.showNotice(this.strings.memberLinkPrivate); break;
       }
       const reply = await this.runTurn(next.message, next.hidden, round === 0 ? attachment : undefined);
       next = null;
-      if (reply.status !== "done" || reply.stopped || !this.actionRegistry().size) break;
+      if (last || reply.status !== "done" || reply.stopped || !this.actionRegistry().size) break;
       const { calls } = parseDirectives(reply.content);
       if (!calls.length) break;
       reply.actions = calls.map((c) => ({ id: c.id, name: c.name, args: c.ok ? c.args : undefined, status: "pending" as const }));
@@ -399,8 +400,13 @@ export class DeweeChatElement extends ElementBase {
         break;
       }
       this.updateMessage(reply);
-      const results = await this.runActions(reply, calls);
-      if (results) next = { message: formatActionResults(results, this.server?.maxMessageLength ?? 4000), hidden: true };
+      const { results, stopped } = await this.runActions(reply, calls);
+      // Stop ends the chain, with one exception: a write that was already running may have taken
+      // effect. The agent and the stored history must learn it is unconfirmed, or the next turn
+      // offers to do it again and a reload shows it as never run. That report is the last turn.
+      if (stopped && !results.some((r) => r.status === "unknown")) break;
+      last = stopped;
+      next = { message: formatActionResults(results, this.server?.maxMessageLength ?? 4000), hidden: true };
     }
   }
 
@@ -489,8 +495,8 @@ export class DeweeChatElement extends ElementBase {
     if (this.config.persist !== false) store.set(key, hash);
   }
 
-  /** Executes the calls of one answer in order. Resolves null when the visitor stopped the chain. */
-  private async runActions(reply: ViewMessage, calls: ParsedCall[]): Promise<ActionResult[] | null> {
+  /** Executes the calls of one answer in order. `stopped` says the visitor stopped the chain. */
+  private async runActions(reply: ViewMessage, calls: ParsedCall[]): Promise<{ results: ActionResult[]; stopped: boolean }> {
     const ctrl = new AbortController();
     this.setRunning(ctrl);
     const results: ActionResult[] = [];
@@ -521,7 +527,7 @@ export class DeweeChatElement extends ElementBase {
     } finally {
       this.setRunning(null);
     }
-    return ctrl.signal.aborted ? null : results;
+    return { results, stopped: ctrl.signal.aborted };
   }
 
   private confirmAction(registry: ActionRegistry, action: PageActionInfo & { callId: string }, args: Record<string, unknown>, signal: AbortSignal): Promise<boolean> | boolean {

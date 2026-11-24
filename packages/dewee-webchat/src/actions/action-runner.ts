@@ -60,9 +60,16 @@ export class ActionError extends Error {
 
 /** Duck-typed so an `ActionError` from another copy of the package (CDN + bundle) is still recognised. */
 function asActionError(e: unknown): { code: string; outcome: "failed" | "unknown"; message: string } | null {
-  const x = e as { name?: unknown; code?: unknown; outcome?: unknown; message?: unknown } | null;
-  if (!x || typeof x !== "object" || x.name !== "ActionError" || typeof x.code !== "string" || !ACTION_ERROR_CODE_RE.test(x.code)) return null;
-  return { code: x.code, outcome: x.outcome === "unknown" ? "unknown" : "failed", message: typeof x.message === "string" ? x.message : x.code };
+  try {
+    const x = e as { name?: unknown; code?: unknown; outcome?: unknown; message?: unknown } | null;
+    if (!x || typeof x !== "object") return null;
+    // A subclass may rename itself; one from another copy of the package is known only by its name.
+    if (!(e instanceof ActionError) && x.name !== "ActionError") return null;
+    if (typeof x.code !== "string" || !ACTION_ERROR_CODE_RE.test(x.code)) return null;
+    return { code: x.code, outcome: x.outcome === "unknown" ? "unknown" : "failed", message: typeof x.message === "string" && x.message ? x.message : x.code };
+  } catch {
+    return null; // a getter that throws: treated as a plain failure, the runner never throws
+  }
 }
 
 export const needsConfirmation = (s: ActionSensitivity) => s === "mutate" || s === "destructive";
@@ -165,7 +172,11 @@ export async function runActionCall(call: ParsedCall, o: RunCallOptions): Promis
       return needsConfirmation(action.sensitivity) ? unknown(`${why} while running; the outcome is not confirmed`) : fail(why);
     }
     const known = asActionError(e);
-    if (!known) return fail(String((e as Error)?.message ?? e).slice(0, 500) || "Action failed");
+    if (!known) {
+      let text = "";
+      try { text = String((e as Error)?.message ?? e); } catch { /* unreadable error: generic text */ }
+      return fail(text.slice(0, 500) || "Action failed");
+    }
     const message = known.message.slice(0, 500);
     if (known.outcome === "unknown") return unknown(message, known.code);
     return { ...fail(message), code: known.code };

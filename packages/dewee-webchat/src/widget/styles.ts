@@ -255,6 +255,16 @@ details > summary svg.ic { width: 14px; height: 14px; flex: none; }
 .credential-request .spin { display: inline-block; vertical-align: middle; }
 .credential-request ul { margin: 8px 0; padding-inline-start: 20px; }
 .credential-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+/* human takeover: a staff reply is labelled, a takeover notice is neutral (never an agent bubble) */
+.msg.human { flex-direction: column; }
+.msg.human .author { font-size: 11.5px; font-weight: 600; color: var(--dw-muted); margin: 0 0 4px; }
+.msg.human .bubble { padding: 9px 12px; border: 1px solid var(--dw-border); border-radius: 12px; background: var(--dw-surface); }
+.msg.system { justify-content: center; }
+.msg.system .bubble { max-width: 100%; font-size: 12.5px; line-height: 1.5; color: var(--dw-muted); text-align: center; white-space: pre-wrap; }
+.handoff { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; margin: 0 2px 8px; }
+.handoff-status { flex: 1 1 180px; min-width: 0; font-size: 12px; line-height: 1.45; color: var(--dw-muted); }
+.handoff-request { font-size: 12.5px; padding: 6px 12px; min-height: 32px; }
+.handoff-request[aria-disabled="true"] { opacity: .6; cursor: default; }
 
 /* ---------- composer ---------- */
 .composer { padding: 10px 12px 12px; border-top: 1px solid var(--dw-border); background: var(--dw-bg); }

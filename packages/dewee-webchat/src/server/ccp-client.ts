@@ -7,7 +7,7 @@
 // another origin. Nothing a visitor sends ever becomes part of a URL.
 
 /** Routes of the public ingress this client calls. Fixed names: callers cannot inject path segments. */
-export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "identity/member-link-proof" | "link" | "job-access" | "credential-request" | "credential-request-handoff" | "credential-request-cancel";
+export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "identity/member-link-proof" | "link" | "job-access" | "credential-request" | "credential-request-handoff" | "credential-request-cancel" | "request-human";
 
 /** Validated CCP endpoint options (see {@link parseCcpOptions}). */
 export interface CcpOptions {
@@ -133,7 +133,16 @@ export interface CcpRequest {
   idempotencyKey?: string;
   accept?: string;
   signal?: AbortSignal;
+  /** Advertise `credential-requests` in `X-Dewee-Webchat-Features`. */
   credentialRequests?: boolean;
+  /** Advertise `human-handoff` in `X-Dewee-Webchat-Features`. */
+  humanHandoff?: boolean;
+}
+
+/** `X-Dewee-Webchat-Features` for the capabilities a request advertises, or undefined for none. */
+export function featuresHeader(req: Pick<CcpRequest, "credentialRequests" | "humanHandoff">): string | undefined {
+  const tokens = [req.humanHandoff ? "human-handoff" : "", req.credentialRequests ? "credential-requests" : ""].filter(Boolean);
+  return tokens.length ? tokens.join(", ") : undefined;
 }
 
 /** Thin client bound to one validated ingress base. */
@@ -162,7 +171,8 @@ export class CcpClient {
     if (req.visitorIp && VISITOR_IP_RE.test(req.visitorIp)) headers["x-dewee-visitor-ip"] = req.visitorIp;
     if (req.requestId) headers["x-request-id"] = req.requestId;
     if (req.idempotencyKey) headers["idempotency-key"] = req.idempotencyKey;
-    if (req.credentialRequests) headers["x-dewee-webchat-features"] = "credential-requests";
+    const features = featuresHeader(req);
+    if (features) headers["x-dewee-webchat-features"] = features;
     let res: Response;
     try {
       // "manual" instead of "error": Cloudflare Workers reject redirect "error"; a 3xx (or an opaque

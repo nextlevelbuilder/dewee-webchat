@@ -127,6 +127,8 @@ final class DeweeWebchat
     private ?array $identity = null;
     private string $identityAgent = '';
     private ?string $credentialFormOrigin = null;
+    /** Option `humanHandoff` (CCP only): visitors may ask for a person; advertised to CCP as `human-handoff`. */
+    private bool $humanHandoff = false;
 
     /**
      * Handles the current request and writes the response.
@@ -209,6 +211,8 @@ final class DeweeWebchat
             'turnstile' => $get('TURNSTILE_SITE_KEY') !== null && $get('TURNSTILE_SECRET_KEY') !== null
                 ? ['siteKey' => $get('TURNSTILE_SITE_KEY'), 'secretKey' => $get('TURNSTILE_SECRET_KEY')]
                 : null,
+            // Opt-in only: anything but "true" leaves human takeover off.
+            'humanHandoff' => trim((string) $get('DEWEE_WEBCHAT_HUMAN_HANDOFF')) === 'true' ? true : null,
         ];
         foreach ($overrides as $k => $v) {
             if ($v !== null) {
@@ -319,6 +323,12 @@ final class DeweeWebchat
             $u = is_string($origin) ? parse_url($origin) : false;
             if ($this->ccp === null || $this->identity === null || !is_string($origin) || preg_match('/[^\x21-\x7e]|[\\\\%]/', $origin) || !is_array($u) || strtolower($u['scheme'] ?? '') !== 'https' || empty($u['host']) || isset($u['user']) || isset($u['pass']) || isset($u['query']) || isset($u['fragment']) || !in_array($u['path'] ?? '', ['', '/'], true)) throw new DeweeConfigError('[dewee-webchat] credentialRequests requires CCP identity and an ASCII HTTPS form origin (use punycode for internationalized domains)');
             $this->credentialFormOrigin = 'https://' . strtolower($u['host']) . (isset($u['port']) && $u['port'] !== 443 ? ':' . $u['port'] : '');
+        }
+        // optionsFromEnv() leaves the key null when the variable is unset; null means off, like TS undefined.
+        if (isset($this->o['humanHandoff'])) {
+            if (!is_bool($this->o['humanHandoff'])) throw new DeweeConfigError('[dewee-webchat] humanHandoff must be true or false');
+            if ($this->o['humanHandoff'] && $this->ccp === null) throw new DeweeConfigError('[dewee-webchat] humanHandoff requires the ccp transport');
+            $this->humanHandoff = $this->o['humanHandoff'];
         }
     }
 
@@ -437,6 +447,7 @@ final class DeweeWebchat
                 $method === 'POST' && $action === 'member-link-proof' => $this->handleMemberLinkProof(),
                 $method === 'POST' && $action === 'job-access' && $this->identity !== null => $this->handleJobAccess(),
                 $method === 'POST' && in_array($action, ['credential-request', 'credential-request-handoff', 'credential-request-cancel'], true) => $this->handleCredentialRequest($action),
+                $method === 'POST' && $action === 'request-human' => $this->handleRequestHuman(),
                 default => $this->fail(404, 'Not found', 'not_found'),
             };
         } catch (DeweeRateLimitUnavailable) {
@@ -977,6 +988,47 @@ final class DeweeWebchat
         } catch (DeweeCcpError $e) { $this->ccpFail($e, $route); }
     }
 
+    /**
+     * The visitor asks for a person in one of their own conversations (option `humanHandoff` only).
+     * Answers `{control, staffOnDuty}`; a conversation that is not this visitor's is CCP's 404. The case
+     * id and anything else CCP sends stay here.
+     */
+    private function handleRequestHuman(): void
+    {
+        if ($this->ccp === null || !$this->humanHandoff) { $this->fail(404, 'Not found', 'not_found'); return; }
+        $claims = $this->claimsFromRequest();
+        if (!isset($claims['v'])) { $this->fail(401, 'Missing or expired visitor session', 'unauthorized'); return; }
+        if (!empty($this->identity['required']) && !isset($claims['ids'])) { $this->identityFail('IDENTITY_REQUIRED'); return; }
+        if (!$this->identityRebind($claims)) return;
+        // The ingress allows 5 per visitor per 10 minutes; this backend refuses the excess before calling it.
+        if (!$this->rateLimit('request-human:' . $claims['v'], 'link')) { $this->fail(429, 'Too many requests, try again later', 'rate_limited'); return; }
+        $raw = file_get_contents('php://input', false, null, 0, 8193);
+        $body = is_string($raw) && strlen($raw) <= 8192 ? json_decode($raw, true) : null;
+        $summary = is_array($body) ? ($body['summary'] ?? null) : null;
+        if (!is_array($body) || ($body !== [] && array_is_list($body)) || array_diff(array_keys($body), ['agent', 'conversationId', 'summary'])
+            || !is_string($body['conversationId'] ?? null) || !preg_match(self::CCP_ID_RE, $body['conversationId'])
+            || (array_key_exists('summary', $body) && (!is_string($summary) || self::utf16Length($summary) > 1000 || preg_match('/MEM-[A-Z2-7]{16}/i', $summary)))) {
+            $this->fail(400, 'Invalid request', 'bad_request'); return;
+        }
+        $asked = self::ccpAgentFor($body['agent'] ?? null);
+        if ($asked === null) { $this->fail(400, 'Invalid agent'); return; }
+        if (isset($claims['ids'])) {
+            if ($asked !== '' && $asked !== $claims['ida']) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return; }
+            $asked = $claims['ida'];
+        }
+        $summary = is_string($summary) ? self::jsTrim($summary) : '';
+        $input = ['conversation_id' => $body['conversationId']] + ($summary !== '' ? ['summary' => $summary] : []) + ($asked !== '' ? ['agent' => $asked] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
+        try {
+            $ctx = $this->visitorContext();
+            $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json('request-human', $ctx + ['body' => $input, 'session' => $edge['token'], 'humanHandoff' => true]));
+            $control = $data['control'] ?? null;
+            if (!in_array($control, ['agent', 'waiting_human', 'human_active'], true)) throw new DeweeCcpError(200, 'ccp_bad_response', 'CCP request-human: no known control');
+            // Nobody on duty is `control: "agent"`; an answer without the flag says so through its control.
+            $staffOnDuty = is_bool($data['staff_on_duty'] ?? null) ? $data['staff_on_duty'] : $control !== 'agent';
+            $this->json(['control' => $control, 'staffOnDuty' => $staffOnDuty]);
+        } catch (DeweeCcpError $e) { $this->ccpFail($e, 'request-human'); }
+    }
+
     private function handleMemberLinkProof(): void
     {
         if ($this->ccp === null || $this->identity === null || $this->credentialFormOrigin === null) { $this->fail(404, 'Not found', 'not_found'); return; }
@@ -1330,6 +1382,7 @@ final class DeweeWebchat
             'pageContextVersions' => !empty($cfg['pageContextVersions']) ? $cfg['pageContextVersions'] : null,
             'credentialFormOrigin' => $this->credentialFormOrigin,
             'memberLinkProof' => $this->credentialFormOrigin !== null && ($cfg['memberLinkProof'] ?? false) ? true : null,
+            'humanHandoff' => $this->humanHandoff && ($cfg['humanHandoff'] ?? false) === true ? true : null,
             'version' => self::VERSION,
         ]));
     }
@@ -1376,10 +1429,24 @@ final class DeweeWebchat
         try {
             $fp = $this->withEdge($ctx, $visitorId, self::sealedEdge($claims), function (array $e) use ($ctx, $body, $claims, &$edge) {
                 $edge = $e;
-                return $this->ccp->open('chat', $ctx + ['body' => $body, 'session' => $e['token'], 'accept' => 'text/event-stream', 'credentialRequests' => $this->credentialFormOrigin !== null && isset($claims['ids'])]);
+                return $this->ccp->open('chat', $ctx + ['body' => $body, 'session' => $e['token'], 'accept' => 'text/event-stream', 'credentialRequests' => $this->credentialFormOrigin !== null && isset($claims['ids']), 'humanHandoff' => $this->humanHandoff]);
             });
         } catch (DeweeCcpError $e) {
             $this->ccpFail($e, 'chat');
+            return;
+        }
+        // A person holds the conversation: CCP answers `202 {held, control}`, the message was kept for
+        // the staff and no agent runs.
+        if (DeweeCcpClient::statusOf($fp) === 202) {
+            $raw = stream_get_contents($fp, 65536);
+            fclose($fp);
+            $held = is_string($raw) ? json_decode($raw, true) : null;
+            $control = is_array($held) && ($held['held'] ?? null) === true ? ($held['control'] ?? null) : null;
+            if (!in_array($control, ['waiting_human', 'human_active'], true)) {
+                $this->ccpFail(new DeweeCcpError(202, 'ccp_bad_response', 'CCP chat: a held answer without a known control'), 'chat');
+                return;
+            }
+            $this->json(['held' => true, 'control' => $control], 202);
             return;
         }
 
@@ -1596,16 +1663,20 @@ final class DeweeWebchat
         $body = ['conversation_id' => $conversationId, 'limit' => 50] + ($agent !== '' ? ['agent' => $agent] : []) + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
         try {
             $cfg = $this->ccpConfig();
-            $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $e) => $this->ccp->json('history', $ctx + ['body' => $body, 'session' => $e['token'], 'credentialRequests' => $this->credentialFormOrigin !== null && isset($claims['ids'])]));
+            $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $e) => $this->ccp->json('history', $ctx + ['body' => $body, 'session' => $e['token'], 'credentialRequests' => $this->credentialFormOrigin !== null && isset($claims['ids']), 'humanHandoff' => $this->humanHandoff]));
         } catch (DeweeCcpError $e) {
             if ($e->ccpCode === 'not_found') {
-                $this->json(['messages' => []]);
+                $this->json(['messages' => []] + ($this->humanHandoff ? ['control' => 'agent'] : []));
                 return;
             }
             $this->ccpFail($e, 'history');
             return;
         }
         $out = ['messages' => self::ccpHistoryMessages(is_array($data['messages'] ?? null) ? $data['messages'] : [], $cfg)];
+        // Who answers now, for a host that shows takeovers; an unknown value counts as the agent (contract).
+        if ($this->humanHandoff) {
+            $out['control'] = in_array($data['control'] ?? null, ['agent', 'waiting_human', 'human_active'], true) ? $data['control'] : 'agent';
+        }
         if ($this->credentialFormOrigin !== null && isset($claims['ids']) && is_array($data['credential_requests'] ?? null)) {
             $cards = [];
             foreach (array_slice($data['credential_requests'], 0, 100) as $raw) {
@@ -1635,6 +1706,10 @@ final class DeweeWebchat
             }
             $content = is_string($m['content'] ?? null) ? ($role === 'user' ? self::stripPageBlock($m['content']) : $m['content']) : '';
             $msg = ['role' => $role, 'content' => $content];
+            // Only the kind of author: a staff member's name, id or email is never read, even when sent.
+            if ($role === 'assistant' && in_array($m['author_kind'] ?? null, ['human', 'system'], true)) {
+                $msg['authorKind'] = $m['author_kind'];
+            }
             if ($cfg['showThinking'] && is_string($m['thinking'] ?? null) && $m['thinking'] !== '') {
                 $msg['thinking'] = $m['thinking'];
             }
@@ -1779,6 +1854,8 @@ final class DeweeWebchat
             'showToolActivity' => ($data['show_tool_activity'] ?? null) === true,
             'maxMessageChars' => is_int($max) && $max > 0 ? $max : PHP_INT_MAX,
             'pageContextVersions' => in_array(1, is_array($data['page_context']['versions'] ?? null) ? $data['page_context']['versions'] : [], true) ? [1] : [],
+            // A visitor of the default agent can ask for a person (the host must also advertise it).
+            'humanHandoff' => ($data['human_handoff'] ?? null) === true,
         ];
     }
 
@@ -1950,18 +2027,23 @@ final class DeweeWebchat
             return $generic;
         }
         $log = static fn (string $hint) => error_log("[dewee-webchat] ccp {$route}: {$e->ccpCode} (HTTP {$e->status}) {$hint}");
+        // The visitor cannot be handed to a person: the ingress names it with the generic
+        // PERMISSION_DENIED and no remediation, as it has no distinct code yet. The widget hides its
+        // button for this code. A refusal that carries a remediation is an identity refusal and stays one.
+        if ($route === 'request-human' && ($e->ccpCode === 'human_handoff_unavailable' || ($e->ccpCode === 'PERMISSION_DENIED' && $e->remediation === null))) {
+            return ['status' => 403, 'code' => 'human_handoff_unavailable', 'message' => 'Talking to a person is not available'];
+        }
         if (isset(self::IDENTITY_ERRORS[$e->ccpCode])) {
             [$status, $message, $action] = self::IDENTITY_ERRORS[$e->ccpCode];
             return ['status' => $status, 'code' => $e->ccpCode, 'message' => $message, 'identity' => true, 'remediation' => $e->remediation ?? ['action' => $action, 'audience' => 'end_user']];
         }
         $retryAfterMs = $e->retryAfterSeconds ? $e->retryAfterSeconds * 1000 : null;
-        if ($route === 'chat') {
-            if (in_array($e->ccpCode, self::ADMISSION_ERROR_CODES, true)) {
-                return ['status' => $e->ccpCode === 'RATE_LIMITED' ? 429 : 403, 'code' => $e->ccpCode, 'message' => '', 'admission' => $e->ccpCode, 'retryAfterMs' => $retryAfterMs];
-            }
-            if ($e->ccpCode === 'rate_limited' || $e->ccpCode === 'concurrency_limited' || $e->status === 429) {
-                return ['status' => 429, 'code' => 'RATE_LIMITED', 'message' => '', 'admission' => 'RATE_LIMITED', 'retryAfterMs' => $retryAfterMs];
-            }
+        // A refused message (or request for a person) is the typed admission refusal the widget localizes.
+        if (($route === 'chat' || $route === 'request-human') && in_array($e->ccpCode, self::ADMISSION_ERROR_CODES, true)) {
+            return ['status' => $e->ccpCode === 'RATE_LIMITED' ? 429 : 403, 'code' => $e->ccpCode, 'message' => '', 'admission' => $e->ccpCode, 'retryAfterMs' => $retryAfterMs];
+        }
+        if ($route === 'chat' && ($e->ccpCode === 'rate_limited' || $e->ccpCode === 'concurrency_limited' || $e->status === 429)) {
+            return ['status' => 429, 'code' => 'RATE_LIMITED', 'message' => '', 'admission' => 'RATE_LIMITED', 'retryAfterMs' => $retryAfterMs];
         }
         $limited = ['status' => 429, 'code' => 'rate_limited', 'message' => 'Too many messages, please wait a moment'] + ($e->retryAfterSeconds ? ['retryAfterSeconds' => $e->retryAfterSeconds] : []);
         switch ($e->ccpCode) {
@@ -2975,7 +3057,7 @@ final class DeweeWebchat
  */
 final class DeweeCcpClient
 {
-    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'identity/member-link-proof', 'link', 'job-access', 'credential-request', 'credential-request-handoff', 'credential-request-cancel'];
+    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'identity/member-link-proof', 'link', 'job-access', 'credential-request', 'credential-request-handoff', 'credential-request-cancel', 'request-human'];
     private const INTEGRATION_ID_RE = '/^wci_[a-z2-7]{26}$/';
     private const SECRET_RE = '/^dwc_[A-Za-z0-9_-]{16,256}$/';
     private const INGRESS_PATH_RE = '#/api/public/webchat/v1/(wci_[a-z2-7]{26})$#';
@@ -3063,7 +3145,8 @@ final class DeweeCcpClient
             'User-Agent: dewee-webchat-php/' . DeweeWebchat::VERSION,
             'Connection: close',
         ];
-        if (($req['credentialRequests'] ?? false) === true) $headers[] = 'X-Dewee-Webchat-Features: credential-requests';
+        $features = self::featuresHeader(($req['humanHandoff'] ?? false) === true, ($req['credentialRequests'] ?? false) === true);
+        if ($features !== null) $headers[] = 'X-Dewee-Webchat-Features: ' . $features;
         $body = null;
         if (isset($req['body'])) {
             $body = (string) json_encode((object) $req['body'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_LINE_TERMINATORS | JSON_INVALID_UTF8_SUBSTITUTE);
@@ -3095,7 +3178,7 @@ final class DeweeCcpClient
         }
         $meta = stream_get_meta_data($fp);
         $respHeaders = is_array($meta['wrapper_data'] ?? null) ? $meta['wrapper_data'] : [];
-        $status = isset($respHeaders[0]) && preg_match('#^HTTP/\S+\s+(\d{3})#', (string) $respHeaders[0], $sm) ? (int) $sm[1] : 0;
+        $status = self::statusOf($fp);
         if ($status === 0) {
             fclose($fp);
             throw new DeweeCcpError(0, 'ccp_bad_response', "CCP {$route}: no HTTP status");
@@ -3110,6 +3193,21 @@ final class DeweeCcpClient
         $raw = (string) stream_get_contents($fp, self::MAX_ERROR_BODY);
         fclose($fp);
         throw self::errorFrom($status, $raw, $respHeaders);
+    }
+
+    /** `X-Dewee-Webchat-Features` for the capabilities a request advertises, or null for none (same as the TS client). */
+    public static function featuresHeader(bool $humanHandoff, bool $credentialRequests): ?string
+    {
+        $tokens = array_values(array_filter([$humanHandoff ? 'human-handoff' : '', $credentialRequests ? 'credential-requests' : ''], static fn (string $t) => $t !== ''));
+        return $tokens ? implode(', ', $tokens) : null;
+    }
+
+    /** The HTTP status of a body stream {@see open()} returned (its first response header line), 0 when unknown. @param resource $fp */
+    public static function statusOf($fp): int
+    {
+        $meta = stream_get_meta_data($fp);
+        $headers = is_array($meta['wrapper_data'] ?? null) ? $meta['wrapper_data'] : [];
+        return isset($headers[0]) && preg_match('#^HTTP/\S+\s+(\d{3})#', (string) $headers[0], $m) ? (int) $m[1] : 0;
     }
 
     /**

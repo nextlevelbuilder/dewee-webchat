@@ -67,6 +67,20 @@ export interface Strings {
   pageChanged: string;
   pageUnavailable: string;
   credential: { open: string; cancel: string; continue: string; unavailable: string; intro: string; required: string; optional: string; expires: string; status: Record<"pending" | "applying" | "resolved" | "cancelled" | "expired" | "failed", string> };
+  /** Human takeover: the button, the status line (also announced), and the label of a staff reply. */
+  handoff: {
+    request: string;
+    requesting: string;
+    waiting: string;
+    active: string;
+    unattended: string;
+    returned: string;
+    held: string;
+    failed: string;
+    limited: string;
+    unavailable: string;
+    staff: string;
+  };
 }
 
 const en: Strings = {
@@ -145,6 +159,19 @@ const en: Strings = {
   pageChanged: "The page changed. Review it and choose to share again before sending.",
   pageUnavailable: "Page details are unavailable. You can send without them.",
   credential: { open: "Open secure form", cancel: "Cancel request", continue: "Continue conversation", unavailable: "Could not open or update the request. Please try again.", intro: "Enter credentials only on the authenticated Dewee form.", required: "required", optional: "optional", expires: "Expires", status: { pending: "Waiting for you", applying: "Processing", resolved: "Completed", cancelled: "Cancelled", expired: "Expired", failed: "Failed" } },
+  handoff: {
+    request: "Talk to a person",
+    requesting: "Contacting support staff…",
+    waiting: "Waiting for a support staff member to join…",
+    active: "You're chatting with support staff.",
+    unattended: "No one is available right now. The assistant will keep helping you.",
+    returned: "The assistant is back in the conversation.",
+    held: "Message sent. Support staff will see it.",
+    failed: "We couldn't reach support staff. Please try again.",
+    limited: "You've asked several times already. Please wait a few minutes and try again.",
+    unavailable: "Talking to a person isn't available right now.",
+    staff: "Support staff",
+  },
 };
 
 const vi: Strings = {
@@ -223,6 +250,19 @@ const vi: Strings = {
   pageChanged: "Trang đã thay đổi. Hãy xem lại và chọn chia sẻ trước khi gửi.",
   pageUnavailable: "Không thể đọc nội dung trang. Bạn vẫn có thể gửi tin nhắn.",
   credential: { open: "Mở biểu mẫu bảo mật", cancel: "Hủy yêu cầu", continue: "Tiếp tục trò chuyện", unavailable: "Chưa thể mở hoặc cập nhật yêu cầu. Bạn thử lại nhé.", intro: "Chỉ nhập thông tin xác thực trên biểu mẫu Dewee sau khi đăng nhập.", required: "bắt buộc", optional: "tùy chọn", expires: "Hết hạn", status: { pending: "Đang chờ bạn", applying: "Đang xử lý", resolved: "Đã hoàn tất", cancelled: "Đã hủy", expired: "Đã hết hạn", failed: "Không thành công" } },
+  handoff: {
+    request: "Gặp nhân viên hỗ trợ",
+    requesting: "Đang liên hệ nhân viên hỗ trợ…",
+    waiting: "Đang chờ nhân viên hỗ trợ tham gia…",
+    active: "Bạn đang trò chuyện với nhân viên hỗ trợ.",
+    unattended: "Hiện chưa có nhân viên trực. Trợ lý sẽ tiếp tục hỗ trợ bạn.",
+    returned: "Trợ lý đã quay lại cuộc trò chuyện.",
+    held: "Đã gửi tin nhắn. Nhân viên hỗ trợ sẽ xem tin nhắn này.",
+    failed: "Chưa liên hệ được nhân viên hỗ trợ. Bạn thử lại nhé.",
+    limited: "Bạn đã yêu cầu nhiều lần. Vui lòng chờ vài phút rồi thử lại.",
+    unavailable: "Hiện chưa thể gặp nhân viên hỗ trợ.",
+    staff: "Nhân viên hỗ trợ",
+  },
 };
 
 export const locales: Record<string, Strings> = { en, vi };

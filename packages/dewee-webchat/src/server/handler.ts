@@ -12,10 +12,12 @@ import {
   isIdentityErrorCode,
   type AgentInfo,
   type ChatStreamEvent,
+  type HeldChatResponse,
   type IdentityErrorCode,
   type LinkResponse,
   type PublicConfig,
   type Remediation,
+  type RequestHumanResponse,
   type SessionResponse,
 } from "../protocol";
 // This module never imports `@dewee/identity`, not even lazily, so bundlers of anonymous-only hosts never
@@ -212,6 +214,13 @@ export interface DeweeHandlerOptions {
   imageSources?: string[];
   /** Enable signed-in hosted credential requests, pinning the Dewee form's HTTPS origin. */
   credentialRequests?: { formOrigin: string };
+  /**
+   * CCP transport only: let visitors ask for a person (human takeover). This backend then advertises
+   * `human-handoff` to CCP, serves `POST {basePath}/request-human`, answers a held message with
+   * `202 {held, control}` and returns `control` and staff/system authors in `/history`. The widget shows
+   * its button only when the integration allows it too. Default false: nothing changes.
+   */
+  humanHandoff?: boolean;
   /** Explicitly public directories in this Worker's Assets binding. Bypasses site middleware. */
   cloudflarePublicImageAssets?: { binding: { fetch(request: Request): Promise<Response> }; prefixes: string[] };
   /** Public-only service bindings for approved HTTPS image directory prefixes. Bypasses host security rules. */
@@ -335,6 +344,9 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       credentialFormOrigin = u.origin;
     } catch { throw new Error("[dewee-webchat] credentialRequests.formOrigin must be an ASCII HTTPS origin (use punycode for internationalized domains)"); }
   }
+  if (o.humanHandoff !== undefined && typeof o.humanHandoff !== "boolean") throw new Error("[dewee-webchat] humanHandoff must be true or false");
+  if (o.humanHandoff && transport !== "ccp") throw new Error("[dewee-webchat] humanHandoff requires the ccp transport");
+  const humanHandoff = o.humanHandoff === true;
   if (o.imageSources !== undefined && !Array.isArray(o.imageSources)) throw new Error("[dewee-webchat] imageSources must be an array");
   const imageSources = (o.imageSources ?? []).map((origin) => {
     let url: URL;
@@ -402,6 +414,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
           new CcpClient(parseCcpOptions(o.ccp)),
           idn ? { createAssertion: (a) => idn.sdk.createAssertion!(a), signer: () => identitySigner(), ttlSeconds: idn.sessionTtlSeconds } : undefined,
           !!credentialFormOrigin,
+          humanHandoff,
         )
       : null;
 
@@ -888,6 +901,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       ...(cfg.pageContextVersions.length ? { pageContextVersions: cfg.pageContextVersions } : {}),
       ...(credentialFormOrigin ? { credentialFormOrigin } : {}),
       ...(credentialFormOrigin && cfg.memberLinkProof ? { memberLinkProof: true } : {}),
+      ...(humanHandoff && cfg.humanHandoff ? { humanHandoff: true } : {}),
       version: VERSION,
     };
     if (idn) {
@@ -1157,6 +1171,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     };
     let cfg: CcpConfig;
     let upstream: Response;
+    let held: Awaited<ReturnType<NonNullable<typeof ccp>["heldControl"]>>;
     try {
       cfg = await ccp!.config();
       if (turn.pageContext != null) {
@@ -1181,11 +1196,17 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
         credentialRequestId: turn.credentialRequestId,
         signal: abort.signal,
       });
+      held = await ccp!.heldControl(upstream);
     } catch (e) {
       cleanup();
       if (timedOut) return fail(req, 504, "The agent took too long to answer", "timeout");
       if (abort.signal.aborted && !(e instanceof CcpError)) return fail(req, 499, "Request cancelled", "cancelled");
       return ccpFail(req, e, "chat", claims.ids);
+    }
+    // A person holds the conversation: the message was kept for the staff and no agent runs.
+    if (held) {
+      cleanup();
+      return json(req, { held: true, control: held } satisfies HeldChatResponse, 202);
     }
 
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
@@ -1366,6 +1387,42 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     } catch (e) { return ccpFail(req, e, route, claims.ids); }
   }
 
+  /**
+   * The visitor asks for a person in one of their own conversations (`humanHandoff` only). Answers
+   * `{control, staffOnDuty}`; a conversation that is not this visitor's is CCP's `404 not_found`.
+   */
+  async function handleRequestHuman(req: Request): Promise<Response> {
+    if (!ccp || !humanHandoff) return fail(req, 404, "Not found", "not_found");
+    const claims = await visitorFrom(req);
+    if (!claims) return fail(req, 401, "Missing or expired visitor session", "unauthorized");
+    if (idn?.required && !claims.ids) return identityFail(req, "IDENTITY_REQUIRED");
+    const refused = await rebindRefusal(req, claims);
+    if (refused) return refused;
+    // The ingress allows 5 per visitor per 10 minutes; this backend refuses the excess before calling it.
+    if (limiter && !(await limiter(`request-human:${claims.v}`, "link"))) return fail(req, 429, "Too many requests, try again later", "rate_limited");
+    const raw = await readImageTicketBody(req);
+    let body: any;
+    try { body = raw && JSON.parse(raw); } catch { return fail(req, 400, "Invalid request", "bad_request"); }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => !["conversationId", "agent", "summary"].includes(key))
+      || typeof body.conversationId !== "string" || !CCP_ID_RE.test(body.conversationId)
+      || (body.summary !== undefined && (typeof body.summary !== "string" || body.summary.length > 1000 || /MEM-[A-Z2-7]{16}/i.test(body.summary)))) {
+      return fail(req, 400, "Invalid request", "bad_request");
+    }
+    const agent = ccpAgentFor(req, claims, body.agent);
+    if (agent instanceof Response) return agent;
+    try {
+      const result = await ccp.requestHuman(visitorContext(req), claims.v, sealedEdge(claims), {
+        conversationId: body.conversationId,
+        agent: agent || undefined,
+        identitySession: claims.ids,
+        summary: typeof body.summary === "string" && body.summary.trim() ? body.summary.trim() : undefined,
+      });
+      return json(req, result satisfies RequestHumanResponse);
+    } catch (e) {
+      return ccpFail(req, e, "request-human", claims.ids);
+    }
+  }
+
   /** Web-first linking: starts a Dewee link for the signed-in user and returns the proof code. */
   async function handleLink(req: Request): Promise<Response> {
     const claims = await visitorFrom(req);
@@ -1512,6 +1569,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (req.method === "POST" && action === "member-link-proof") return await handleMemberLinkProof(req);
       if (req.method === "POST" && action === "job-access" && idn) return await handleJobAccess(req);
       if (req.method === "POST" && (action === "credential-request" || action === "credential-request-handoff" || action === "credential-request-cancel")) return await handleCredentialRequest(req, action);
+      if (req.method === "POST" && action === "request-human") return await handleRequestHuman(req);
       return fail(req, 404, "Not found", "not_found");
     } catch (e) {
       if (e instanceof IdentityStoreError) return identityFail(req, "SOURCE_UNAVAILABLE", { action: "retry_later", audience: "end_user" });
@@ -1551,6 +1609,8 @@ export function optionsFromEnv(env: Record<string, string | undefined>, override
     imageSources: list(env.DEEWEE_IMAGE_SOURCES),
     allowClientCredentials: env.DEWEE_ALLOW_CLIENT_CREDENTIALS === "true" ? (byoHosts?.length ? { allowedHosts: byoHosts } : true) : false,
     turnstile: env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY ? { siteKey: env.TURNSTILE_SITE_KEY, secretKey: env.TURNSTILE_SECRET_KEY } : undefined,
+    // Opt-in only: anything but "true" leaves human takeover off.
+    humanHandoff: env.DEWEE_WEBCHAT_HUMAN_HANDOFF?.trim() === "true" ? true : undefined,
     // undefined overrides must not erase env-derived values
     ...Object.fromEntries(Object.entries(overrides).filter(([, v]) => v !== undefined)),
   };

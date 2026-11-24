@@ -60,6 +60,7 @@ first three values below.
 | `DEWEE_ALLOWED_ORIGINS` | Extra origins for cross-origin embedding (same origin always works) |
 | `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | Optional Cloudflare Turnstile check for new visitors (with `ccp`, a returning visitor's hourly refresh is not challenged) |
 | `DEWEE_WEBCHAT_TRANSPORT` | Optional: `ccp` or `legacy-gateway`. Without it, the variables that are set decide (gateway variables alone select `legacy-gateway`, with a deprecation warning); set it to pin the transport explicitly. |
+| `DEWEE_WEBCHAT_HUMAN_HANDOFF` | Optional, `ccp` only: `true` lets visitors ask for a person (see [Talking to a person](#talking-to-a-person)). Any other value leaves it off. |
 
 The same values as options: `createDeweeHandler({ transport: "ccp", ccp: { chatUrl, integrationId, integrationSecret }, secret })`.
 With `ccp`, the agents come from the integration: `/config` lists them, the widget's `agent` is
@@ -441,6 +442,33 @@ default:
 - The built-ins operate the DOM, not your app's permissions: the agent can do whatever the visitor's
   clicks can, after approval. Narrow it with `domActionsRoot` and `data-dewee-ignore`, and keep the server
   as the authority.
+
+## Talking to a person
+
+Off by default. With `transport: "ccp"`, `createDeweeHandler({ …, humanHandoff: true })` (or
+`DEWEE_WEBCHAT_HUMAN_HANDOFF=true`) tells CCP this host can show a human takeover. When the
+integration allows it too, the widget shows **Talk to a person** / **Gặp nhân viên hỗ trợ** under
+the conversation. The widget then follows what the server says:
+
+- **Waiting for staff**: the request was recorded; messages the visitor sends are kept for the staff
+  (no agent reply, no error) and the widget checks history for the staff's answer.
+- **Staff joined**: the staff member's messages are labelled "Support staff" / "Nhân viên hỗ trợ";
+  their name, id and email are never sent to the browser.
+- **Nobody on duty**: the agent keeps answering and the widget says so.
+- When staff hand the conversation back, the agent answers again and the widget stops checking.
+
+| Host | Supports |
+|---|---|
+| TypeScript handler, `ccp` | Yes, with `humanHandoff: true` |
+| PHP backend, `ccp` | Yes, with `$options['humanHandoff'] = true` or `DEWEE_WEBCHAT_HUMAN_HANDOFF=true` |
+| Either backend, `legacy-gateway` | No: the option is refused at startup |
+| Older versions of either backend | No: no button, no feature header, no polling |
+
+Turn the option on only with widget **0.5.0-beta.7** or later on every page that embeds it (a pinned
+older widget does not understand the `202` answer to a held message). The `/config` flag reflects the
+integration's default agent.
+
+Routes and payloads: [HTTP contract](../../docs/http-contract.md#talking-to-a-person-human-takeover).
 
 ## Signed-in users
 

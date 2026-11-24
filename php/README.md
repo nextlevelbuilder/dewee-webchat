@@ -42,6 +42,15 @@ origin of the Dewee form, using ASCII punycode for an internationalized domain. 
 receives credential values; only an authenticated workspace approval administrator can submit them
 on the hosted form. See the [HTTP contract](../docs/http-contract.md#hosted-credential-requests).
 
+## Talking to a person
+
+Off by default. With CCP, `$options['humanHandoff'] = true;` (or `DEWEE_WEBCHAT_HUMAN_HANDOFF=true`)
+lets visitors ask for a person when the integration allows it, exactly like the TypeScript handler:
+`POST request-human`, a `202 {held, control}` answer to messages a person holds, and `control` and
+`authorKind` in history (never the staff member's identity). A non-boolean option is refused
+at startup, and so is the option with the legacy gateway transport. Without it the backend behaves as
+before. Turn it on only with widget 0.5.0-beta.7 or later on the pages that embed it. See the [HTTP contract](../docs/http-contract.md#talking-to-a-person-human-takeover).
+
 ## Install
 
 Copy `dewee-webchat.php` into your project and create an endpoint, for example `api/dewee.php`:
@@ -69,6 +78,7 @@ CCP and copy its values (agents, allowed sites and limits are set there):
 | `DEWEE_WEBCHAT_INTEGRATION_SECRET` | `dwc_…`. Server only; sent to that origin only, redirects are refused |
 | `DEWEE_WEBCHAT_SECRET` | HMAC secret for visitor tokens (at least 32 random bytes; required with either transport) |
 | `DEWEE_WEBCHAT_TRANSPORT` | Optional `ccp` or `legacy-gateway`; otherwise the variables set decide |
+| `DEWEE_WEBCHAT_HUMAN_HANDOFF` | Optional, `ccp` only: `true` lets visitors ask for a person; anything else leaves it off |
 | `DEWEE_ALLOWED_ORIGINS` (csv or `*`) | Optional |
 | `DEWEE_IMAGE_SOURCES` | Comma-separated trusted HTTPS directory prefixes for the image proxy; disabled when unset |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Require Cloudflare Turnstile for new sessions |

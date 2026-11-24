@@ -4,12 +4,16 @@ import { parseCredentialHandoff, parseCredentialRequest, type CredentialHandoff,
 import {
   HEADER_GATEWAY_TOKEN,
   HEADER_GATEWAY_URL,
+  isHandoffControl,
   type ChatRequestBody,
   type ChatStreamEvent,
+  type HandoffControl,
+  type HeldChatResponse,
   type HistoryMessage,
   type LinkResponse,
   type PublicConfig,
   type Remediation,
+  type RequestHumanResponse,
   type SessionResponse,
 } from "../protocol";
 
@@ -359,14 +363,26 @@ export class ApiClient {
     return (await this.historyDetails(agent, conversationId)).messages;
   }
 
-  async historyDetails(agent: string, conversationId: string): Promise<{ messages: HistoryMessage[]; credentialRequests: CredentialRequestView[] }> {
+  async historyDetails(agent: string, conversationId: string): Promise<{ messages: HistoryMessage[]; credentialRequests: CredentialRequestView[]; control?: HandoffControl }> {
     const res = await this.signedInRequest(async () =>
       this.request(this.url("history", { agent, conversationId }), { headers: await this.headers(true) }),
     );
-    const data = await this.parse<{ messages: HistoryMessage[]; credentialRequests?: unknown[] }>(res);
+    const data = await this.parse<{ messages: HistoryMessage[]; credentialRequests?: unknown[]; control?: unknown }>(res);
     const cards = this.session?.verified && this.config?.credentialFormOrigin && Array.isArray(data.credentialRequests)
       ? data.credentialRequests.slice(0, 100).map((v) => parseCredentialRequest(v, agent)).filter((v): v is CredentialRequestView => v !== null) : [];
-    return { messages: data.messages, credentialRequests: cards };
+    // Who answers is read only from a backend that offers takeovers; any other value is ignored.
+    const control = this.config?.humanHandoff && isHandoffControl(data.control) ? data.control : undefined;
+    return { messages: data.messages, credentialRequests: cards, ...(control ? { control } : {}) };
+  }
+
+  /** Asks for a person in this conversation (backends with `humanHandoff`). Asking again answers the same case. */
+  async requestHuman(agent: string, conversationId: string): Promise<RequestHumanResponse> {
+    const res = await this.signedInRequest(async () =>
+      this.request(this.url("request-human"), { method: "POST", headers: await this.headers(true), body: JSON.stringify({ agent, conversationId }), redirect: "error" }),
+    );
+    const data = await this.parse<{ control?: unknown; staffOnDuty?: unknown }>(res);
+    if (!isHandoffControl(data.control)) throw new ApiError("Invalid response", 502, "bad_response");
+    return { control: data.control, staffOnDuty: typeof data.staffOnDuty === "boolean" ? data.staffOnDuty : data.control !== "agent" };
   }
 
   /** Never retry a credential action under a newly authenticated identity. */
@@ -403,11 +419,16 @@ export class ApiClient {
     return send();
   }
 
-  /** Sends a message and calls `onEvent` for every streamed event. Resolves when the run ends. */
+  /**
+   * Sends a message and calls `onEvent` for every streamed event. Resolves when the run ends. While a
+   * person holds the conversation (backends with `humanHandoff`) the message is kept for staff and no
+   * agent runs: there is no event, `onHeld` gets the answer and the call resolves.
+   */
   async chat(
     input: ChatRequestBody & { agent: string; conversationId: string },
     onEvent: (e: ChatStreamEvent) => void,
     signal?: AbortSignal,
+    onHeld?: (held: HeldChatResponse) => void,
   ): Promise<void> {
     await this.ensureSession();
     let res = await this.request(this.url("chat"), { method: "POST", headers: await this.headers(true), body: JSON.stringify(input), signal });
@@ -418,6 +439,12 @@ export class ApiClient {
       // Another visitor means another backend conversation, which has not seen the action manifest.
       if (input.actionsHash && this.visitorId() !== before) input = { ...input, actionsHash: undefined };
       res = await this.request(this.url("chat"), { method: "POST", headers: await this.headers(true), body: JSON.stringify(input), signal });
+    }
+    if (res.status === 202) {
+      const held = await this.parse<{ held?: unknown; control?: unknown }>(res);
+      if (held.held !== true || (held.control !== "waiting_human" && held.control !== "human_active")) throw new ApiError("Invalid response", 502, "bad_response");
+      try { onHeld?.({ held: true, control: held.control }); } catch { /* a failing listener never breaks the send */ }
+      return;
     }
     if (!res.ok || !res.body) await this.parse(res);
 

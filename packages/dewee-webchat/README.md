@@ -196,6 +196,16 @@ A widget on the page is not yet a channel that answers. The widget tracks three 
 
 Each step is `idle` (not checked yet), `pending`, `ok` or `failed` (with a `code`).
 
+- `reply` describes the visitor's own last message. A rate limit or a policy refusal (`RATE_LIMITED`,
+  `POLICY_DENIED`, `CHALLENGE_REQUIRED`) stopped the message before the agent, so it leaves `reply` as
+  it was; automatic page-action follow-ups do not change it either.
+- A `code` is a short word list such as `ORIGIN_NOT_ALLOWED`. Anything longer than 40 characters, or
+  not made of underscore-separated words of at most 16 characters, is replaced by `http_<status>`, so a
+  backend that puts something else in `code` cannot leak it through a snapshot.
+- Changing `endpoint`, `gatewayUrl` or `gatewayToken` starts over: the steps go back to `idle`, and
+  `dewee:ready` fires for the new backend only. `renewSession()` resets `session` and `reply`.
+- While the config is unavailable `send()` sends nothing, keeps the visitor's text and shows a notice.
+
 ```ts
 chat.addEventListener("dewee:status", (e) => console.log(e.detail));
 // { embedded: true, config: { state: "ok" }, session: { state: "idle" }, reply: { state: "idle" }, version: "0.5.0" }

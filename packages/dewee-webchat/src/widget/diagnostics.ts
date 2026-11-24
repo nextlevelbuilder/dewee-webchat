@@ -25,7 +25,9 @@ export interface WidgetDiagnostics {
   version?: string;
 }
 
-const CODE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+// Codes are short words joined by underscores (`ORIGIN_NOT_ALLOWED`, `http_503`). Anything longer or
+// with a long unbroken run could be a key or a token fragment a misbehaving server put in `code`.
+const CODE_RE = /^(?=.{1,40}$)[A-Za-z][A-Za-z0-9]{0,15}(_[A-Za-z0-9]{1,16})*$/;
 
 /** A short machine-readable reason for a failed request. Never the server's message text. */
 export function errorCode(e: unknown): string {
@@ -43,6 +45,10 @@ export class Diagnostics {
     return this.steps[step].state;
   }
 
+  get(step: CheckStep): CheckResult {
+    return { ...this.steps[step] };
+  }
+
   /** Records a step. Returns false when nothing changed, so no event is needed. */
   set(step: CheckStep, state: CheckState, code?: string): boolean {
     const next: CheckResult = state === "failed" ? { state, code: code && CODE_RE.test(code) ? code : "network_error" } : { state };
@@ -54,12 +60,6 @@ export class Diagnostics {
 
   setVersion(version: unknown): void {
     this.version = typeof version === "string" && /^[A-Za-z0-9_.+-]{1,64}$/.test(version) ? version : undefined;
-  }
-
-  /** A new backend: nothing known about it yet. */
-  reset(): void {
-    this.steps = { config: { state: "idle" }, session: { state: "idle" }, reply: { state: "idle" } };
-    this.version = undefined;
   }
 
   snapshot(): WidgetDiagnostics {

@@ -14,7 +14,7 @@ import {
 import { createDomActions, type DomActions, type DomActionsRoot } from "../actions/dom-actions";
 import { ACTION_LIMITS, stripPageBlock } from "../actions/page-block";
 import { ApiClient, ApiError, type RequestHeadersOption } from "./api-client";
-import { Diagnostics, errorCode, type CheckState, type CheckStep, type WidgetDiagnostics } from "./diagnostics";
+import { Diagnostics, errorCode, type CheckResult, type CheckState, type CheckStep, type WidgetDiagnostics } from "./diagnostics";
 import { JobAccessPopupError, openJobAccessTicket } from "./job-access";
 import { showConfirmDialog } from "./confirm-dialog";
 import { icons, pickStrings, type Strings } from "./i18n";
@@ -215,6 +215,11 @@ export class DeweeChatElement extends ElementBase {
   private activated = false;
   /** The boot in flight, so `retry()` and `checkConnection()` can wait for it. */
   private activating: Promise<void> | null = null;
+  /** Bumped when the backend changes: a boot started for the previous one must not report. */
+  private bootSeq = 0;
+  private replyBefore: CheckResult = { state: "idle" };
+  /** The retry panel, kept across renders so a screen reader hears the alert once. */
+  private unavailablePanel: HTMLElement | null = null;
   private diag = new Diagnostics();
   private probedPage = false;
   private strings: Strings = pickStrings();
@@ -353,7 +358,7 @@ export class DeweeChatElement extends ElementBase {
     if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.open();
     await this.activate();
     // No backend config: nothing can be sent. The text stays in the composer for after "Try again".
-    if (this.diag.state("config") !== "ok") return;
+    if (this.diag.state("config") !== "ok") { this.showNotice(this.strings.unavailable); return; }
     let attachment: PageContextAttachment | undefined;
     if (this.els.pageChoice.checked) {
       if (this.pagePending) { this.showNotice(this.strings.pageUnavailable); return; }
@@ -425,13 +430,16 @@ export class DeweeChatElement extends ElementBase {
     this.setRunning(new AbortController());
     this.emit("dewee:send", { message, agent: this.agentId, conversationId: this.conversationId, auto: hidden || undefined });
     let sessionOpen = false;
+    // A hidden page-action follow-up is not the turn the visitor saw: it leaves the reply step alone.
+    if (!hidden) this.replyBefore = this.diag.get("reply");
+    const cards = this.credentialCards.size;
     try {
       // The session decides which backend conversation (visitor) the page-action ack belongs to.
       if (this.diag.state("session") !== "ok") this.setCheck("session", "pending");
       await this.client().ensureSession();
       sessionOpen = true;
       this.setCheck("session", "ok");
-      this.setCheck("reply", "pending");
+      if (!hidden) this.setCheck("reply", "pending");
       await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal);
       if (reply.status === "streaming") reply.status = "done";
     } catch (e) {
@@ -441,7 +449,10 @@ export class DeweeChatElement extends ElementBase {
         if (!reply.content) reply.content = `_${this.strings.stopped}_`;
       } else {
         reply.status = "error";
-        this.setCheck(sessionOpen ? "reply" : "session", "failed", errorCode(e));
+        // A rate limit or a policy refusal stopped the message before the agent: the channel works.
+        if (isAdmissionErrorCode((e as ApiError).code)) this.restoreReplyCheck();
+        else if (!sessionOpen) this.setCheck("session", "failed", errorCode(e));
+        else if (!hidden) this.setCheck("reply", "failed", errorCode(e));
         this.showError(reply, e as Error);
       }
     } finally {
@@ -450,7 +461,7 @@ export class DeweeChatElement extends ElementBase {
       if (this.diag.state("reply") === "pending") {
         if (reply.stopped) this.setCheck("reply", "idle");
         else if (reply.status !== "done") this.setCheck("reply", "failed", "reply_failed");
-        else if (reply.content.trim() || reply.toolCalls?.length) this.setCheck("reply", "ok");
+        else if (reply.content.trim() || reply.toolCalls?.length || this.credentialCards.size > cards) this.setCheck("reply", "ok");
         else this.setCheck("reply", "failed", "empty_reply");
       }
       this.finishThinking(reply);
@@ -584,7 +595,7 @@ export class DeweeChatElement extends ElementBase {
 
   /** Loads the backend config again after it failed (the "Try again" button calls this). */
   async retry(): Promise<WidgetDiagnostics> {
-    await this.activate();
+    await this.activate().catch(() => {});
     return this.diag.snapshot();
   }
 
@@ -593,7 +604,7 @@ export class DeweeChatElement extends ElementBase {
    * Resolves the same snapshot as `diagnostics()`; never rejects.
    */
   async checkConnection(): Promise<WidgetDiagnostics> {
-    await this.activate();
+    await this.activate().catch(() => {});
     if (this.diag.state("config") === "ok") {
       if (this.diag.state("session") !== "ok") this.setCheck("session", "pending");
       try {
@@ -613,6 +624,9 @@ export class DeweeChatElement extends ElementBase {
   async renewSession(): Promise<void> {
     this.stop();
     this.clearCredentials();
+    // Another visitor: what was learned about the previous one's session and answers is void.
+    this.setCheck("session", "idle");
+    this.setCheck("reply", "idle");
     this.renderLog();
     try {
       await this.client().renewSession();
@@ -810,6 +824,26 @@ export class DeweeChatElement extends ElementBase {
     this.emit("dewee:status", this.diag.snapshot());
   }
 
+  /** Puts the reply step back to what it was before the visitor's turn that just did not count. */
+  private restoreReplyCheck() {
+    const before = this.replyBefore;
+    this.setCheck("reply", before.state === "pending" ? "idle" : before.state, before.code);
+  }
+
+  /** The backend or the way it is asked changed: drop the boot in flight and start one for the new one. */
+  private restartBoot(newBackend: boolean) {
+    this.bootSeq++;
+    this.activating = null;
+    this.activated = false;
+    if (newBackend) {
+      this.server = null;
+      this.probedPage = false;
+      this.diag.setVersion(undefined);
+      for (const step of ["reply", "session", "config"] as const) this.setCheck(step, "idle");
+    }
+    void this.activate().catch(() => {});
+  }
+
   private client(): ApiClient {
     const c = this.config;
     const key = [c.endpoint, c.gatewayUrl, c.gatewayToken].join("|");
@@ -896,14 +930,9 @@ export class DeweeChatElement extends ElementBase {
 
     // Credentials or endpoint changed after activation: reload server config.
     if (this.activated && this.api && this.apiKey !== [c.endpoint, c.gatewayUrl, c.gatewayToken].join("|")) {
-      this.activated = false;
-      this.server = null;
-      this.probedPage = false;
-      this.diag.reset();
-      this.activate();
+      this.restartBoot(true);
     } else if (this.activated && !this.probedPage && (c.pageContext === "metadata" || c.pageContext === "content")) {
-      this.activated = false;
-      this.activate();
+      this.restartBoot(false);
     } else if (this.activated && c.agent && c.agent !== this.agentId && this.server) {
       this.switchAgent(c.agent);
     } else if (this.activated) {
@@ -1102,13 +1131,19 @@ export class DeweeChatElement extends ElementBase {
   private activate(): Promise<void> {
     if (this.activating) return this.activating;
     if (this.activated) return Promise.resolve();
-    const run = this.boot().finally(() => {
+    // Deferred one microtask so `activating` is set before the first `dewee:status` fires: a listener
+    // that calls `checkConnection()` from it waits for this boot instead of reading a pending snapshot.
+    this.activated = true;
+    const run = Promise.resolve().then(() => this.boot()).finally(() => {
       if (this.activating === run) this.activating = null;
     });
     return (this.activating = run);
   }
 
   private async boot(): Promise<void> {
+    const seq = this.bootSeq;
+    const retrying = this.diag.state("config") === "failed";
+    const refocus = retrying && !!this.unavailablePanel?.contains(this.shadowRoot?.activeElement ?? null);
     this.activated = true;
     this.setCheck("config", "pending");
     this.renderLog();
@@ -1120,6 +1155,7 @@ export class DeweeChatElement extends ElementBase {
     } catch (e) {
       failure = e ?? new Error(this.strings.errorGeneric);
     }
+    if (seq !== this.bootSeq) return; // the backend changed meanwhile: its own boot reports
     if (!loaded) {
       this.activated = false;
       this.setCheck("config", "failed", errorCode(failure));
@@ -1135,8 +1171,15 @@ export class DeweeChatElement extends ElementBase {
       const wanted = this.config.agent;
       const known = (id?: string) => !!id && (loaded!.agents.length === 0 || loaded!.agents.some((a: AgentInfo) => a.id === id));
       this.agentId = known(wanted) ? wanted! : loaded.defaultAgent || loaded.agents[0]?.id || wanted || "";
-      await this.loadConversation();
+      try {
+        await this.loadConversation();
+      } catch (e) {
+        // The config is fine; a history that would not load is shown, not thrown at the caller.
+        if (seq === this.bootSeq) this.showError(null, e instanceof Error ? e : new Error(this.strings.errorGeneric));
+      }
+      if (seq !== this.bootSeq) return;
     }
+    if (refocus) (this.diag.state("config") === "ok" ? this.els.input : this.unavailablePanel?.querySelector<HTMLElement>(".retry"))?.focus();
     this.renderSubtitle();
     this.updatePageChoice();
     // Fired once per boot attempt, as before, including a failed one. `ok` tells the two apart;
@@ -1179,7 +1222,10 @@ export class DeweeChatElement extends ElementBase {
     const log = this.els.log;
     disposeMarkdownImages(log);
     log.replaceChildren();
-    const unavailable = this.diag.state("config") === "failed";
+    // Kept while a retry is in flight, so the button (and keyboard focus) does not vanish and come back.
+    const state = this.diag.state("config");
+    const unavailable = state === "failed" || (state === "pending" && !!this.unavailablePanel);
+    if (!unavailable) this.unavailablePanel = null;
     if (!this.messages.length && !unavailable) log.appendChild(this.renderWelcome());
     for (const m of this.messages) log.appendChild(this.renderMessage(m));
     if (unavailable) log.appendChild(this.renderUnavailable());
@@ -1321,6 +1367,15 @@ export class DeweeChatElement extends ElementBase {
 
   /** Shown instead of the welcome when the backend config could not be loaded. */
   private renderUnavailable(): HTMLElement {
+    const busy = this.diag.state("config") === "pending";
+    if (this.unavailablePanel) {
+      const button = this.unavailablePanel.querySelector<HTMLButtonElement>(".retry")!;
+      this.unavailablePanel.setAttribute("aria-busy", String(busy));
+      // aria-disabled, not disabled: a disabled button drops keyboard focus.
+      button.setAttribute("aria-disabled", String(busy));
+      button.textContent = busy ? this.strings.connecting : this.strings.retry;
+      return this.unavailablePanel;
+    }
     const box = document.createElement("div");
     box.className = "unavailable";
     box.setAttribute("role", "alert");
@@ -1333,12 +1388,11 @@ export class DeweeChatElement extends ElementBase {
     b.className = "retry";
     b.textContent = this.strings.retry;
     b.addEventListener("click", () => {
-      b.disabled = true;
-      b.textContent = this.strings.connecting;
+      if (b.getAttribute("aria-disabled") === "true") return;
       void this.retry();
     });
     box.append(h, p, b);
-    return box;
+    return (this.unavailablePanel = box);
   }
 
   private renderWelcome(): HTMLElement {
@@ -1552,7 +1606,12 @@ export class DeweeChatElement extends ElementBase {
         break;
       case "error": {
         m.status = "error";
-        this.setCheck("reply", "failed", typeof e.code === "string" && e.code ? errorCode({ code: e.code }) : "reply_failed");
+        // Only the visitor's own turn is tracked (it set the step to pending): not a hidden follow-up
+        // or a credential stream, and not a refusal that never reached the agent.
+        if (this.diag.state("reply") === "pending") {
+          if (isAdmissionErrorCode(e.code)) this.restoreReplyCheck();
+          else this.setCheck("reply", "failed", typeof e.code === "string" && e.code ? errorCode({ code: e.code }) : "reply_failed");
+        }
         this.showError(m, new ApiError(e.message, 500, e.code, e.remediation, e.retryAfterMs));
         break;
       }

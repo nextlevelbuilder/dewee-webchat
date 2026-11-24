@@ -183,6 +183,108 @@ describe("<dewee-chat> lifecycle signals", () => {
     ]);
   });
 
+  it("reports the new backend, not the boot it replaced, when the endpoint changes mid-boot", async () => {
+    let releaseOld!: (r: Response) => void;
+    const counts = backend({ config: (path) => (path.startsWith("/api/old/") ? new Promise<Response>((r) => (releaseOld = r)) : undefined) });
+    const el = document.createElement("dewee-chat") as DeweeChatElement;
+    for (const [k, v] of Object.entries({ endpoint: "/api/old", mode: "inline", persist: "false", locale: "en" })) el.setAttribute(k, v);
+    const ready: any[] = [];
+    el.addEventListener("dewee:ready", (e) => ready.push((e as CustomEvent).detail));
+    document.body.appendChild(el);
+    await settle();
+    el.configure({ endpoint: "/api/dewee" }); // what a framework wrapper does right after mounting
+    await settle();
+    expect(counts.config).toBe(2);
+    expect(ready.map((r) => r.ok)).toEqual([true]);
+    expect(el.diagnostics().config).toEqual({ state: "ok" });
+    releaseOld(refused(503, "upstream_unavailable")); // the replaced boot ends late, and badly
+    await settle();
+    expect(ready).toHaveLength(1);
+    expect(el.diagnostics().config).toEqual({ state: "ok" });
+    expect(el.getAttribute("data-connection")).toBe("ready");
+    expect(retryButton(el)).toBeNull();
+  });
+
+  it("does not call a rate limit or a policy refusal a broken reply", async () => {
+    for (const code of ["RATE_LIMITED", "POLICY_DENIED"]) {
+      backend({ chat: (_p, n) => (n === 2 ? refused(429, code) : undefined) });
+      const { el } = await mount();
+      await el.send("first");
+      expect(el.diagnostics().reply).toEqual({ state: "ok" });
+      await el.send("second");
+      expect(el.diagnostics().reply).toEqual({ state: "ok" });
+      document.body.innerHTML = "";
+    }
+    backend({ chat: () => refused(429, "RATE_LIMITED") });
+    const fresh = await mount();
+    await fresh.el.send("first");
+    expect(fresh.el.diagnostics()).toMatchObject({ session: { state: "ok" }, reply: { state: "idle" } });
+  });
+
+  it("keeps the visitor's answer as the reply result when a hidden page-action turn comes back empty", async () => {
+    const call = "On it.\n\n```dewee-action\n" + JSON.stringify({ id: "c1", name: "orders.status", args: {} }) + "\n```";
+    const counts = backend({ chat: (_p, n) => answer(n === 1 ? call : "") });
+    const { el } = await mount();
+    el.registerActions([{ name: "orders.status", description: "Look up", sensitivity: "read", handler: () => ({ status: "paid" }) }]);
+    await el.send("status?");
+    expect(counts.chat).toBe(2);
+    expect(el.diagnostics().reply).toEqual({ state: "ok" });
+  });
+
+  it("forgets the session and reply results when the visitor changes", async () => {
+    backend();
+    const { el, status } = await mount();
+    await el.send("test");
+    expect(el.diagnostics()).toMatchObject({ session: { state: "ok" }, reply: { state: "ok" } });
+    await el.renewSession();
+    expect(el.diagnostics()).toMatchObject({ config: { state: "ok" }, session: { state: "idle" }, reply: { state: "idle" } });
+    expect(status.at(-1)).toEqual(el.diagnostics());
+  });
+
+  it("refuses a code shaped like a key or a token and reports the HTTP status instead", async () => {
+    // Built here so no scanner mistakes a fixture for a real credential.
+    const keyShaped = ["key", "test", "A1b2".repeat(6)].join("_");
+    const tokenShaped = "Zm9v".repeat(9);
+    for (const code of [keyShaped, tokenShaped, "a.b.c", "key:value", "x".repeat(41)]) {
+      backend({ config: () => json({ error: { code, message: "x" } }, 500) });
+      expect((await mount()).el.diagnostics().config).toEqual({ state: "failed", code: "http_500" });
+      document.body.innerHTML = "";
+    }
+  });
+
+  it("keeps the retry panel, and keyboard focus, while a retry is in flight and after it fails again", async () => {
+    let release!: (r: Response) => void;
+    backend({ config: (_p, n) => (n === 1 ? refused(503, "upstream_unavailable") : new Promise<Response>((r) => (release = r))) });
+    const { el } = await mount();
+    const panel = el.shadowRoot!.querySelector(".unavailable")!;
+    const button = retryButton(el)!;
+    button.focus();
+    button.click();
+    await settle();
+    expect(el.shadowRoot!.querySelector(".unavailable")).toBe(panel); // same node: announced once
+    expect(panel.getAttribute("aria-busy")).toBe("true");
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.disabled).toBe(false);
+    expect(button.textContent).toBe("Connecting…");
+    expect(el.shadowRoot!.querySelector(".welcome")).toBeNull();
+    button.click(); // ignored while busy
+    release(refused(503, "upstream_unavailable"));
+    await settle();
+    await settle();
+    expect(el.shadowRoot!.querySelector(".unavailable")).toBe(panel);
+    expect(panel.getAttribute("aria-busy")).toBe("false");
+    expect(button.textContent).toBe("Try again");
+    expect(el.shadowRoot!.activeElement).toBe(button);
+  });
+
+  it("says why nothing was sent while the config is unavailable", async () => {
+    backend({ config: () => refused(503, "upstream_unavailable") });
+    const { el } = await mount();
+    await el.send("Is anyone there?");
+    expect(el.shadowRoot!.textContent).toContain("Chat is unavailable");
+    expect(await el.checkConnection()).toMatchObject({ config: { state: "failed" } });
+  });
+
   it("keeps tokens, server messages, URLs and conversation text out of every diagnostic event", async () => {
     backend({ chat: (_p, n) => (n === 1 ? answer("Your order ord_1001a ships tomorrow.") : refused(500, "upstream_unavailable")) });
     const { el, status, ready } = await mount();

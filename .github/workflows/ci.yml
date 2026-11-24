@@ -57,4 +57,16 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -C packages/dewee-webchat exec vitest run test/php-parity.test.ts test/php-ccp-transport.test.ts test/php-identity-*.test.ts test/php-image-proxy.test.ts
+      # Every PHP suite, found by one pattern; a pattern that matches nothing fails the job instead of
+      # passing with fewer suites.
+      - name: PHP suites
+        working-directory: packages/dewee-webchat
+        run: |
+          shopt -s nullglob
+          suites=(test/php-*.test.ts)
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "::error::no PHP suite matches test/php-*.test.ts"
+            exit 1
+          fi
+          echo "Running ${#suites[@]} PHP suites: ${suites[*]}"
+          pnpm exec vitest run "${suites[@]}"

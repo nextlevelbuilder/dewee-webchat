@@ -247,7 +247,8 @@ export interface DeweeHandlerOptions {
   /** Max duration of one agent run. */
   timeoutMs?: number;
   /** Observe traffic (logging/analytics). Errors thrown here are ignored. */
-  onChat?: (info: { visitorId: string; agent: string; message: string; reply?: string; error?: string }) => void;
+  /** `check`: true for the one test message of the control plane's install check (never the nonce itself). */
+  onChat?: (info: { visitorId: string; agent: string; message: string; reply?: string; error?: string; check?: true }) => void;
   /**
    * Verified signed-in users through Dewee (needs the `@dewee/identity` package). Absent: every
    * visitor is anonymous, exactly as before. Cannot be combined with `allowClientCredentials`.
@@ -945,9 +946,9 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (limiter && !(await limiter(previous ? `visitor:${previous.v}` : ip, "session"))) return fail(req, 429, "Too many sessions, slow down", "rate_limited");
       return issueAnonymousSession(req, body, ip, previous);
     }
-    if (limiter && !(await limiter(ip, "session"))) return fail(req, 429, "Too many sessions, slow down", "rate_limited");
     const body: any = await req.json().catch(() => ({}));
     if (installCheckOf(body) === null) return fail(req, 400, "Invalid request", "bad_request");
+    if (limiter && !(await limiter(ip, "session"))) return fail(req, 429, "Too many sessions, slow down", "rate_limited");
     return issueAnonymousSession(req, body, ip);
   }
 
@@ -1145,7 +1146,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       } finally {
         connection?.close(); // idempotent; covers a turn that ended before the stream took the connection
         clearInterval(keepAlive);
-        try { o.onChat?.({ visitorId, agent, message, reply, error: errMsg }); } catch { /* observer errors are ignored */ }
+        try { o.onChat?.({ visitorId, agent, message, reply, error: errMsg, ...(check ? { check: true as const } : {}) }); } catch { /* observer errors are ignored */ }
         writer.close().catch(() => {});
       }
     })();
@@ -1296,7 +1297,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
         cleanup();
         if (!finished && abort.signal.aborted) errMsg ??= "cancelled";
         finished = true;
-        try { o.onChat?.({ visitorId, agent, message: turn.rawMessage, reply, error: errMsg }); } catch { /* observer errors are ignored */ }
+        try { o.onChat?.({ visitorId, agent, message: turn.rawMessage, reply, error: errMsg, ...(turn.check ? { check: true as const } : {}) }); } catch { /* observer errors are ignored */ }
         writer.close().catch(() => {});
       }
     })();

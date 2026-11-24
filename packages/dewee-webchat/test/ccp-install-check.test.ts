@@ -119,13 +119,16 @@ describe("ccp install check: /chat", () => {
     expect(ccp.routes("chat")).toHaveLength(0);
   });
 
-  it("never hands the nonce to onChat with the visitor's text", async () => {
-    const seen: unknown[] = [];
+  it("marks the test turn in onChat with check: true, never with the nonce", async () => {
+    const seen: Array<Record<string, unknown>> = [];
     const h = makeHandler({ onChat: (e) => seen.push(e) });
     const s = (await session(h)).json();
     await chat(h, s.token, { check: NONCE });
+    await chat(h, s.token);
     await new Promise((r) => setTimeout(r, 50));
-    expect(seen).toHaveLength(1);
+    expect(seen).toHaveLength(2);
+    expect(seen[0].check).toBe(true);
+    expect("check" in seen[1]).toBe(false);
     expect(JSON.stringify(seen)).not.toContain(NONCE);
   });
 });
@@ -177,5 +180,16 @@ describe("legacy gateway transport", () => {
     expect(body.check).toBeUndefined();
     const bad = await h(new Request(`${BASE}/session`, { method: "POST", body: JSON.stringify({ check: "x" }) }));
     expect(bad.status).toBe(400);
+  });
+
+  it("refuses a malformed nonce before rate limiting, as the PHP backend does", async () => {
+    vi.spyOn(console, "warn").mockImplementationOnce(() => {});
+    const limited: string[] = [];
+    const h = createDeweeHandler({ gatewayUrl: "https://gw.example.com", token: "gw-" + "token", secret: VISITOR_SECRET, agents: ["shop"], rateLimit: async (key, bucket) => { limited.push(`${bucket}:${key}`); return false; } });
+    const bad = await h(new Request(`${BASE}/session`, { method: "POST", body: JSON.stringify({ check: "x" }) }));
+    expect(bad.status).toBe(400);
+    expect(limited).toEqual([]);
+    const ok = await h(new Request(`${BASE}/session`, { method: "POST", body: JSON.stringify({ check: NONCE }) }));
+    expect(ok.status).toBe(429);
   });
 });

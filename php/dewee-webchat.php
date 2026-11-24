@@ -876,9 +876,7 @@ final class DeweeWebchat
                 $digest = self::b64url(hash_hmac('sha256', 'dewee-webchat:subject:' . $subject, $this->secret, true));
                 $hint = is_string($body['reuseHint'] ?? null) ? self::verifyVisitorToken($this->secret, $body['reuseHint'], true, 'reuse') : null;
                 $reuse = is_array($hint) && isset($hint['ids'], $hint['ida'], $hint['sub']) && $hint['v'] === $visitor && $hint['ida'] === $agent && hash_equals($hint['sub'], $digest) && $hint['exp'] - self::nowMs() > 120000;
-                $edge = $this->edgeFor($ctx, $visitor, $reuse ? self::sealedEdge($hint) : null, null, self::EDGE_RESEAL_MS, $check);
-                // Read now: the exchange below may replace the edge session.
-                $checked = ($edge['check'] ?? false) === true;
+                $edge = $this->edgeFor($ctx, $visitor, $reuse ? self::sealedEdge($hint) : null, null, self::EDGE_RESEAL_MS);
                 if ($reuse) {
                     $session = $hint['ids'];
                     $principal = 'reused';
@@ -890,6 +888,12 @@ final class DeweeWebchat
                     });
                     $session = $exchange['identity_session'] ?? null;
                     $principal = $exchange['principal_ref'] ?? null;
+                }
+                // Like the TS handler: the identity first, then the edge session refreshed with the install
+                // check nonce, so the ingress sees the nonce on the session the token will carry.
+                if ($check !== null) {
+                    $edge = $this->edgeFor($ctx, $visitor, $edge, null, self::EDGE_RESEAL_MS, $check);
+                    $checked = ($edge['check'] ?? false) === true;
                 }
             } else {
                 $agent = $this->identityAgent;
@@ -1304,7 +1308,7 @@ final class DeweeWebchat
         } finally {
             if (isset($this->o['onChat']) && is_callable($this->o['onChat'])) {
                 try {
-                    ($this->o['onChat'])(['visitorId' => $visitorId, 'agent' => $agent, 'message' => $message, 'reply' => $reply, 'error' => $errMsg]);
+                    ($this->o['onChat'])(['visitorId' => $visitorId, 'agent' => $agent, 'message' => $message, 'reply' => $reply, 'error' => $errMsg] + ($check !== null ? ['check' => true] : []));
                 } catch (Throwable) {
                     // observer errors are ignored
                 }
@@ -1575,7 +1579,7 @@ final class DeweeWebchat
             }
             if (isset($this->o['onChat']) && is_callable($this->o['onChat'])) {
                 try {
-                    ($this->o['onChat'])(['visitorId' => $visitorId, 'agent' => $agent !== '' ? $agent : $cfg['defaultAgent'], 'message' => $rawMessage, 'reply' => $reply, 'error' => $errMsg]);
+                    ($this->o['onChat'])(['visitorId' => $visitorId, 'agent' => $agent !== '' ? $agent : $cfg['defaultAgent'], 'message' => $rawMessage, 'reply' => $reply, 'error' => $errMsg] + ($check !== null ? ['check' => true] : []));
                 } catch (Throwable) {
                     // observer errors are ignored
                 }

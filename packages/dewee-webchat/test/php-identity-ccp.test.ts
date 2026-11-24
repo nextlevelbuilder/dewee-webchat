@@ -222,37 +222,43 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     expect((await verifyVisitorToken(secret, (await switched.json()).token))?.ids).not.toBe((await verifyVisitorToken(secret, first.token))?.ids);
   });
 
-  it("forwards an install check nonce for a signed-in user like the TS handler", async () => {
+  it("forwards an install check nonce for a signed-in user with the TS handler's upstream calls", async () => {
     // Built by concatenation: fixtures shaped like tokens are never literal.
     const nonce = "chk_" + "S1gn".repeat(6);
     const ts = createDeweeHandler({
       ccp: { chatUrl: ccp.url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET }, secret, rateLimit: false,
-      identity: { sdk: deweeIdentitySdk, appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, authenticate: async (req) => { const uid = /(?:^|;\s*)uid=([^;]+)/.exec(req.headers.get("cookie") ?? "")?.[1]; return uid ? { subject: uid } : null; } },
+      identity: { sdk: deweeIdentitySdk, appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, sessionTtlSeconds: 3600, authenticate: async (req) => { const uid = /(?:^|;\s*)uid=([^;]+)/.exec(req.headers.get("cookie") ?? "")?.[1]; return uid ? { subject: uid } : null; } },
     });
-    const both = async (body: unknown) => {
-      const init = { method: "POST", headers: { cookie: "uid=user-a" }, body: JSON.stringify(body) };
-      const p = await fetch(`${base}/session`, init);
-      const t = await ts(new Request("https://shop.example/api/dewee/session", init));
-      return { php: { status: p.status, body: await p.json() }, ts: { status: t.status, body: await t.json() } };
+    const init = (uid: string, body: unknown) => ({ method: "POST", headers: { cookie: `uid=${uid}` }, body: JSON.stringify(body) });
+    /** The ingress calls a request made, config reads aside; the signed assertion is time-dependent. */
+    const calls = async (send: () => Promise<Response>) => {
+      const from = ccp.seen.length;
+      const res = await send();
+      const body = await res.json();
+      const seen = ccp.seen.slice(from).filter((r) => r.route !== "config")
+        .map((r) => ({ route: r.route, session: typeof r.headers["x-dewee-webchat-session"] === "string", body: r.body?.assertion ? { ...r.body, assertion: "ASSERTION" } : r.body }));
+      return { status: res.status, body, seen };
     };
     ccp.state.checkNonce = nonce;
-    const accepted = await both({ check: nonce });
-    expect([accepted.php.status, accepted.php.body.verified, accepted.php.body.check]).toEqual([200, true, true]);
-    expect([accepted.ts.status, accepted.ts.body.verified, accepted.ts.body.check]).toEqual([200, true, true]);
-    expect(Object.keys(accepted.php.body).sort()).toEqual(Object.keys(accepted.ts.body).sort());
-    const checked = ccp.routes("session").filter((r) => r.body?.check !== undefined);
-    expect(checked.length).toBeGreaterThanOrEqual(2);
-    expect(checked.every((r) => r.body.check === nonce)).toBe(true);
-    expect(JSON.stringify(await verifyVisitorToken(secret, accepted.php.body.token))).not.toContain("check");
+    const php = await calls(() => fetch(`${base}/session`, init("check-user", { check: nonce })));
+    const tsr = await calls(() => ts(new Request("https://shop.example/api/dewee/session", init("check-user", { check: nonce }))));
+    expect([php.status, php.body.verified, php.body.check]).toEqual([200, true, true]);
+    expect([tsr.status, tsr.body.verified, tsr.body.check]).toEqual([200, true, true]);
+    expect(Object.keys(php.body).sort()).toEqual(Object.keys(tsr.body).sort());
+    expect(php.seen.map((c) => c.route)).toEqual(["session", "identity/exchange", "session"]);
+    expect(php.seen).toEqual(tsr.seen);
+    expect(php.seen[2]).toEqual({ route: "session", session: true, body: { check: nonce } });
+    expect(JSON.stringify(await verifyVisitorToken(secret, php.body.token))).not.toContain("check");
 
-    // A nonce CCP does not accept is never confirmed; a malformed one is the same 400 on both.
+    // A nonce CCP does not accept is never confirmed; a malformed one is the same 400 on both, without a call.
     ccp.state.checkNonce = undefined;
-    const ignored = await both({ check: nonce });
-    expect([ignored.php.body.check, ignored.ts.body.check]).toEqual([undefined, undefined]);
-    const sessions = ccp.routes("session").length;
-    const malformed = await both({ check: "nope" });
-    expect([malformed.php.status, malformed.php.body]).toEqual([400, malformed.ts.body]);
-    expect(malformed.ts.status).toBe(400);
-    expect(ccp.routes("session")).toHaveLength(sessions);
+    const phpIgnored = await calls(() => fetch(`${base}/session`, init("other-user", { check: nonce })));
+    const tsIgnored = await calls(() => ts(new Request("https://shop.example/api/dewee/session", init("other-user", { check: nonce }))));
+    expect([phpIgnored.body.check, tsIgnored.body.check]).toEqual([undefined, undefined]);
+    expect(phpIgnored.seen).toEqual(tsIgnored.seen);
+    const phpBad = await calls(() => fetch(`${base}/session`, init("check-user", { check: "nope" })));
+    const tsBad = await calls(() => ts(new Request("https://shop.example/api/dewee/session", init("check-user", { check: "nope" }))));
+    expect([phpBad.status, phpBad.body, phpBad.seen]).toEqual([400, tsBad.body, []]);
+    expect([tsBad.status, tsBad.seen]).toEqual([400, []]);
   });
 });

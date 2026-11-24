@@ -75,7 +75,7 @@ describe.skipIf(!hasPhp)("PHP ccp transport", () => {
     mkdirSync(join(dir, "tmp"));
     writeFileSync(
       join(dir, "router.php"),
-      `<?php\nrequire ${JSON.stringify(phpFile)};\n$f = basename((string) ($_SERVER['HTTP_X_TEST_OPTIONS'] ?? ''));\n$o = preg_match('/^options-\\d+\\.json$/', $f) ? json_decode((string) file_get_contents(__DIR__ . '/' . $f), true) : null;\nif (!is_array($o)) { http_response_code(599); exit; }\nDeweeWebchat::handle($o);\n`,
+      `<?php\nrequire ${JSON.stringify(phpFile)};\n$f = basename((string) ($_SERVER['HTTP_X_TEST_OPTIONS'] ?? ''));\n$o = preg_match('/^options-\\d+\\.json$/', $f) ? json_decode((string) file_get_contents(__DIR__ . '/' . $f), true) : null;\nif (!is_array($o)) { http_response_code(599); exit; }\nif (($_SERVER['HTTP_X_TEST_ONCHAT'] ?? '') !== '') $o['onChat'] = static function (array $e): void { file_put_contents(__DIR__ . '/onchat.jsonl', json_encode($e) . PHP_EOL, FILE_APPEND); };\nDeweeWebchat::handle($o);\n`,
     );
     setOptions();
     const port = await freePort();
@@ -735,6 +735,18 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env]);`,
         expect([JSON.stringify(check), phpChat.status, phpChat.json()]).toEqual([JSON.stringify(check), 400, JSON.parse(tsChat.text)]);
       }
       expect(ccp.seen).toHaveLength(0);
+    });
+
+    it("marks the test turn in onChat with check: true like the TS handler, never with the nonce", async () => {
+      const file = join(dir, "onchat.jsonl");
+      rmSync(file, { force: true });
+      const s = await session();
+      const send = (body: Record<string, unknown>) => call("/chat", { method: "POST", headers: { authorization: `Bearer ${s.token}`, "content-type": "application/json", "x-test-onchat": "1" }, body: JSON.stringify({ message: "hi", conversationId: "conv_php_0001", agent: "shop", ...body }) });
+      expect((await send({ check: NONCE })).status).toBe(200);
+      expect((await send({})).status).toBe(200);
+      const seen = readFileSync(file, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
+      expect(seen.map((e) => e.check)).toEqual([true, undefined]);
+      expect(JSON.stringify(seen)).not.toContain(NONCE);
     });
 
     it("forwards check last in the chat body; without it the ingress gets the same bytes as from the TS handler", async () => {

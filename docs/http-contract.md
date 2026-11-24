@@ -447,6 +447,179 @@ person with its tool) or ends `cancelled` makes the widget read the history and 
 widget does not understand the `202` held answer. Pin at least that version, or keep the option off
 until the pages that embed the widget use it.
 
+## Business requests / callback
+
+A visitor can leave a business request, such as "call me back", that the control plane stores as its
+own record with a code (`WR-` plus 8 characters). The record is separate from the conversation and from
+any human takeover: ending a takeover, staff going off duty, or starting a new conversation never changes
+it. One conversation can hold several independent requests.
+
+**Requirements:**
+
+- Widget and backend **0.5.0-beta.7** or later.
+- Transport `ccp`.
+- A control plane with work requests enabled for the integration.
+
+**Opting in.** The backend opts in with `workRequests: true`. In TypeScript that is a handler option or
+`DEWEE_WEBCHAT_WORK_REQUESTS=true`; in PHP it is the option `workRequests` or the same variable.
+
+- A non-boolean value is refused at startup.
+- The option is refused with the legacy gateway transport.
+
+**Without the option**, the backend:
+
+- never sends CCP the `work-requests` token;
+- has no `workRequests` in `/config`;
+- answers `404 not_found` on both routes below.
+
+The widget then shows no entry and makes no request and no timer.
+
+With the option on, the backend adds `work-requests` to `X-Dewee-Webchat-Features` on the config,
+create and list calls. The token comes after `human-handoff` and `credential-requests`. The TypeScript
+and PHP backends answer identically.
+
+### Config
+
+`GET {base}/config` adds the kinds the integration offers, when it offers any:
+
+```json
+{ "workRequests": [
+  { "kind": "callback", "title": "Call me back", "schema": "callback", "staffedNow": false },
+  { "kind": "quote", "title": "Ask for a quote", "schema": "generic", "staffedNow": true }
+] }
+```
+
+- `schema` is `callback` (the widget has a form for it) or `generic` (receipts only). Other schemas
+  are dropped.
+- `staffedNow` only affects wording. The widget mentions that nobody is available, and it never
+  blocks the request.
+
+### `POST {base}/work-requests`
+
+Sends one request the visitor confirmed. It needs a visitor bearer. The body is at most 20 KiB.
+
+```json
+{
+  "kind": "callback",
+  "summary": "Please call me about my order",
+  "payload": { "contact_method": "phone", "contact_value": "<number>", "purpose": "Please call me about my order", "consent": true },
+  "idempotencyKey": "wr-…",
+  "conversationId": "optional, one of the visitor's own",
+  "agent": "optional"
+}
+```
+
+**Validation before CCP.** The backend checks these fields itself. Unknown fields are refused.
+
+| Field | Rule |
+|---|---|
+| `kind` | Matches `^[a-z][a-z0-9_-]{0,63}$`. |
+| `idempotencyKey` | Matches `^[A-Za-z0-9._:-]{8,128}$`. |
+| `summary` | 1 to 500 characters after trimming. More than 500 is `413 too_long`. |
+| `payload` | A JSON object of at most 16 KiB encoded. More is `413 too_long`. |
+| Summary and payload | A workspace member code is `400 bad_request`. |
+
+The control plane checks the payload against the kind's schema. A `callback` payload is
+`{contact_method: "phone" | "zalo" | "email", contact_value, purpose (≤ 500), consent: true, preferred_time? (≤ 100)}`:
+
+- A phone or Zalo number has 6 to 15 digits and at most 32 characters.
+- An email address is plain and has a dot in its domain.
+
+**Answers:**
+
+- `201 {"workRequest": view, "replayed": false}` for a new request.
+- `200` with `"replayed": true` for a retry with the same key and content, which returns the stored
+  request.
+
+**Definite refusals.** Nothing was stored, and the browser may correct the request and send it again.
+
+| Answer | Meaning |
+|---|---|
+| `400 bad_request` | The request failed validation. |
+| `401 unauthorized` | The visitor session is missing or expired. The widget renews it and resends with the same key. |
+| `403 work_requests_unavailable` | The kind is not offered, or the integration cannot take requests. |
+| `404 not_found` | The conversation is not the visitor's. The widget resends without it, with the same key. |
+| `409 idempotency_conflict` | The key already holds a request with other content. |
+| `413 too_long` | The summary or payload is too long. |
+| `429 rate_limited` | The backend's own limit, or CCP's. CCP allows 60 new requests an hour per integration. |
+
+**Unknown outcome.** Any other failure means the request may have been stored: a network failure, a
+timeout, a CCP 5xx (including `ingress_unavailable`), or an answer that could not be read. The backend
+then answers:
+
+```json
+503 { "error": { "code": "work_request_outcome_unknown", "message": "The request may have been received. Check before sending it again." } }
+```
+
+The answer carries `Retry-After`, using CCP's value or 5 seconds.
+
+- The browser must list by the key before sending again.
+- A resend must use the same key and the same body.
+
+The summary, payload and contact value are never logged. The backend logs only the error code.
+
+### `POST {base}/work-requests/list`
+
+Returns the visitor's own requests, newest first. It needs a visitor bearer.
+
+- **Body:** `{conversationId?, idempotencyKey?, limit? (1..100), agent?}`.
+- **Answer:** `{"workRequests": [view, …]}`.
+- `idempotencyKey` finds the request that key created, if any.
+- A conversation filter never answers 404.
+- Another visitor's requests are never listed.
+
+### The view
+
+```json
+{
+  "code": "WR-7K3M9P2Q", "kind": "callback", "summary": "Please call me about my order",
+  "state": "received", "receivedAt": "2026-11-25T05:30:00Z",
+  "respondDueAt": "2026-11-25T09:30:00Z", "dueTimezone": "Asia/Ho_Chi_Minh",
+  "publicNote": "", "contactHint": "***678", "updatedAt": "2026-11-25T05:30:00Z"
+}
+```
+
+`state` is one of:
+
+| `state` | Final |
+|---|---|
+| `received` | No |
+| `in_progress` | No |
+| `waiting` | No |
+| `resolved` | Yes |
+| `cancelled` | Yes |
+
+The widget never words a state that is not final as done.
+
+The backends rebuild the view from these fields only. It never carries:
+
+- the assignee;
+- an internal note;
+- the payload;
+- the raw contact value. `contactHint` is `***` plus its last three characters.
+
+**Widget behaviour:**
+
+- **Entry.** The widget shows **Request a callback** / **Nhờ gọi lại** only when a `callback` kind is
+  offered. When `staffedNow` is false, or a request for a person found nobody on duty, it adds an
+  off-hours hint next to the entry.
+- **Keys.** Each confirmed intent gets one crypto-random key. The key is kept in `sessionStorage` as
+  `dewee-webchat:wr-draft:{endpoint}|{kind}` = `{key, at}`, with no contact data. The same key is
+  reused by:
+  - a double click;
+  - a second widget on the page;
+  - a retry;
+  - a reload during a send.
+
+  A recorded request, or a definite refusal followed by an edit, starts a new key.
+- **Receipts.** The widget lists receipts:
+  - for a visitor who already holds a session;
+  - on load;
+  - on open or focus, at most every 10 s;
+  - after a create, at 30 s and then twice as late each time, up to 5 min, for 30 min.
+
+  It never polls without the feature. The `dewee:work-request` event carries `{code, state, kind}` only.
+
 ## Install check
 
 The control plane's "Check on my website" opens the site with `?dewee_check=<nonce>` in the page URL,

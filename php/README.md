@@ -51,6 +51,30 @@ lets visitors ask for a person when the integration allows it, exactly like the 
 at startup, and so is the option with the legacy gateway transport. Without it the backend behaves as
 before. Turn it on only with widget 0.5.0-beta.7 or later on the pages that embed it. See the [HTTP contract](../docs/http-contract.md#talking-to-a-person-human-takeover).
 
+## Business requests / callback
+
+This feature is off by default. It needs widget and backend **0.5.0-beta.7** or later, and a
+control plane with work requests enabled for the integration.
+
+**Turning it on.** With CCP, set `$options['workRequests'] = true;` or
+`DEWEE_WEBCHAT_WORK_REQUESTS=true`. The backend then behaves exactly like the TypeScript handler:
+
+- `/config` lists the kinds the integration offers.
+- `POST work-requests` sends a request the visitor confirmed. The visitor's idempotency key is passed
+  through unchanged.
+- `POST work-requests/list` returns the visitor's own receipts.
+
+**Refusals.** A definite refusal keeps its typed code. An outcome that cannot be known (network,
+timeout, CCP 5xx) is `503 work_request_outcome_unknown` with `Retry-After`, so the widget checks by
+key before it sends again.
+
+**Privacy.** The summary, payload and contact value are never logged.
+
+**Startup checks.** A non-boolean option is refused at startup, and so is the option with the legacy
+gateway transport. Without the option, both routes are `404` and nothing is advertised.
+
+See the [HTTP contract](../docs/http-contract.md#business-requests--callback).
+
 ## Install check
 
 Nothing to configure. When the control plane checks the install (`?dewee_check=<nonce>` on the page),
@@ -89,6 +113,7 @@ CCP and copy its values (agents, allowed sites and limits are set there):
 | `DEWEE_WEBCHAT_SECRET` | HMAC secret for visitor tokens (at least 32 random bytes; required with either transport) |
 | `DEWEE_WEBCHAT_TRANSPORT` | Optional `ccp` or `legacy-gateway`; otherwise the variables set decide |
 | `DEWEE_WEBCHAT_HUMAN_HANDOFF` | Optional, `ccp` only: `true` lets visitors ask for a person; anything else leaves it off |
+| `DEWEE_WEBCHAT_WORK_REQUESTS` | Optional, `ccp` only: `true` lets visitors send business requests such as a callback; anything else leaves it off |
 | `DEWEE_ALLOWED_ORIGINS` (csv or `*`) | Optional |
 | `DEWEE_IMAGE_SOURCES` | Comma-separated trusted HTTPS directory prefixes for the image proxy; disabled when unset |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Require Cloudflare Turnstile for new sessions |

@@ -61,6 +61,7 @@ first three values below.
 | `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | Optional Cloudflare Turnstile check for new visitors (with `ccp`, a returning visitor's hourly refresh is not challenged) |
 | `DEWEE_WEBCHAT_TRANSPORT` | Optional: `ccp` or `legacy-gateway`. Without it, the variables that are set decide (gateway variables alone select `legacy-gateway`, with a deprecation warning); set it to pin the transport explicitly. |
 | `DEWEE_WEBCHAT_HUMAN_HANDOFF` | Optional, `ccp` only: `true` lets visitors ask for a person (see [Talking to a person](#talking-to-a-person)). Any other value leaves it off. |
+| `DEWEE_WEBCHAT_WORK_REQUESTS` | Optional, `ccp` only: `true` lets visitors send business requests such as a callback (see [Business requests / callback](#business-requests--callback)). Any other value leaves it off. |
 
 The same values as options: `createDeweeHandler({ transport: "ccp", ccp: { chatUrl, integrationId, integrationSecret }, secret })`.
 With `ccp`, the agents come from the integration: `/config` lists them, the widget's `agent` is
@@ -496,6 +497,47 @@ older widget does not understand the `202` answer to a held message). The `/conf
 integration's default agent.
 
 Routes and payloads: [HTTP contract](../../docs/http-contract.md#talking-to-a-person-human-takeover).
+
+## Business requests / callback
+
+This feature is off by default. It needs widget and backend **0.5.0-beta.7** or later, transport
+`ccp`, and a control plane with work requests enabled for the integration.
+
+**Turning it on.** Use `createDeweeHandler({ …, workRequests: true })`, or set
+`DEWEE_WEBCHAT_WORK_REQUESTS=true`. When the integration offers a `callback` kind, the widget then
+shows **Request a callback** / **Nhờ gọi lại** in the composer.
+
+**The form.** The visitor chooses phone, Zalo or email, enters the contact and what it is about, and
+ticks a consent that names the request. Skipping the form leaves the chat as it was: the form is
+never required.
+
+**What the visitor sees:**
+
+- **Sending**: the request is on its way.
+- **Unconfirmed**: the outcome is unknown. The widget checks by the request's key, then offers
+  **Check again** and **Send again**. Both reuse the same key, so the request is never stored twice.
+- **Failed**: the request was refused. The key is kept until the visitor changes the form.
+- **Recorded**: the widget shows the server's receipt: the code, the state (a dot and a word), when
+  the business will reply (in the visitor's local time), the public note, and a contact hint such as
+  `***678`.
+
+**Receipts.** Each request is its own receipt. They are read again on load, when the widget is
+opened or focused, and after a send. They are separate from the conversation and from **Talk to a
+person**, so a takeover ending or staff going off duty never changes them. `generic` kinds appear as
+receipts too.
+
+**Privacy.** The contact value is never logged, stored in the browser, or put in an event. The
+`dewee:work-request` event carries `{code, state, kind}` only. The idempotency key lives in
+`sessionStorage`, without contact data.
+
+| Host | Supports |
+|---|---|
+| TypeScript handler, `ccp` | Yes, with `workRequests: true` |
+| PHP backend, `ccp` | Yes, with `$options['workRequests'] = true` or `DEWEE_WEBCHAT_WORK_REQUESTS=true` |
+| Either backend, `legacy-gateway` | No: the option is refused at startup |
+| Older versions of either backend | No: no entry, no feature header, no request |
+
+Routes and payloads: [HTTP contract](../../docs/http-contract.md#business-requests--callback).
 
 ## Signed-in users
 

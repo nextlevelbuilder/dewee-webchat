@@ -91,6 +91,10 @@ final class DeweeWebchat
     private const IDENTITY_SEAL_INFO = 'dewee-webchat:identity-session:aes-256-gcm:v1';
     private const MAX_EDGE_SESSION_LENGTH = 1024;
     private const CCP_CONFIG_TTL = 60;
+    /** Work request kinds (workspace slugs), idempotency keys and the body bound (16 KiB payload plus the rest). */
+    private const WORK_REQUEST_KIND_RE = '/^[a-z][a-z0-9_-]{0,63}$/D';
+    private const WORK_REQUEST_KEY_RE = '/^[A-Za-z0-9._:-]{8,128}$/D';
+    private const WORK_REQUEST_MAX_BODY_BYTES = 20 * 1024;
     /** An edge session this close to expiry (ms) is refreshed before use. */
     private const EDGE_MARGIN_MS = 30_000;
     /**
@@ -131,6 +135,8 @@ final class DeweeWebchat
     private ?string $credentialFormOrigin = null;
     /** Option `humanHandoff` (CCP only): visitors may ask for a person; advertised to CCP as `human-handoff`. */
     private bool $humanHandoff = false;
+    /** Option `workRequests` (CCP only): visitors may send the request kinds the integration offers; advertised as `work-requests`. */
+    private bool $workRequests = false;
 
     /**
      * Handles the current request and writes the response.
@@ -215,6 +221,7 @@ final class DeweeWebchat
                 : null,
             // Opt-in only: anything but "true" leaves human takeover off.
             'humanHandoff' => trim((string) $get('DEWEE_WEBCHAT_HUMAN_HANDOFF')) === 'true' ? true : null,
+            'workRequests' => trim((string) $get('DEWEE_WEBCHAT_WORK_REQUESTS')) === 'true' ? true : null,
         ];
         foreach ($overrides as $k => $v) {
             if ($v !== null) {
@@ -331,6 +338,11 @@ final class DeweeWebchat
             if (!is_bool($this->o['humanHandoff'])) throw new DeweeConfigError('[dewee-webchat] humanHandoff must be true or false');
             if ($this->o['humanHandoff'] && $this->ccp === null) throw new DeweeConfigError('[dewee-webchat] humanHandoff requires the ccp transport');
             $this->humanHandoff = $this->o['humanHandoff'];
+        }
+        if (isset($this->o['workRequests'])) {
+            if (!is_bool($this->o['workRequests'])) throw new DeweeConfigError('[dewee-webchat] workRequests must be true or false');
+            if ($this->o['workRequests'] && $this->ccp === null) throw new DeweeConfigError('[dewee-webchat] workRequests requires the ccp transport');
+            $this->workRequests = $this->o['workRequests'];
         }
     }
 
@@ -450,6 +462,8 @@ final class DeweeWebchat
                 $method === 'POST' && $action === 'job-access' && $this->identity !== null => $this->handleJobAccess(),
                 $method === 'POST' && in_array($action, ['credential-request', 'credential-request-handoff', 'credential-request-cancel'], true) => $this->handleCredentialRequest($action),
                 $method === 'POST' && $action === 'request-human' => $this->handleRequestHuman(),
+                $method === 'POST' && $action === 'work-requests' => $this->handleWorkRequestCreate(),
+                $method === 'POST' && $action === 'list' && ($segments[count($segments) - 2] ?? '') === 'work-requests' => $this->handleWorkRequestList(),
                 default => $this->fail(404, 'Not found', 'not_found'),
             };
         } catch (DeweeRateLimitUnavailable) {
@@ -1054,6 +1068,173 @@ final class DeweeWebchat
         } catch (DeweeCcpError $e) { $this->ccpFail($e, 'request-human'); }
     }
 
+    /**
+     * The visitor's claims and the decoded JSON object body of a work request route (option
+     * `workRequests` only), or null once a refusal was sent. Same order and limits as the TS handler:
+     * the `chat` bucket for creates (CCP allows 20 per 10 minutes, so same-key retries get through),
+     * `preauth` for lists. The body is kept as objects, so an empty payload stays `{}` upstream.
+     *
+     * @return array{0: array<string, mixed>, 1: stdClass}|null
+     */
+    private function workRequestCaller(string $bucket): ?array
+    {
+        if ($this->ccp === null || !$this->workRequests) { $this->fail(404, 'Not found', 'not_found'); return null; }
+        $claims = $this->claimsFromRequest();
+        if (!isset($claims['v'])) { $this->fail(401, 'Missing or expired visitor session', 'unauthorized'); return null; }
+        if (!empty($this->identity['required']) && !isset($claims['ids'])) { $this->identityFail('IDENTITY_REQUIRED'); return null; }
+        if (!$this->identityRebind($claims)) return null;
+        if (!$this->rateLimit(($bucket === 'chat' ? 'work-request:' : 'work-request-list:') . $claims['v'], $bucket)) { $this->fail(429, 'Too many requests, try again later', 'rate_limited'); return null; }
+        $raw = file_get_contents('php://input', false, null, 0, self::WORK_REQUEST_MAX_BODY_BYTES + 1);
+        if (!is_string($raw) || $raw === '') { $this->fail(400, 'Invalid request', 'bad_request'); return null; }
+        if (strlen($raw) > self::WORK_REQUEST_MAX_BODY_BYTES) { $this->fail(413, 'Request is too long', 'too_long'); return null; }
+        $body = json_decode($raw);
+        if (!$body instanceof stdClass) { $this->fail(400, 'Invalid request', 'bad_request'); return null; }
+        return [$claims, $body];
+    }
+
+    /**
+     * `POST {base}/work-requests`: one request the visitor confirmed (option `workRequests` only). The
+     * idempotency key goes to CCP unchanged. A definite refusal (a 4xx of CCP) is mapped as usual;
+     * anything else may have stored the request and is `503 work_request_outcome_unknown`: the widget
+     * lists by its key before it sends again. The summary, payload and contact data are never logged.
+     */
+    private function handleWorkRequestCreate(): void
+    {
+        $caller = $this->workRequestCaller('chat');
+        if ($caller === null) return;
+        [$claims, $body] = $caller;
+        $fields = get_object_vars($body);
+        $summary = is_string($fields['summary'] ?? null) ? self::jsTrim($fields['summary']) : '';
+        $payload = $fields['payload'] ?? null;
+        $conversation = $fields['conversationId'] ?? null;
+        if (array_diff(array_keys($fields), ['kind', 'summary', 'payload', 'idempotencyKey', 'conversationId', 'agent'])
+            || !is_string($fields['kind'] ?? null) || !preg_match(self::WORK_REQUEST_KIND_RE, $fields['kind'])
+            || !is_string($fields['idempotencyKey'] ?? null) || !preg_match(self::WORK_REQUEST_KEY_RE, $fields['idempotencyKey'])
+            || (array_key_exists('conversationId', $fields) && (!is_string($conversation) || !preg_match('/^[A-Za-z0-9_-]{8,64}$/D', $conversation)))
+            || $summary === '' || !$payload instanceof stdClass) {
+            $this->fail(400, 'Invalid request', 'bad_request'); return;
+        }
+        $encoded = (string) json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_LINE_TERMINATORS);
+        if ((int) preg_match_all('/./su', $summary) > 500 || strlen($encoded) > 16 * 1024) { $this->fail(413, 'Request is too long', 'too_long'); return; }
+        if (preg_match('/MEM-[A-Z2-7]{16}/i', $summary) || preg_match('/MEM-[A-Z2-7]{16}/i', $encoded)) { $this->fail(400, 'Invalid request', 'bad_request'); return; }
+        $agent = $this->workRequestAgent($claims, $fields['agent'] ?? null);
+        if ($agent === null) return;
+        $input = ['kind' => $fields['kind'], 'summary' => $summary, 'payload' => $payload, 'idempotency_key' => $fields['idempotencyKey']]
+            + (is_string($conversation) ? ['conversation_id' => $conversation] : [])
+            + ($agent !== '' ? ['agent' => $agent] : [])
+            + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
+        try {
+            $ctx = $this->visitorContext();
+            $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json('work-requests/create', $ctx + ['body' => $input, 'session' => $edge['token'], 'workRequests' => true]));
+            $view = self::parseWorkRequestView($data['work_request'] ?? null, true);
+            if ($view === null) throw new DeweeCcpError(200, 'ccp_bad_response', 'CCP work-requests/create: no valid work request');
+            $replayed = ($data['replayed'] ?? null) === true;
+            $this->json(['workRequest' => $view, 'replayed' => $replayed], $replayed ? 200 : 201);
+        } catch (Throwable $e) {
+            if ($e instanceof DeweeCcpError && $e->status >= 400 && $e->status < 500) { $this->ccpFail($e, 'work-requests/create'); return; }
+            // Network, timeout, 5xx, redirect, or an answer that could not be read: the request may be stored.
+            error_log('[dewee-webchat] ccp work-requests/create: outcome unknown (' . ($e instanceof DeweeCcpError ? $e->ccpCode : 'error') . ')');
+            header('Retry-After: ' . ($e instanceof DeweeCcpError && $e->retryAfterSeconds ? (int) ceil($e->retryAfterSeconds) : 5));
+            $this->fail(503, 'The request may have been received. Check before sending it again.', 'work_request_outcome_unknown');
+        }
+    }
+
+    /** `POST {base}/work-requests/list`: the visitor's own requests, newest first (with a key: that create's). */
+    private function handleWorkRequestList(): void
+    {
+        $caller = $this->workRequestCaller('preauth');
+        if ($caller === null) return;
+        [$claims, $body] = $caller;
+        $fields = get_object_vars($body);
+        $conversation = $fields['conversationId'] ?? null;
+        $key = $fields['idempotencyKey'] ?? null;
+        $limit = $fields['limit'] ?? null;
+        if (array_diff(array_keys($fields), ['conversationId', 'idempotencyKey', 'limit', 'agent'])
+            || (array_key_exists('conversationId', $fields) && (!is_string($conversation) || !preg_match('/^[A-Za-z0-9_-]{8,64}$/D', $conversation)))
+            || (array_key_exists('idempotencyKey', $fields) && (!is_string($key) || !preg_match(self::WORK_REQUEST_KEY_RE, $key)))
+            || (array_key_exists('limit', $fields) && (!is_int($limit) || $limit < 1 || $limit > 100))) {
+            $this->fail(400, 'Invalid request', 'bad_request'); return;
+        }
+        $agent = $this->workRequestAgent($claims, $fields['agent'] ?? null);
+        if ($agent === null) return;
+        $input = (is_string($conversation) ? ['conversation_id' => $conversation] : [])
+            + (is_string($key) ? ['idempotency_key' => $key] : [])
+            + (is_int($limit) ? ['limit' => $limit] : [])
+            + ($agent !== '' ? ['agent' => $agent] : [])
+            + (isset($claims['ids']) ? ['identity_session' => $claims['ids']] : []);
+        try {
+            $ctx = $this->visitorContext();
+            $data = $this->withEdge($ctx, $claims['v'], self::sealedEdge($claims), fn (array $edge) => $this->ccp->json('work-requests/list', $ctx + ['body' => $input, 'session' => $edge['token'], 'workRequests' => true]));
+            $raw = $data['work_requests'] ?? null;
+            if (!is_array($raw) || ($raw !== [] && !array_is_list($raw))) throw new DeweeCcpError(200, 'ccp_bad_response', 'CCP work-requests/list: no list');
+            $views = array_values(array_filter(array_map(static fn ($v) => self::parseWorkRequestView($v, true), array_slice($raw, 0, 100)), static fn ($v) => $v !== null));
+            $this->json(['workRequests' => $views]);
+        } catch (DeweeCcpError $e) { $this->ccpFail($e, 'work-requests/list'); }
+    }
+
+    /**
+     * The agent a work request names, as ccpAgentFor() in the TS handler: '' for the integration default,
+     * the bound agent for a signed-in visitor, null once a refusal was sent.
+     */
+    private function workRequestAgent(array $claims, mixed $requested): ?string
+    {
+        $asked = self::ccpAgentFor($requested);
+        if ($asked === null) { $this->fail(400, 'Invalid agent'); return null; }
+        if (isset($claims['ids'])) {
+            if ($asked !== '' && $asked !== $claims['ida']) { $this->fail(403, 'Agent not allowed', 'agent_not_allowed'); return null; }
+            return (string) $claims['ida'];
+        }
+        return $asked;
+    }
+
+    /**
+     * A work request view rebuilt from known fields (as work-request.ts does): null without a valid code
+     * and a known state; a field that is not a string within its bound is empty, never cut.
+     * `$snake`: the control plane's shape. Never the assignee, a note for staff, the payload or a contact.
+     *
+     * @return array<string, string>|null
+     */
+    public static function parseWorkRequestView(mixed $raw, bool $snake): ?array
+    {
+        if (!is_array($raw) || ($raw !== [] && array_is_list($raw))) return null;
+        $code = $raw['code'] ?? null;
+        $state = $raw['state'] ?? null;
+        if (!is_string($code) || !preg_match('/^WR-[0-9A-HJKMNP-TV-Z]{8}$/D', $code) || !in_array($state, ['received', 'in_progress', 'waiting', 'resolved', 'cancelled'], true)) return null;
+        $field = static fn (mixed $v, int $max): string => is_string($v) && self::utf16Length($v) <= $max ? $v : '';
+        $pick = static fn (string $camel, string $under): mixed => $raw[$snake ? $under : $camel] ?? null;
+        $kind = $field($raw['kind'] ?? null, 64);
+        return [
+            'code' => $code,
+            'kind' => preg_match(self::WORK_REQUEST_KIND_RE, $kind) ? $kind : '',
+            'summary' => $field($raw['summary'] ?? null, 2000),
+            'state' => $state,
+            'receivedAt' => $field($pick('receivedAt', 'received_at'), 64),
+            'respondDueAt' => $field($pick('respondDueAt', 'respond_due_at'), 64),
+            'dueTimezone' => $field($pick('dueTimezone', 'due_timezone'), 64),
+            'publicNote' => $field($pick('publicNote', 'public_note'), 2000),
+            'contactHint' => $field($pick('contactHint', 'contact_hint'), 16),
+            'updatedAt' => $field($pick('updatedAt', 'updated_at'), 64),
+        ];
+    }
+
+    /**
+     * Offered request kinds (as parseWorkRequestKinds() in work-request.ts): at most 50, each kind once,
+     * unknown schemas dropped.
+     *
+     * @return list<array{kind: string, title: string, schema: string, staffedNow: bool}>
+     */
+    public static function parseWorkRequestKinds(mixed $raw, bool $snake): array
+    {
+        $out = [];
+        foreach (is_array($raw) && array_is_list($raw) ? array_slice($raw, 0, 50) : [] as $k) {
+            if (!is_array($k) || !is_string($k['kind'] ?? null) || !preg_match(self::WORK_REQUEST_KIND_RE, $k['kind']) || in_array($k['kind'], array_column($out, 'kind'), true)) continue;
+            if (!in_array($k['schema'] ?? null, ['callback', 'generic'], true)) continue;
+            $title = is_string($k['title'] ?? null) && self::utf16Length($k['title']) <= 200 ? self::jsTrim($k['title']) : '';
+            $out[] = ['kind' => $k['kind'], 'title' => $title !== '' ? $title : $k['kind'], 'schema' => $k['schema'], 'staffedNow' => ($k[$snake ? 'staffed_now' : 'staffedNow'] ?? null) === true];
+        }
+        return $out;
+    }
+
     private function handleMemberLinkProof(): void
     {
         if ($this->ccp === null || $this->identity === null || $this->credentialFormOrigin === null) { $this->fail(404, 'Not found', 'not_found'); return; }
@@ -1410,6 +1591,7 @@ final class DeweeWebchat
             'credentialFormOrigin' => $this->credentialFormOrigin,
             'memberLinkProof' => $this->credentialFormOrigin !== null && ($cfg['memberLinkProof'] ?? false) ? true : null,
             'humanHandoff' => $this->humanHandoff && ($cfg['humanHandoff'] ?? false) === true ? true : null,
+            'workRequests' => $this->workRequests && !empty($cfg['workRequests']) ? $cfg['workRequests'] : null,
             'version' => self::VERSION,
         ]));
     }
@@ -1773,7 +1955,8 @@ final class DeweeWebchat
     private function ccpConfig(): array
     {
         static $memo = [];
-        $key = substr(hash('sha256', $this->ccp->base), 0, 16);
+        // The answer depends on the features this host advertises (work request kinds), so they are part of the key.
+        $key = substr(hash('sha256', $this->ccp->base . ($this->workRequests ? "\nwork-requests" : '')), 0, 16);
         if (isset($memo[$key])) {
             return $memo[$key];
         }
@@ -1788,7 +1971,7 @@ final class DeweeWebchat
                 }
             }
         }
-        $cfg = self::parseCcpConfig($this->ccp->json('config', $this->visitorContext()));
+        $cfg = self::parseCcpConfig($this->ccp->json('config', $this->visitorContext() + ['workRequests' => $this->workRequests]));
         if ($file !== null) {
             $tmp = $file . '.' . bin2hex(random_bytes(4));
             if (@file_put_contents($tmp, json_encode($cfg, self::JSON_FLAGS), LOCK_EX) !== false) {
@@ -1883,6 +2066,8 @@ final class DeweeWebchat
             'pageContextVersions' => in_array(1, is_array($data['page_context']['versions'] ?? null) ? $data['page_context']['versions'] : [], true) ? [1] : [],
             // A visitor of the default agent can ask for a person (the host must also advertise it).
             'humanHandoff' => ($data['human_handoff'] ?? null) === true,
+            // Listed by CCP only to a host that advertises work-requests.
+            'workRequests' => self::parseWorkRequestKinds($data['work_requests'] ?? null, true),
         ];
     }
 
@@ -2081,6 +2266,10 @@ final class DeweeWebchat
         switch ($e->ccpCode) {
             case 'credential_requests_unavailable':
                 return ['status' => 403, 'code' => $e->ccpCode, 'message' => 'Credential requests are unavailable'];
+            case 'work_requests_unavailable':
+                return ['status' => 403, 'code' => $e->ccpCode, 'message' => 'This request cannot be sent here'];
+            case 'idempotency_conflict':
+                return ['status' => 409, 'code' => $e->ccpCode, 'message' => 'This request was already sent with other details'];
             case 'credential_request_not_found':
                 return ['status' => 404, 'code' => $e->ccpCode, 'message' => 'Credential request not found'];
             case 'credential_request_not_ready':
@@ -3089,7 +3278,7 @@ final class DeweeWebchat
  */
 final class DeweeCcpClient
 {
-    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'identity/member-link-proof', 'link', 'job-access', 'credential-request', 'credential-request-handoff', 'credential-request-cancel', 'request-human'];
+    public const ROUTES = ['config', 'session', 'chat', 'history', 'abort', 'identity/exchange', 'identity/revoke', 'identity/member-link-proof', 'link', 'job-access', 'credential-request', 'credential-request-handoff', 'credential-request-cancel', 'request-human', 'work-requests/create', 'work-requests/list'];
     private const INTEGRATION_ID_RE = '/^wci_[a-z2-7]{26}$/';
     private const SECRET_RE = '/^dwc_[A-Za-z0-9_-]{16,256}$/';
     private const INGRESS_PATH_RE = '#/api/public/webchat/v1/(wci_[a-z2-7]{26})$#';
@@ -3177,7 +3366,7 @@ final class DeweeCcpClient
             'User-Agent: dewee-webchat-php/' . DeweeWebchat::VERSION,
             'Connection: close',
         ];
-        $features = self::featuresHeader(($req['humanHandoff'] ?? false) === true, ($req['credentialRequests'] ?? false) === true);
+        $features = self::featuresHeader(($req['humanHandoff'] ?? false) === true, ($req['credentialRequests'] ?? false) === true, ($req['workRequests'] ?? false) === true);
         if ($features !== null) $headers[] = 'X-Dewee-Webchat-Features: ' . $features;
         $body = null;
         if (isset($req['body'])) {
@@ -3228,9 +3417,9 @@ final class DeweeCcpClient
     }
 
     /** `X-Dewee-Webchat-Features` for the capabilities a request advertises, or null for none (same as the TS client). */
-    public static function featuresHeader(bool $humanHandoff, bool $credentialRequests): ?string
+    public static function featuresHeader(bool $humanHandoff, bool $credentialRequests, bool $workRequests = false): ?string
     {
-        $tokens = array_values(array_filter([$humanHandoff ? 'human-handoff' : '', $credentialRequests ? 'credential-requests' : ''], static fn (string $t) => $t !== ''));
+        $tokens = array_values(array_filter([$humanHandoff ? 'human-handoff' : '', $credentialRequests ? 'credential-requests' : '', $workRequests ? 'work-requests' : ''], static fn (string $t) => $t !== ''));
         return $tokens ? implode(', ', $tokens) : null;
     }
 

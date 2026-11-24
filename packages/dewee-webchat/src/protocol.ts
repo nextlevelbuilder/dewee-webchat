@@ -1,5 +1,8 @@
 // Wire contract shared by the browser widget and every backend (Node/Workers/PHP).
 // Keep in sync with php/dewee-webchat.php and docs/http-contract.md.
+import type { WorkRequestKind } from "./work-request";
+
+export type { CallbackContactMethod, CallbackPayload, WorkRequestCreateBody, WorkRequestCreateResponse, WorkRequestKind, WorkRequestListBody, WorkRequestListResponse, WorkRequestState, WorkRequestView } from "./work-request";
 
 /** Server-Sent Events emitted by `POST {basePath}/chat`. */
 export type ChatStreamEvent =
@@ -91,6 +94,12 @@ export interface PublicConfig {
    * integration allows it. The widget shows its "talk to a person" button only then.
    */
   humanHandoff?: boolean;
+  /**
+   * Request kinds a visitor may create (a callback, a quote…), present only when the backend opted in
+   * (`workRequests`) and the integration offers at least one. Absent: the widget shows no request form
+   * and reads no receipts.
+   */
+  workRequests?: WorkRequestKind[];
 }
 
 /**

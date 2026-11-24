@@ -3,7 +3,8 @@ const utf8 = new TextEncoder();
 const encode = (data: Uint8Array) => btoa(String.fromCharCode(...data)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const decode = (data: string) => Uint8Array.from(atob(data.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((data.length + 3) % 4)), (c) => c.charCodeAt(0));
 
-export async function readImageTicketBody(request: Request): Promise<string | null> {
+/** The request body as text, or null when there is none or it exceeds `maxBytes`. */
+export async function readImageTicketBody(request: Request, maxBytes = 8192): Promise<string | null> {
   if (!request.body) return null;
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -13,7 +14,7 @@ export async function readImageTicketBody(request: Request): Promise<string | nu
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > 8192) { await reader.cancel(); return null; }
+      if (size > maxBytes) { await reader.cancel(); return null; }
       chunks.push(value);
     }
   } finally { reader.releaseLock(); }

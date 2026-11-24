@@ -97,6 +97,15 @@ button { font: inherit; color: inherit; background: none; border: 0; cursor: poi
 .title { font-weight: 650; font-size: 15px; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .subtitle { font-size: 12px; color: var(--dw-muted); display: flex; align-items: center; gap: 6px; margin-top: 2px; }
 .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #22c58b; box-shadow: 0 0 0 3px color-mix(in srgb, #22c58b 22%, transparent); }
+:host([data-connection="connecting"]) .dot { background: var(--dw-muted); box-shadow: none; }
+:host([data-connection="unavailable"]) .dot { background: #c2334f; box-shadow: 0 0 0 3px color-mix(in srgb, #c2334f 22%, transparent); }
+.unavailable { margin: auto 0; padding: 24px 8px; text-align: center; }
+.unavailable h2 { margin: 0 0 6px; font-size: 16px; font-weight: 650; }
+.unavailable p { margin: 0 0 16px; font-size: 13.5px; color: var(--dw-muted); }
+.unavailable .retry { font: inherit; font-size: 13.5px; font-weight: 600; padding: 8px 16px; border-radius: 999px; border: 0; cursor: pointer; color: #fff; background: var(--dw-accent); }
+.unavailable .retry:hover { filter: brightness(1.06); }
+.unavailable .retry:focus-visible { outline: 2px solid var(--dw-accent); outline-offset: 2px; }
+.unavailable .retry:disabled { opacity: .6; cursor: default; }
 .agent-select {
   font: inherit; font-size: 12px; color: var(--dw-muted); background: transparent; border: 0;
   padding: 0 14px 0 0; margin: 0; max-width: 170px; cursor: pointer; appearance: none; field-sizing: content; text-overflow: ellipsis;

@@ -19,6 +19,12 @@ export interface Strings {
   args: string;
   result: string;
   online: string;
+  /** Header status while the backend config is loading, and the retry button while it retries. */
+  connecting: string;
+  /** Header status and panel title when the backend config could not be loaded. */
+  unavailable: string;
+  unavailableBody: string;
+  retry: string;
   poweredBy: string;
   errorGeneric: string;
   stopped: string;
@@ -82,6 +88,10 @@ const en: Strings = {
   args: "Arguments",
   result: "Result",
   online: "Online",
+  connecting: "Connecting…",
+  unavailable: "Chat is unavailable",
+  unavailableBody: "We could not connect right now. Please try again in a moment.",
+  retry: "Try again",
   poweredBy: "Powered by",
   errorGeneric: "Something went wrong. Please try again.",
   stopped: "Stopped.",
@@ -156,6 +166,10 @@ const vi: Strings = {
   args: "Tham số",
   result: "Kết quả",
   online: "Đang trực tuyến",
+  connecting: "Đang kết nối…",
+  unavailable: "Tạm thời gián đoạn",
+  unavailableBody: "Hiện chưa kết nối được. Bạn thử lại sau ít phút nhé.",
+  retry: "Thử lại",
   poweredBy: "Vận hành bởi",
   errorGeneric: "Có lỗi xảy ra. Bạn thử lại giúp mình nhé.",
   stopped: "Đã dừng.",

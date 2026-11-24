@@ -10,6 +10,7 @@ export type { ActionResult, ActionResultStatus } from "./actions/directives";
 export { DOM_ACTION_NAMES, type DomActionsRoot } from "./actions/dom-actions";
 export type { JsonSchema } from "./actions/json-schema-subset";
 export type { ActionEventDetail, ActionCallView } from "./widget/element";
+export type { CheckResult, CheckState, CheckStep, WidgetDiagnostics } from "./widget/diagnostics";
 
 /** Registers the `<dewee-chat>` custom element (idempotent, SSR-safe). */
 export function defineDeweeChat(tag = "dewee-chat"): void {

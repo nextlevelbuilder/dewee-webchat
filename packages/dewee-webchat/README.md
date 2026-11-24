@@ -179,9 +179,41 @@ Attributes use kebab-case (`show-reasoning="false"`), `data-*` on the script tag
 
 Methods: `open()`, `close()`, `toggle()`, `send(text)`, `stop()`, `newConversation()`, `configure(partial)`,
 `registerActions(actions)`, `unregisterAction(name)`, and for [signed-in users](#signed-in-users)
-`renewSession()` and `startLink()`.
-Events: `dewee:ready`, `dewee:open`, `dewee:close`, `dewee:send`, `dewee:reply`, `dewee:error`, `dewee:action`, `dewee:link`.
+`renewSession()` and `startLink()`. For [install checks](#lifecycle-and-diagnostics): `diagnostics()`,
+`checkConnection()`, `retry()`.
+Events: `dewee:ready`, `dewee:status`, `dewee:open`, `dewee:close`, `dewee:send`, `dewee:reply`, `dewee:error`, `dewee:action`, `dewee:link`.
 CSS variables: `--dw-accent`, `--dw-font`, `--dw-radius`, `--dw-width`, `--dw-height`, `--dw-z`.
+
+### Lifecycle and diagnostics
+
+A widget on the page is not yet a channel that answers. The widget tracks three steps separately:
+
+| Step | `ok` means | Typical failure codes |
+|---|---|---|
+| `config` | The backend's `/config` answered: the embed points at a working backend | `ORIGIN_NOT_ALLOWED`, `http_404`, `http_503`, `network_error` |
+| `session` | A visitor session was opened | `LOGIN_REQUIRED`, `turnstile_failed`, `http_401` |
+| `reply` | The agent answered the last message | `AGENT_UNAVAILABLE`, `upstream_unavailable`, `empty_reply`, `reply_failed` |
+
+Each step is `idle` (not checked yet), `pending`, `ok` or `failed` (with a `code`).
+
+```ts
+chat.addEventListener("dewee:status", (e) => console.log(e.detail));
+// { embedded: true, config: { state: "ok" }, session: { state: "idle" }, reply: { state: "idle" }, version: "0.5.0" }
+
+chat.diagnostics();            // the same snapshot, any time
+await chat.checkConnection();  // loads the config and opens a session, without sending a message
+await chat.send("ping");       // then `reply` shows whether the agent answered
+```
+
+- `dewee:ready` fires once per load attempt, **including a failed one**, so embeds that wait for it
+  never hang. Its detail is `{ ok, agent, config, error? }`: check `ok` before treating the chat as
+  usable (`config` is `null` and `error.code` is set when it is `false`).
+- `dewee:status` fires whenever a step changes. The snapshot holds states and short codes only: no
+  token, key, URL, server message or conversation text, so it is safe to log or to send to a checker.
+- When the config cannot be loaded, the header says the chat is unavailable instead of "Online", the
+  panel shows a **Try again** button (`retry()`), and nothing is sent until the config loads. The host
+  element carries `data-connection="connecting" | "ready" | "unavailable"` for your own styling.
+- React: `onStatus`. Vue: `@status`.
 
 ## Markdown images
 

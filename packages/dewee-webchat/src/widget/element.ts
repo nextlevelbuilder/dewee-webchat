@@ -14,6 +14,7 @@ import {
 import { createDomActions, type DomActions, type DomActionsRoot } from "../actions/dom-actions";
 import { ACTION_LIMITS, stripPageBlock } from "../actions/page-block";
 import { ApiClient, ApiError, type RequestHeadersOption } from "./api-client";
+import { Diagnostics, errorCode, type CheckState, type CheckStep, type WidgetDiagnostics } from "./diagnostics";
 import { JobAccessPopupError, openJobAccessTicket } from "./job-access";
 import { showConfirmDialog } from "./confirm-dialog";
 import { icons, pickStrings, type Strings } from "./i18n";
@@ -212,6 +213,9 @@ export class DeweeChatElement extends ElementBase {
   private credentialPopups = new Map<string, { popup: Window; controller: AbortController; timer?: ReturnType<typeof setTimeout> }>();
   private credentialRequestsInFlight = new Set<AbortController>();
   private activated = false;
+  /** The boot in flight, so `retry()` and `checkConnection()` can wait for it. */
+  private activating: Promise<void> | null = null;
+  private diag = new Diagnostics();
   private probedPage = false;
   private strings: Strings = pickStrings();
   private mql: MediaQueryList | null = null;
@@ -348,6 +352,8 @@ export class DeweeChatElement extends ElementBase {
     }
     if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.open();
     await this.activate();
+    // No backend config: nothing can be sent. The text stays in the composer for after "Try again".
+    if (this.diag.state("config") !== "ok") return;
     let attachment: PageContextAttachment | undefined;
     if (this.els.pageChoice.checked) {
       if (this.pagePending) { this.showNotice(this.strings.pageUnavailable); return; }
@@ -412,9 +418,14 @@ export class DeweeChatElement extends ElementBase {
     this.pushMessage(reply);
     this.setRunning(new AbortController());
     this.emit("dewee:send", { message, agent: this.agentId, conversationId: this.conversationId, auto: hidden || undefined });
+    let sessionOpen = false;
     try {
       // The session decides which backend conversation (visitor) the page-action ack belongs to.
+      if (this.diag.state("session") !== "ok") this.setCheck("session", "pending");
       await this.client().ensureSession();
+      sessionOpen = true;
+      this.setCheck("session", "ok");
+      this.setCheck("reply", "pending");
       await this.client().chat({ ...this.chatBody(message), ...(attachment ? { page_context: attachment } : {}) }, (e) => { if (generation === this.credentialGeneration) this.onStreamEvent(reply, e); }, this.running!.signal);
       if (reply.status === "streaming") reply.status = "done";
     } catch (e) {
@@ -424,9 +435,18 @@ export class DeweeChatElement extends ElementBase {
         if (!reply.content) reply.content = `_${this.strings.stopped}_`;
       } else {
         reply.status = "error";
+        this.setCheck(sessionOpen ? "reply" : "session", "failed", errorCode(e));
         this.showError(reply, e as Error);
       }
     } finally {
+      // Stopped by the visitor before anything was learned about the channel: back to "not checked".
+      if (!sessionOpen && this.diag.state("session") === "pending") this.setCheck("session", "idle");
+      if (this.diag.state("reply") === "pending") {
+        if (reply.stopped) this.setCheck("reply", "idle");
+        else if (reply.status !== "done") this.setCheck("reply", "failed", "reply_failed");
+        else if (reply.content.trim() || reply.toolCalls?.length) this.setCheck("reply", "ok");
+        else this.setCheck("reply", "failed", "empty_reply");
+      }
       this.finishThinking(reply);
       this.updateMessage(reply);
       this.setRunning(null);
@@ -546,6 +566,38 @@ export class DeweeChatElement extends ElementBase {
   /** Stops the running reply. */
   stop(): void {
     this.running?.abort();
+  }
+
+  /**
+   * What the widget knows about its connection: states and short error codes for the config, session
+   * and reply steps. Safe to log or send to an install checker: no token, key, URL or message text.
+   */
+  diagnostics(): WidgetDiagnostics {
+    return this.diag.snapshot();
+  }
+
+  /** Loads the backend config again after it failed (the "Try again" button calls this). */
+  async retry(): Promise<WidgetDiagnostics> {
+    await this.activate();
+    return this.diag.snapshot();
+  }
+
+  /**
+   * Checks the embed without sending a message: loads the config, then opens a visitor session.
+   * Resolves the same snapshot as `diagnostics()`; never rejects.
+   */
+  async checkConnection(): Promise<WidgetDiagnostics> {
+    await this.activate();
+    if (this.diag.state("config") === "ok") {
+      if (this.diag.state("session") !== "ok") this.setCheck("session", "pending");
+      try {
+        await this.client().ensureSession();
+        this.setCheck("session", "ok");
+      } catch (e) {
+        this.setCheck("session", "failed", errorCode(e));
+      }
+    }
+    return this.diag.snapshot();
   }
 
   /**
@@ -742,6 +794,16 @@ export class DeweeChatElement extends ElementBase {
     this.dispatchEvent(new CustomEvent(name, { detail, bubbles: true, composed: true }));
   }
 
+  /** Records one connection step and tells the page (`dewee:status`) when it changed. */
+  private setCheck(step: CheckStep, state: CheckState, code?: string) {
+    if (!this.diag.set(step, state, code)) return;
+    if (step === "config") {
+      this.setAttribute("data-connection", state === "ok" ? "ready" : state === "failed" ? "unavailable" : "connecting");
+      this.renderSubtitle();
+    }
+    this.emit("dewee:status", this.diag.snapshot());
+  }
+
   private client(): ApiClient {
     const c = this.config;
     const key = [c.endpoint, c.gatewayUrl, c.gatewayToken].join("|");
@@ -831,6 +893,7 @@ export class DeweeChatElement extends ElementBase {
       this.activated = false;
       this.server = null;
       this.probedPage = false;
+      this.diag.reset();
       this.activate();
     } else if (this.activated && !this.probedPage && (c.pageContext === "metadata" || c.pageContext === "content")) {
       this.activated = false;
@@ -1020,30 +1083,61 @@ export class DeweeChatElement extends ElementBase {
       e.select.setAttribute("aria-label", "Agent");
     }
     const current = agents.find((a) => a.id === this.agentId);
-    e.status.textContent = c.subtitle || (current?.name && current.name !== c.title ? `${this.strings.online} · ${current.name}` : this.strings.online);
+    // "Online" is only claimed once the backend answered; a failed or pending load says so instead.
+    const connection = this.diag.state("config");
+    e.status.textContent = connection === "failed"
+      ? this.strings.unavailable
+      : connection === "pending"
+        ? this.strings.connecting
+        : c.subtitle || (current?.name && current.name !== c.title ? `${this.strings.online} · ${current.name}` : this.strings.online);
   }
 
   /** Loads backend config and the persisted conversation once. */
-  private async activate(): Promise<void> {
-    if (this.activated) return;
+  private activate(): Promise<void> {
+    if (this.activating) return this.activating;
+    if (this.activated) return Promise.resolve();
+    const run = this.boot().finally(() => {
+      if (this.activating === run) this.activating = null;
+    });
+    return (this.activating = run);
+  }
+
+  private async boot(): Promise<void> {
     this.activated = true;
+    this.setCheck("config", "pending");
     this.renderLog();
+    let loaded: PublicConfig | null = null;
+    let failure: unknown = null;
     try {
       this.probedPage = this.config.pageContext === "metadata" || this.config.pageContext === "content";
-      this.server = await this.client().getConfig(true, this.probedPage);
-      this.els.input.maxLength = this.server.maxMessageLength;
-      const wanted = this.config.agent;
-      const known = (id?: string) => !!id && (this.server!.agents.length === 0 || this.server!.agents.some((a: AgentInfo) => a.id === id));
-      this.agentId = known(wanted) ? wanted! : this.server.defaultAgent || this.server.agents[0]?.id || wanted || "";
-      await this.loadConversation();
+      loaded = await this.client().getConfig(true, this.probedPage);
     } catch (e) {
+      failure = e ?? new Error(this.strings.errorGeneric);
+    }
+    if (!loaded) {
       this.activated = false;
+      this.setCheck("config", "failed", errorCode(failure));
+      // Hosts already listening for dewee:error keep getting it; the log shows the retry panel
+      // instead of a bare error line.
+      this.showError(null, failure instanceof Error ? failure : new Error(this.strings.errorGeneric));
       this.renderLog();
-      this.showError(null, e as Error);
+    } else {
+      this.server = loaded;
+      this.diag.setVersion(loaded.version);
+      this.setCheck("config", "ok");
+      this.els.input.maxLength = loaded.maxMessageLength;
+      const wanted = this.config.agent;
+      const known = (id?: string) => !!id && (loaded!.agents.length === 0 || loaded!.agents.some((a: AgentInfo) => a.id === id));
+      this.agentId = known(wanted) ? wanted! : loaded.defaultAgent || loaded.agents[0]?.id || wanted || "";
+      await this.loadConversation();
     }
     this.renderSubtitle();
     this.updatePageChoice();
-    this.emit("dewee:ready", { agent: this.agentId, config: this.server });
+    // Fired once per boot attempt, as before, including a failed one. `ok` tells the two apart;
+    // `dewee:status` and `diagnostics()` say which step failed.
+    const config = this.diag.snapshot().config;
+    const ok = config.state === "ok";
+    this.emit("dewee:ready", { agent: this.agentId, config: ok ? this.server : null, ok, ...(ok ? {} : { error: { code: config.code } }) });
   }
 
   private async switchAgent(id: string) {
@@ -1079,8 +1173,10 @@ export class DeweeChatElement extends ElementBase {
     const log = this.els.log;
     disposeMarkdownImages(log);
     log.replaceChildren();
-    if (!this.messages.length) log.appendChild(this.renderWelcome());
+    const unavailable = this.diag.state("config") === "failed";
+    if (!this.messages.length && !unavailable) log.appendChild(this.renderWelcome());
     for (const m of this.messages) log.appendChild(this.renderMessage(m));
+    if (unavailable) log.appendChild(this.renderUnavailable());
     for (const card of this.credentialCards.values()) log.appendChild(this.renderCredential(card));
     log.scrollTop = log.scrollHeight;
   }
@@ -1215,6 +1311,28 @@ export class DeweeChatElement extends ElementBase {
       }
     }
     finally { if (this.running === controller) this.setRunning(null); if (generation === this.credentialGeneration) { this.credentialBusy.delete(card.id); this.updateMessage(reply); this.renderLog(); } }
+  }
+
+  /** Shown instead of the welcome when the backend config could not be loaded. */
+  private renderUnavailable(): HTMLElement {
+    const box = document.createElement("div");
+    box.className = "unavailable";
+    box.setAttribute("role", "alert");
+    const h = document.createElement("h2");
+    h.textContent = this.strings.unavailable;
+    const p = document.createElement("p");
+    p.textContent = this.strings.unavailableBody;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "retry";
+    b.textContent = this.strings.retry;
+    b.addEventListener("click", () => {
+      b.disabled = true;
+      b.textContent = this.strings.connecting;
+      void this.retry();
+    });
+    box.append(h, p, b);
+    return box;
   }
 
   private renderWelcome(): HTMLElement {
@@ -1426,10 +1544,12 @@ export class DeweeChatElement extends ElementBase {
         if (e.content && e.content.length >= m.content.length) m.content = e.content;
         m.status = "done";
         break;
-      case "error":
+      case "error": {
         m.status = "error";
+        this.setCheck("reply", "failed", typeof e.code === "string" && e.code ? errorCode({ code: e.code }) : "reply_failed");
         this.showError(m, new ApiError(e.message, 500, e.code, e.remediation, e.retryAfterMs));
         break;
+      }
     }
     this.scheduleUpdate(m);
   }

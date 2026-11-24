@@ -4,7 +4,8 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { verifyVisitorToken } from "../src/server";
+import { createDeweeHandler, verifyVisitorToken } from "../src/server";
+import { deweeIdentitySdk } from "../src/server/identity";
 import { verifyReuseHint } from "../src/server/security";
 import { APP_ID, ASSERTION_SECRET, INTEGRATION_ID, INTEGRATION_SECRET, ISSUER, startFakeCcp, type FakeCcp } from "./helpers/fake-ccp-ingress";
 import { forgeToken } from "./helpers/forge-token";
@@ -219,5 +220,39 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     expect(ccp.routes("identity/exchange")).toHaveLength(1);
     const switched = await fetch(`${base}/session`, { method: "POST", headers: { cookie: "uid=user-b" }, body: JSON.stringify({ reuseHint: first.reuseHint }) });
     expect((await verifyVisitorToken(secret, (await switched.json()).token))?.ids).not.toBe((await verifyVisitorToken(secret, first.token))?.ids);
+  });
+
+  it("forwards an install check nonce for a signed-in user like the TS handler", async () => {
+    // Built by concatenation: fixtures shaped like tokens are never literal.
+    const nonce = "chk_" + "S1gn".repeat(6);
+    const ts = createDeweeHandler({
+      ccp: { chatUrl: ccp.url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET }, secret, rateLimit: false,
+      identity: { sdk: deweeIdentitySdk, appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, authenticate: async (req) => { const uid = /(?:^|;\s*)uid=([^;]+)/.exec(req.headers.get("cookie") ?? "")?.[1]; return uid ? { subject: uid } : null; } },
+    });
+    const both = async (body: unknown) => {
+      const init = { method: "POST", headers: { cookie: "uid=user-a" }, body: JSON.stringify(body) };
+      const p = await fetch(`${base}/session`, init);
+      const t = await ts(new Request("https://shop.example/api/dewee/session", init));
+      return { php: { status: p.status, body: await p.json() }, ts: { status: t.status, body: await t.json() } };
+    };
+    ccp.state.checkNonce = nonce;
+    const accepted = await both({ check: nonce });
+    expect([accepted.php.status, accepted.php.body.verified, accepted.php.body.check]).toEqual([200, true, true]);
+    expect([accepted.ts.status, accepted.ts.body.verified, accepted.ts.body.check]).toEqual([200, true, true]);
+    expect(Object.keys(accepted.php.body).sort()).toEqual(Object.keys(accepted.ts.body).sort());
+    const checked = ccp.routes("session").filter((r) => r.body?.check !== undefined);
+    expect(checked.length).toBeGreaterThanOrEqual(2);
+    expect(checked.every((r) => r.body.check === nonce)).toBe(true);
+    expect(JSON.stringify(await verifyVisitorToken(secret, accepted.php.body.token))).not.toContain("check");
+
+    // A nonce CCP does not accept is never confirmed; a malformed one is the same 400 on both.
+    ccp.state.checkNonce = undefined;
+    const ignored = await both({ check: nonce });
+    expect([ignored.php.body.check, ignored.ts.body.check]).toEqual([undefined, undefined]);
+    const sessions = ccp.routes("session").length;
+    const malformed = await both({ check: "nope" });
+    expect([malformed.php.status, malformed.php.body]).toEqual([400, malformed.ts.body]);
+    expect(malformed.ts.status).toBe(400);
+    expect(ccp.routes("session")).toHaveLength(sessions);
   });
 });

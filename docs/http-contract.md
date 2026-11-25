@@ -536,12 +536,15 @@ The control plane checks the payload against the kind's schema. A `callback` pay
 | Answer | Meaning |
 |---|---|
 | `400 bad_request` | The request failed validation. |
-| `401 unauthorized` | The visitor session is missing or expired. The widget renews it and resends with the same key. |
+| `401 unauthorized` | The visitor session is missing or expired. The widget renews it and resends with the same key, unless the visitor was signed in and the renewed session is not: then it asks them to sign in again and keeps the key. |
+| `401 IDENTITY_REQUIRED` and other identity codes | The visitor must sign in (again). The request is never sent as anonymous instead. |
+| `403 agent_not_allowed` | A signed-in visitor named another agent than the one their sign-in is bound to. |
 | `403 work_requests_unavailable` | The kind is not offered, or the integration cannot take requests. |
 | `404 not_found` | The conversation is not the visitor's. The widget resends without it, with the same key. |
 | `409 idempotency_conflict` | The key already holds a request with other content. |
 | `413 too_long` | The summary or payload is too long. |
 | `429 rate_limited` | The backend's own limit, or CCP's. CCP allows 60 new requests an hour per integration. |
+| `403` with the mapped code | Any other CCP 4xx (for example `integration_unauthorized` as `not_configured`, `integration_disabled` as `unavailable`). On these routes a definite refusal is never answered with a 5xx. |
 
 **Unknown outcome.** Any other failure means the request may have been stored: a network failure, a
 timeout, a CCP 5xx (including `ingress_unavailable`), or an answer that could not be read. The backend
@@ -556,13 +559,16 @@ The answer carries `Retry-After`, using CCP's value or 5 seconds.
 - The browser must list by the key before sending again.
 - A resend must use the same key and the same body.
 
+The widget treats only this answer, a network failure or timeout, and a 2xx it cannot read as an
+unknown outcome. Any other error answer is final.
+
 The summary, payload and contact value are never logged. The backend logs only the error code.
 
 ### `POST {base}/work-requests/list`
 
 Returns the visitor's own requests, newest first. It needs a visitor bearer.
 
-- **Body:** `{conversationId?, idempotencyKey?, limit? (1..100), agent?}`.
+- **Body:** `{conversationId?, idempotencyKey?, limit? (an integer 1..100, `2.0` included), agent?}`.
 - **Answer:** `{"workRequests": [view, …]}`.
 - `idempotencyKey` finds the request that key created, if any.
 - A conversation filter never answers 404.
@@ -588,6 +594,7 @@ Returns the visitor's own requests, newest first. It needs a visitor bearer.
 | `waiting` | No |
 | `resolved` | Yes |
 | `cancelled` | Yes |
+| `updated` | No: a state the control plane added after this version. The backends pass it on as `updated` and the widget shows a neutral "Updated" receipt rather than dropping the request. |
 
 The widget never words a state that is not final as done.
 
@@ -611,7 +618,19 @@ The backends rebuild the view from these fields only. It never carries:
   - a retry;
   - a reload during a send.
 
-  A recorded request, or a definite refusal followed by an edit, starts a new key.
+  A recorded request starts a new key, and so does a definite refusal followed by an edit or by
+  closing the form. A request refused because the visitor must sign in again keeps its key for after
+  the sign-in.
+
+  Each browser tab has its own `sessionStorage`, so each tab has its own key: the same details sent
+  from two tabs are the visitor's two requests, and both are stored.
+- **Unknown outcome.** The widget first lists by the key. Until one such check has answered, it offers
+  only **Check again**; once a check found nothing, it also offers **Send again**, with the same key
+  and body.
+- **Form.** The visitor session is opened before the form is shown, so a Turnstile challenge appears
+  in its usual place rather than under the dialog.
+- **Due time.** Shown in the visitor's local time, followed by the business's time only when the two
+  read differently (an alias such as `Asia/Saigon` for `Asia/Ho_Chi_Minh` is shown once).
 - **Receipts.** The widget lists receipts:
   - for a visitor who already holds a session;
   - on load;

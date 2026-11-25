@@ -515,8 +515,11 @@ never required.
 
 - **Sending**: the request is on its way.
 - **Unconfirmed**: the outcome is unknown. The widget checks by the request's key, then offers
-  **Check again** and **Send again**. Both reuse the same key, so the request is never stored twice.
-- **Failed**: the request was refused. The key is kept until the visitor changes the form.
+  **Check again**, and **Send again** once a check has answered. Both reuse the same key, so the
+  request is never stored twice.
+- **Failed**: the request was refused. The key is kept until the visitor changes the form or closes it.
+- **Sign in again**: a signed-in visitor whose sign-in ended. The request is never sent as anonymous;
+  it keeps its key for after the sign-in.
 - **Recorded**: the widget shows the server's receipt: the code, the state (a dot and a word), when
   the business will reply (in the visitor's local time), the public note, and a contact hint such as
   `***678`.
@@ -524,7 +527,8 @@ never required.
 **Receipts.** Each request is its own receipt. They are read again on load, when the widget is
 opened or focused, and after a send. They are separate from the conversation and from **Talk to a
 person**, so a takeover ending or staff going off duty never changes them. `generic` kinds appear as
-receipts too.
+receipts too, and a state added by a newer control plane shows as "Updated". Each browser tab keeps
+its own key, so the same details sent from two tabs are two requests.
 
 **Privacy.** The contact value is never logged, stored in the browser, or put in an event. The
 `dewee:work-request` event carries `{code, state}` only. The idempotency key lives in

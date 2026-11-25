@@ -55,6 +55,7 @@ import { resolveTransport } from "./transport-selection";
 import { readChatBody, validPageContext } from "./page-context";
 import { JobAccessRefusal, mintJobAccess } from "./job-access";
 import { parseCredentialHandoff, parseCredentialRequest } from "../credential-request";
+import { MEMBER_PROOF_RE, WORK_REQUEST_KEY_RE, WORK_REQUEST_KIND_RE, WORK_REQUEST_LIMITS, codePoints, type WorkRequestCreateResponse, type WorkRequestListResponse } from "../work-request";
 import { CCP_AGENT_RE, CCP_ID_RE, EDGE_RESEAL_MS, browserErrorFor, createCcpTransport, type BrowserError, type CcpConfig, type EdgeSession, type VisitorContext } from "./ccp-transport";
 import { memoryIdentitySessionStore, type IdentitySessionStore, type StoredIdentitySession } from "./identity-session-store";
 import { allowedImageSource, fetchRasterImage, issueImageTicket, readImageTicketBody, verifyImageTicket } from "./image-proxy";
@@ -222,6 +223,13 @@ export interface DeweeHandlerOptions {
    * its button only when the integration allows it too. Default false: nothing changes.
    */
   humanHandoff?: boolean;
+  /**
+   * CCP transport only: let visitors send business requests the integration offers (a callback…) and
+   * see their receipts. This backend then advertises `work-requests` to CCP, lists the offered kinds in
+   * `/config` (`workRequests`) and serves `POST {basePath}/work-requests` and
+   * `POST {basePath}/work-requests/list`. Needs widget 0.5.0-beta.7 or later. Default false: nothing changes.
+   */
+  workRequests?: boolean;
   /** Explicitly public directories in this Worker's Assets binding. Bypasses site middleware. */
   cloudflarePublicImageAssets?: { binding: { fetch(request: Request): Promise<Response> }; prefixes: string[] };
   /** Public-only service bindings for approved HTTPS image directory prefixes. Bypasses host security rules. */
@@ -277,6 +285,8 @@ const ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 const AGENT_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const IDEMPOTENCY_KEY_RE = /^[\x21-\x7E]{1,255}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A work request body: a 16 KiB payload, a 500-character summary and the other fields fit. */
+const WORK_REQUEST_MAX_BODY_BYTES = 20 * 1024;
 
 /** Gateway default identity session lifetime, used when the expiry cannot be trusted (clock skew). */
 const DEFAULT_IDENTITY_TTL_MS = 3600_000;
@@ -359,6 +369,9 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   if (o.humanHandoff !== undefined && typeof o.humanHandoff !== "boolean") throw new Error("[dewee-webchat] humanHandoff must be true or false");
   if (o.humanHandoff && transport !== "ccp") throw new Error("[dewee-webchat] humanHandoff requires the ccp transport");
   const humanHandoff = o.humanHandoff === true;
+  if (o.workRequests !== undefined && typeof o.workRequests !== "boolean") throw new Error("[dewee-webchat] workRequests must be true or false");
+  if (o.workRequests && transport !== "ccp") throw new Error("[dewee-webchat] workRequests requires the ccp transport");
+  const workRequests = o.workRequests === true;
   if (o.imageSources !== undefined && !Array.isArray(o.imageSources)) throw new Error("[dewee-webchat] imageSources must be an array");
   const imageSources = (o.imageSources ?? []).map((origin) => {
     let url: URL;
@@ -427,6 +440,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
           idn ? { createAssertion: (a) => idn.sdk.createAssertion!(a), signer: () => identitySigner(), ttlSeconds: idn.sessionTtlSeconds } : undefined,
           !!credentialFormOrigin,
           humanHandoff,
+          workRequests,
         )
       : null;
 
@@ -917,6 +931,7 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       ...(credentialFormOrigin ? { credentialFormOrigin } : {}),
       ...(credentialFormOrigin && cfg.memberLinkProof ? { memberLinkProof: true } : {}),
       ...(humanHandoff && cfg.humanHandoff ? { humanHandoff: true } : {}),
+      ...(workRequests && cfg.workRequests?.length ? { workRequests: cfg.workRequests } : {}),
       version: VERSION,
     };
     if (idn) {
@@ -1450,6 +1465,101 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
     }
   }
 
+  /**
+   * The visitor's checks and parsed JSON body for a work request route (`workRequests` only), or the
+   * refusal to answer. Rate limited per visitor: the `chat` bucket for creates (CCP allows 20 per 10
+   * minutes, so retries with the same key still get through), `preauth` for lists.
+   */
+  async function workRequestCaller(req: Request, bucket: "chat" | "preauth"): Promise<{ claims: VisitorClaims; body: Record<string, unknown> } | Response> {
+    if (!ccp || !workRequests) return fail(req, 404, "Not found", "not_found");
+    const claims = await visitorFrom(req);
+    if (!claims) return fail(req, 401, "Missing or expired visitor session", "unauthorized");
+    if (idn?.required && !claims.ids) return identityFail(req, "IDENTITY_REQUIRED");
+    const refused = await rebindRefusal(req, claims);
+    if (refused) return refused;
+    if (limiter && !(await limiter(`${bucket === "chat" ? "work-request" : "work-request-list"}:${claims.v}`, bucket))) return fail(req, 429, "Too many requests, try again later", "rate_limited");
+    if (!req.body) return fail(req, 400, "Invalid request", "bad_request");
+    const raw = await readImageTicketBody(req, WORK_REQUEST_MAX_BODY_BYTES);
+    if (raw === null) return fail(req, 413, "Request is too long", "too_long");
+    let body: unknown;
+    try { body = JSON.parse(raw); } catch { return fail(req, 400, "Invalid request", "bad_request"); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return fail(req, 400, "Invalid request", "bad_request");
+    return { claims, body: body as Record<string, unknown> };
+  }
+
+  /**
+   * `POST {basePath}/work-requests`: one request the visitor confirmed. The idempotency key goes to CCP
+   * unchanged, so a retry of the same intent answers the stored request. A definite refusal (a 4xx of
+   * CCP) is mapped as usual; anything else may have stored the request and is
+   * `503 work_request_outcome_unknown`: the widget lists by its key before it sends again. The summary,
+   * payload and contact data are never logged or passed to `onChat`.
+   */
+  async function handleWorkRequestCreate(req: Request): Promise<Response> {
+    const caller = await workRequestCaller(req, "chat");
+    if (caller instanceof Response) return caller;
+    const { claims, body } = caller;
+    const summary = typeof body.summary === "string" ? body.summary.trim() : "";
+    const payload = body.payload;
+    if (Object.keys(body).some((key) => !["kind", "summary", "payload", "idempotencyKey", "conversationId", "agent"].includes(key))
+      || typeof body.kind !== "string" || !WORK_REQUEST_KIND_RE.test(body.kind)
+      || typeof body.idempotencyKey !== "string" || !WORK_REQUEST_KEY_RE.test(body.idempotencyKey)
+      || (body.conversationId !== undefined && (typeof body.conversationId !== "string" || !CCP_ID_RE.test(body.conversationId)))
+      || !summary || !payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return fail(req, 400, "Invalid request", "bad_request");
+    }
+    const encoded = JSON.stringify(payload);
+    if (codePoints(summary) > WORK_REQUEST_LIMITS.summaryChars || new TextEncoder().encode(encoded).length > WORK_REQUEST_LIMITS.payloadBytes) return fail(req, 413, "Request is too long", "too_long");
+    if (MEMBER_PROOF_RE.test(summary) || MEMBER_PROOF_RE.test(encoded)) return fail(req, 400, "Invalid request", "bad_request");
+    const agent = ccpAgentFor(req, claims, body.agent);
+    if (agent instanceof Response) return agent;
+    try {
+      const result = await ccp!.workRequestCreate(visitorContext(req), claims.v, sealedEdge(claims), {
+        kind: body.kind,
+        summary,
+        payload: payload as Record<string, unknown>,
+        idempotencyKey: body.idempotencyKey,
+        conversationId: body.conversationId as string | undefined,
+        agent: agent || undefined,
+        identitySession: claims.ids,
+      });
+      return json(req, result satisfies WorkRequestCreateResponse, result.replayed ? 200 : 201);
+    } catch (e) {
+      if (e instanceof CcpError && e.status >= 400 && e.status < 500) return ccpFail(req, e, "work-requests/create", claims.ids);
+      // Network, timeout, 5xx, redirect, or an answer that could not be read: the request may be stored.
+      console.warn(`[dewee-webchat] ccp work-requests/create: outcome unknown (${e instanceof CcpError ? e.code : "error"})`);
+      const res = fail(req, 503, "The request may have been received. Check before sending it again.", "work_request_outcome_unknown");
+      res.headers.set("retry-after", String(e instanceof CcpError && e.retryAfterSeconds ? Math.ceil(e.retryAfterSeconds) : 5));
+      return res;
+    }
+  }
+
+  /** `POST {basePath}/work-requests/list`: the visitor's own requests, newest first (with a key: that create's). */
+  async function handleWorkRequestList(req: Request): Promise<Response> {
+    const caller = await workRequestCaller(req, "preauth");
+    if (caller instanceof Response) return caller;
+    const { claims, body } = caller;
+    if (Object.keys(body).some((key) => !["conversationId", "idempotencyKey", "limit", "agent"].includes(key))
+      || (body.conversationId !== undefined && (typeof body.conversationId !== "string" || !CCP_ID_RE.test(body.conversationId)))
+      || (body.idempotencyKey !== undefined && (typeof body.idempotencyKey !== "string" || !WORK_REQUEST_KEY_RE.test(body.idempotencyKey)))
+      || (body.limit !== undefined && (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > 100))) {
+      return fail(req, 400, "Invalid request", "bad_request");
+    }
+    const agent = ccpAgentFor(req, claims, body.agent);
+    if (agent instanceof Response) return agent;
+    try {
+      const workRequests = await ccp!.workRequestList(visitorContext(req), claims.v, sealedEdge(claims), {
+        conversationId: body.conversationId as string | undefined,
+        idempotencyKey: body.idempotencyKey as string | undefined,
+        limit: body.limit as number | undefined,
+        agent: agent || undefined,
+        identitySession: claims.ids,
+      });
+      return json(req, { workRequests } satisfies WorkRequestListResponse);
+    } catch (e) {
+      return ccpFail(req, e, "work-requests/list", claims.ids);
+    }
+  }
+
   /** Web-first linking: starts a Dewee link for the signed-in user and returns the proof code. */
   async function handleLink(req: Request): Promise<Response> {
     const claims = await visitorFrom(req);
@@ -1537,7 +1647,8 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
   const deweeHandler = async function deweeHandler(req: Request): Promise<Response> {
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(req) });
     if (!originAllowed(req)) return fail(req, 403, "Origin not allowed", "forbidden_origin");
-    const action = new URL(req.url).pathname.replace(/\/+$/, "").split("/").pop();
+    const segments = new URL(req.url).pathname.replace(/\/+$/, "").split("/");
+    const action = segments.at(-1);
     try {
       if (req.method === "POST" && action === "image-ticket" && imageSources.length) {
         const claims = await visitorFrom(req);
@@ -1597,6 +1708,8 @@ export function createDeweeHandler(options: DeweeHandlerOptions): DeweeHandler {
       if (req.method === "POST" && action === "job-access" && idn) return await handleJobAccess(req);
       if (req.method === "POST" && (action === "credential-request" || action === "credential-request-handoff" || action === "credential-request-cancel")) return await handleCredentialRequest(req, action);
       if (req.method === "POST" && action === "request-human") return await handleRequestHuman(req);
+      if (req.method === "POST" && action === "work-requests") return await handleWorkRequestCreate(req);
+      if (req.method === "POST" && action === "list" && segments.at(-2) === "work-requests") return await handleWorkRequestList(req);
       return fail(req, 404, "Not found", "not_found");
     } catch (e) {
       if (e instanceof IdentityStoreError) return identityFail(req, "SOURCE_UNAVAILABLE", { action: "retry_later", audience: "end_user" });
@@ -1638,6 +1751,7 @@ export function optionsFromEnv(env: Record<string, string | undefined>, override
     turnstile: env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY ? { siteKey: env.TURNSTILE_SITE_KEY, secretKey: env.TURNSTILE_SECRET_KEY } : undefined,
     // Opt-in only: anything but "true" leaves human takeover off.
     humanHandoff: env.DEWEE_WEBCHAT_HUMAN_HANDOFF?.trim() === "true" ? true : undefined,
+    workRequests: env.DEWEE_WEBCHAT_WORK_REQUESTS?.trim() === "true" ? true : undefined,
     // undefined overrides must not erase env-derived values
     ...Object.fromEntries(Object.entries(overrides).filter(([, v]) => v !== undefined)),
   };

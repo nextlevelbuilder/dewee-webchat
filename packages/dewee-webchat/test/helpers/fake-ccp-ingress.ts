@@ -46,6 +46,45 @@ export interface FakeCcpState {
   credentialHandoffUrl?: string;
   /** The install check nonce the control plane accepts: a `session` carrying it as `check` answers `check: true`. */
   checkNonce?: string;
+  /** Request kinds the workspace offers; listed in `config` only to a host advertising `work-requests`. */
+  workRequestKinds: Array<{ kind: string; title: string; schema: "callback" | "generic"; staffed_now: boolean }>;
+  /** Stored work requests by requester actor, oldest first. */
+  workRequests: Map<string, FakeWorkRequest[]>;
+  /**
+   * The next create that stores a request (or replays one) fails after storing it: `drop` closes the
+   * connection without an answer, `unknown` answers `503 work_request_outcome_unknown`. Consumed once.
+   */
+  workRequestFault?: "drop" | "unknown";
+}
+
+/** A stored work request: its visitor view plus what idempotency is judged on. */
+export interface FakeWorkRequest {
+  key: string;
+  /** kind, payload, summary and conversation, as the runtime hashes them. */
+  content: string;
+  view: { code: string; kind: string; summary: string; state: string; received_at: string; respond_due_at: string; due_timezone: string; public_note: string; contact_hint: string; updated_at: string };
+}
+
+/** Builds the stored view's code: `WR-` plus 8 Crockford base32 characters. */
+function workRequestCode(): string {
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  return "WR-" + Array.from(randomBytes(8), (b) => alphabet[b & 31]).join("");
+}
+
+/** The runtime's callback schema check (`internal/workrequest/payload.go`); returns the field at fault. */
+function callbackFault(p: Record<string, unknown>): string | null {
+  if (Object.keys(p).some((k) => !["contact_method", "contact_value", "purpose", "consent", "preferred_time"].includes(k))) return "payload";
+  const method = typeof p.contact_method === "string" ? p.contact_method.trim().toLowerCase() : "";
+  const value = typeof p.contact_value === "string" ? p.contact_value.trim() : "";
+  if (method === "phone" || method === "zalo") {
+    const digits = value.replace(/[^0-9]/g, "").length;
+    if (!/^\+?[0-9][0-9 ().-]*$/.test(value) || value.length > 32 || digits < 6 || digits > 15) return "payload.contact_value";
+  } else if (method === "email") {
+    if (!/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(value)) return "payload.contact_value";
+  } else return "payload.contact_method";
+  if (typeof p.purpose !== "string" || !p.purpose.trim() || [...p.purpose.trim()].length > 500) return "payload.purpose";
+  if (p.consent !== true) return "payload.consent";
+  return null;
 }
 
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
@@ -89,6 +128,8 @@ export interface FakeCcp {
   reset(): void;
   close(): Promise<void>;
   routes(name: string): Recorded[];
+  /** Staff work one request: changes its state or public note, nothing else. */
+  updateWorkRequest(code: string, patch: { state?: string; public_note?: string }): void;
 }
 
 const defaultConfig = () => ({
@@ -120,6 +161,8 @@ export async function startFakeCcp(): Promise<FakeCcp> {
     staffOnDuty: true,
     stopMidRun: false,
     edgeTtlSeconds: 3600,
+    workRequestKinds: [],
+    workRequests: new Map(),
   };
 
   const send = (res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) => {
@@ -158,7 +201,14 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       if (injected.remediation) extra.remediation = injected.remediation;
       return error(res, injected.status, injected.code, injected.message, extra);
     }
-    if (route === "config") return send(res, 200, state.config);
+    // `X-Dewee-Webchat-Features`: comma-separated, case-insensitive host capabilities (contract §1.2).
+    const features = String(req.headers["x-dewee-webchat-features"] ?? "").split(",").map((t) => t.trim().toLowerCase());
+    const workRequestFeature = features.includes("work-requests");
+    if (route === "config") {
+      // Listed only to a host that declared work-requests, and only when the workspace offers a kind.
+      const kinds = workRequestFeature && state.workRequestKinds.length ? { work_requests: state.workRequestKinds } : {};
+      return send(res, 200, { ...state.config, ...kinds });
+    }
     if (route === "session") {
       const checked = state.checkNonce !== undefined && body?.check === state.checkNonce ? { check: true } : {};
       const prev = req.headers["x-dewee-webchat-session"] as string | undefined;
@@ -191,8 +241,6 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       return error(res, 401, "IDENTITY_REQUIRED", "sign in", { remediation: { action: "reauthenticate", audience: "end_user" } });
     }
 
-    // `X-Dewee-Webchat-Features`: comma-separated, case-insensitive host capabilities (contract §1.2).
-    const features = String(req.headers["x-dewee-webchat-features"] ?? "").split(",").map((t) => t.trim().toLowerCase());
     const credentialFeature = features.includes("credential-requests");
     const handoffFeature = features.includes("human-handoff");
 
@@ -264,6 +312,54 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       conv.push({ role: "assistant", content: state.staffOnDuty ? "A support staff member will join shortly." : "Nobody is on duty right now. Please leave your contact details.", author_kind: "system" });
       return send(res, 200, { case_id: "case_0193_internal", control, staff_on_duty: state.staffOnDuty });
     }
+    if (route === "work-requests/create" || route === "work-requests/list") {
+      if (!workRequestFeature) return error(res, 403, "work_requests_unavailable");
+      const mine = state.workRequests.get(actor) ?? [];
+      // Fields the runtime keeps from the visitor; a host must drop them before the browser sees a view.
+      const leak = { assignee: "staff_0193@shop.example", internal_note: "VIP, call before 5pm", payload: { contact_value: "leaked-contact" } };
+      if (route === "work-requests/list") {
+        const limit = body?.limit ?? 50;
+        if (body?.limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 100)) return error(res, 400, "invalid_request");
+        const found = mine.filter((r) => (!body?.idempotency_key || r.key === body.idempotency_key) && (!body?.conversation_id || JSON.parse(r.content)[3] === body.conversation_id));
+        return send(res, 200, { work_requests: found.reverse().slice(0, limit).map((r) => ({ ...r.view, ...leak })) });
+      }
+      const key = body?.idempotency_key;
+      if (typeof key !== "string" || !/^[A-Za-z0-9._:-]{8,128}$/.test(key)) return error(res, 400, "invalid_request");
+      const summary = typeof body?.summary === "string" ? body.summary.trim() : "";
+      if (!summary) return error(res, 400, "invalid_request");
+      if ([...summary].length > 500) return error(res, 413, "message_too_large");
+      const payload = body?.payload ?? {};
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) return error(res, 400, "invalid_request");
+      const conversation = typeof body?.conversation_id === "string" ? body.conversation_id : "";
+      const content = JSON.stringify([body.kind, payload, summary, conversation]);
+      // A retry of a stored request is answered from the stored row, even if the kind is no longer offered.
+      const stored = mine.find((r) => r.key === key);
+      let answer: { status: number; record: FakeWorkRequest };
+      if (stored) {
+        if (stored.content !== content) return error(res, 409, "idempotency_conflict");
+        answer = { status: 200, record: stored };
+      } else {
+        const kind = state.workRequestKinds.find((k) => k.kind === body?.kind);
+        if (!kind) return error(res, 403, "work_requests_unavailable");
+        if (conversation && !state.conversations.has(`${actor}|${conversation}`)) return error(res, 404, "not_found");
+        const fault = kind.schema === "callback" ? callbackFault(payload) : Object.values(payload).every((v) => typeof v === "string") ? null : "payload";
+        if (fault) return error(res, 400, "invalid_request", "invalid field", { details: { field: fault } });
+        const now = new Date().toISOString();
+        const contact = kind.schema === "callback" ? String(payload.contact_value).trim() : "";
+        const record: FakeWorkRequest = {
+          key,
+          content,
+          view: { code: workRequestCode(), kind: kind.kind, summary, state: "received", received_at: now, respond_due_at: new Date(Date.now() + 4 * 3600_000).toISOString(), due_timezone: "Asia/Ho_Chi_Minh", public_note: "", contact_hint: contact ? `***${contact.slice(-3)}` : "", updated_at: now },
+        };
+        state.workRequests.set(actor, [...mine, record]);
+        answer = { status: 201, record };
+      }
+      const fault = state.workRequestFault;
+      state.workRequestFault = undefined;
+      if (fault === "drop") return void res.destroy();
+      if (fault === "unknown") return error(res, 503, "work_request_outcome_unknown", "commit failed on runtime postgres://internal-db", { retry_after_seconds: 5 });
+      return send(res, answer.status, { work_request: { ...answer.record.view, ...leak }, replayed: answer.status === 200 });
+    }
     if (route === "abort") return send(res, 200, { aborted: true });
     if (route === "identity/exchange") {
       const sub = typeof body?.assertion === "string" ? verifyAssertion(body.assertion) : null;
@@ -321,8 +417,21 @@ export async function startFakeCcp(): Promise<FakeCcp> {
       state.staffOnDuty = true;
       state.stopMidRun = false;
       state.checkNonce = undefined;
+      state.workRequestKinds = [];
+      state.workRequests.clear();
+      state.workRequestFault = undefined;
     },
     routes: (name) => seen.filter((r) => r.route === name),
+    updateWorkRequest(code, patch) {
+      for (const list of state.workRequests.values()) {
+        const found = list.find((r) => r.view.code === code);
+        if (found) {
+          found.view = { ...found.view, ...patch, updated_at: new Date().toISOString() };
+          return;
+        }
+      }
+      throw new Error(`no work request ${code}`);
+    },
     close: () =>
       new Promise<void>((r) => {
         server.closeAllConnections();

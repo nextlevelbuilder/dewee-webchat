@@ -7,7 +7,7 @@
 // another origin. Nothing a visitor sends ever becomes part of a URL.
 
 /** Routes of the public ingress this client calls. Fixed names: callers cannot inject path segments. */
-export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "identity/member-link-proof" | "link" | "job-access" | "credential-request" | "credential-request-handoff" | "credential-request-cancel" | "request-human";
+export type CcpRoute = "config" | "session" | "chat" | "history" | "abort" | "identity/exchange" | "identity/revoke" | "identity/member-link-proof" | "link" | "job-access" | "credential-request" | "credential-request-handoff" | "credential-request-cancel" | "request-human" | "work-requests/create" | "work-requests/list";
 
 /** Validated CCP endpoint options (see {@link parseCcpOptions}). */
 export interface CcpOptions {
@@ -137,11 +137,13 @@ export interface CcpRequest {
   credentialRequests?: boolean;
   /** Advertise `human-handoff` in `X-Dewee-Webchat-Features`. */
   humanHandoff?: boolean;
+  /** Advertise `work-requests` in `X-Dewee-Webchat-Features`. */
+  workRequests?: boolean;
 }
 
 /** `X-Dewee-Webchat-Features` for the capabilities a request advertises, or undefined for none. */
-export function featuresHeader(req: Pick<CcpRequest, "credentialRequests" | "humanHandoff">): string | undefined {
-  const tokens = [req.humanHandoff ? "human-handoff" : "", req.credentialRequests ? "credential-requests" : ""].filter(Boolean);
+export function featuresHeader(req: Pick<CcpRequest, "credentialRequests" | "humanHandoff" | "workRequests">): string | undefined {
+  const tokens = [req.humanHandoff ? "human-handoff" : "", req.credentialRequests ? "credential-requests" : "", req.workRequests ? "work-requests" : ""].filter(Boolean);
   return tokens.length ? tokens.join(", ") : undefined;
 }
 

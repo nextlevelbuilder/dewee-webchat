@@ -1,6 +1,7 @@
 // Browser client for the dewee-webchat backend HTTP contract.
 import { parseJobAccessLaunch, type JobAccessLaunch } from "../job-access";
 import { parseCredentialHandoff, parseCredentialRequest, type CredentialHandoff, type CredentialRequestView } from "../credential-request";
+import { parseWorkRequestView, type WorkRequestCreateBody, type WorkRequestCreateResponse, type WorkRequestListBody, type WorkRequestView } from "../work-request";
 import {
   HEADER_GATEWAY_TOKEN,
   HEADER_GATEWAY_URL,
@@ -22,6 +23,14 @@ import {
  * Turnstile challenge: the install check gives up instead of rendering one into a widget nobody opened.
  */
 export const INSTALL_CHECK_CHALLENGE = "install_check_challenge";
+
+/**
+ * Code of the error {@link ApiClient.workRequestCreate} rejects with when the request may have been
+ * stored: list by its key before sending it again (with the same key).
+ */
+export const WORK_REQUEST_UNKNOWN = "work_request_outcome_unknown";
+/** A work request call that has not answered by then is abandoned (its outcome is unknown). */
+const WORK_REQUEST_TIMEOUT_MS = 20_000;
 
 /** Identity errors after which the signed-in session is dropped and `/session` is requested again. */
 const RENEW_CODES = new Set(["LINK_EXPIRED", "LINK_REVOKED"]);
@@ -421,6 +430,70 @@ export class ApiClient {
     const data = await this.parse<{ control?: unknown; staffOnDuty?: unknown }>(res);
     if (!isHandoffControl(data.control)) throw new ApiError("Invalid response", 502, "bad_response");
     return { control: data.control, staffOnDuty: typeof data.staffOnDuty === "boolean" ? data.staffOnDuty : data.control !== "agent" };
+  }
+
+  /**
+   * Whether a visitor session is held, or stored and still fresh, without asking the backend: receipts
+   * are listed only for a visitor who already has one (listing never opens a session).
+   */
+  hasSession(): boolean {
+    const s = this.session ?? this.stored();
+    return !!s && this.fresh(s);
+  }
+
+  /**
+   * Sends one confirmed work request. The same body with the same key may be sent again: the backend
+   * answers the stored request. Rejects with an {@link ApiError}: code {@link WORK_REQUEST_UNKNOWN}
+   * when the request may have been stored (network failure, timeout, the backend's own
+   * `work_request_outcome_unknown`, a 2xx that cannot be read), else the backend's definite refusal. An
+   * expired session is renewed and the request sent once more with the same key, but a signed-in visitor
+   * whose sign-in ended is refused with `IDENTITY_REQUIRED` instead of being sent as anonymous.
+   */
+  async workRequestCreate(body: WorkRequestCreateBody): Promise<WorkRequestCreateResponse> {
+    // A session that cannot be opened sent nothing; a request that went out and failed may have been stored.
+    const send = () => this.workRequestPost("work-requests", body).catch(() => {
+      throw new ApiError("The request may have been received", 0, WORK_REQUEST_UNKNOWN);
+    });
+    const signedIn = (await this.ensureSession()).verified === true;
+    let res = await send();
+    if (res.status === 401) {
+      // Refused before it reached the control plane: nothing was stored, so a new session may send it, but
+      // a signed-in visitor's request is never sent as anonymous: it waits until they sign in again.
+      this.forgetSession();
+      const renewed = await this.ensureSession();
+      if (signedIn && !renewed.verified) throw new ApiError("Sign in again to send this request", 401, "IDENTITY_REQUIRED");
+      res = await send();
+    }
+    // Only the backend's own "may have been stored" answer is an unknown outcome; any other refusal is final.
+    // Throws: `work_request_outcome_unknown` when the backend says so, else the backend's final refusal.
+    if (!res.ok) await this.parse(res);
+    const data = await res.json().catch(() => null) as { workRequest?: unknown; replayed?: unknown } | null;
+    const view = parseWorkRequestView(data?.workRequest);
+    if (!view) throw new ApiError("The request may have been received", res.status, WORK_REQUEST_UNKNOWN);
+    return { workRequest: view, replayed: data?.replayed === true };
+  }
+
+  /**
+   * The visitor's work requests, newest first; with `idempotencyKey`, the one that key created (if any).
+   * Never opens a session: without one there is nothing to list.
+   */
+  async workRequestList(body: WorkRequestListBody = {}): Promise<WorkRequestView[]> {
+    if (!this.hasSession()) return [];
+    await this.ensureSession();
+    const res = await this.workRequestPost("work-requests/list", body);
+    const data = await this.parse<{ workRequests?: unknown }>(res);
+    if (!Array.isArray(data.workRequests)) throw new ApiError("Invalid response", 502, "bad_response");
+    return data.workRequests.slice(0, 100).map(parseWorkRequestView).filter((v): v is WorkRequestView => v !== null);
+  }
+
+  private async workRequestPost(action: string, body: object): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), WORK_REQUEST_TIMEOUT_MS);
+    try {
+      return await this.request(this.url(action), { method: "POST", headers: await this.headers(true), body: JSON.stringify(body), redirect: "error", signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Never retry a credential action under a newly authenticated identity. */

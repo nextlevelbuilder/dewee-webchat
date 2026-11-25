@@ -9,6 +9,7 @@
 import { stripPageBlock } from "../actions/page-block";
 import { parseCredentialRequest, type CredentialRequestView } from "../credential-request";
 import { parseJobAccessLaunch, type JobAccessLaunch } from "../job-access";
+import { parseWorkRequestKinds, workRequestFromCcp, type WorkRequestCreateResponse, type WorkRequestKind, type WorkRequestView } from "../work-request";
 import { isAdmissionErrorCode, isHandoffControl, isIdentityErrorCode, type AdmissionErrorCode, type AgentInfo, type ChatStreamEvent, type HandoffControl, type HistoryMessage, type IdentityErrorCode, type LinkResponse, type Remediation, type RequestHumanResponse, type ToolCallView } from "../protocol";
 import { CcpClient, CcpError, knownRemediation, readSseJson, type CcpRequest, type CcpRoute } from "./ccp-client";
 import { DEAD_SESSION_CODES, IDENTITY_ERRORS } from "./identity-errors";
@@ -63,6 +64,8 @@ export interface CcpConfig {
   pageContextVersions: number[];
   /** A visitor of the default agent can ask for a person (the host must also advertise `human-handoff`). */
   humanHandoff?: boolean;
+  /** Request kinds a visitor may create; listed by CCP only to a host that advertises `work-requests`. */
+  workRequests?: WorkRequestKind[];
 }
 
 /** Per browser request: what CCP is told about the visitor. */
@@ -103,6 +106,14 @@ const GENERIC_UNAVAILABLE: BrowserError = { status: 502, code: "gateway_error", 
  * generically.
  */
 export function browserErrorFor(e: unknown, route: CcpRoute): BrowserError {
+  const b = mapCcpError(e, route);
+  // A definite refusal of a work request (a CCP 4xx such as integration_unauthorized) is never answered
+  // with a 5xx: the widget reads that as "the request may have been stored".
+  if ((route === "work-requests/create" || route === "work-requests/list") && e instanceof CcpError && e.status >= 400 && e.status < 500 && b.status >= 500) return { ...b, status: 403 };
+  return b;
+}
+
+function mapCcpError(e: unknown, route: CcpRoute): BrowserError {
   if (!(e instanceof CcpError)) {
     console.error(`[dewee-webchat] ccp ${route} failed:`, (e as Error)?.name ?? "error");
     return GENERIC_UNAVAILABLE;
@@ -122,6 +133,10 @@ export function browserErrorFor(e: unknown, route: CcpRoute): BrowserError {
   switch (e.code) {
     case "credential_requests_unavailable":
       return { status: 403, code: e.code, message: "Credential requests are unavailable" };
+    case "work_requests_unavailable":
+      return { status: 403, code: e.code, message: "This request cannot be sent here" };
+    case "idempotency_conflict":
+      return { status: 409, code: e.code, message: "This request was already sent with other details" };
     case "credential_request_not_found":
       return { status: 404, code: e.code, message: "Credential request not found" };
     case "credential_request_not_ready":
@@ -223,6 +238,7 @@ function parseConfig(data: Record<string, any>): CcpConfig {
     maxMessageChars: Number.isInteger(max) && max > 0 ? max : Number.POSITIVE_INFINITY,
     pageContextVersions: Array.isArray(data.page_context?.versions) && data.page_context.versions.includes(1) ? [1] : [],
     humanHandoff: data.human_handoff === true,
+    workRequests: parseWorkRequestKinds(data.work_requests, true),
   };
 }
 
@@ -254,9 +270,11 @@ export type CcpTransport = ReturnType<typeof createCcpTransport>;
 
 /**
  * `humanHandoff`: the host can show a conversation handed to a person, so `human-handoff` is advertised
- * on `chat`, `history` and `request-human`. Off: the header never carries it and nothing changes.
+ * on `chat`, `history` and `request-human`. `workRequests`: the host can show a request form and its
+ * receipts, so `work-requests` is advertised on `config` and the work request routes. Off: the header
+ * never carries them and nothing changes.
  */
-export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps, credentialRequests = false, humanHandoff = false) {
+export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps, credentialRequests = false, humanHandoff = false, workRequests = false) {
   let config: { value: CcpConfig; at: number } | undefined;
   let pendingConfig: Promise<CcpConfig> | undefined;
   const edges = new Map<string, EdgeSession>();
@@ -265,7 +283,7 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
   async function getConfig(): Promise<CcpConfig> {
     if (config && Date.now() - config.at < CONFIG_TTL_MS) return config.value;
     pendingConfig ??= client
-      .json("config")
+      .json("config", { workRequests })
       .then((data) => {
         const value = parseConfig(data);
         config = { value, at: Date.now() };
@@ -421,6 +439,42 @@ export function createCcpTransport(client: CcpClient, identity?: CcpIdentityDeps
       // Nobody on duty is `control: "agent"`; an answer without the flag says so through its control.
       const staffOnDuty = typeof data.staff_on_duty === "boolean" ? data.staff_on_duty : data.control !== "agent";
       return { control: data.control, staffOnDuty };
+    },
+
+    /**
+     * `POST work-requests/create`: stores one confirmed request of the visitor once per idempotency key.
+     * The key goes in the body unchanged (CCP and the runtime key the request by integration, visitor and
+     * key); the payload and summary are forwarded as given and never logged. An answer without a valid
+     * view is `ccp_bad_response` (the request may be stored: the caller treats it as an unknown outcome).
+     */
+    async workRequestCreate(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { kind: string; summary: string; payload: Record<string, unknown>; idempotencyKey: string; conversationId?: string; agent?: string; identitySession?: string }): Promise<WorkRequestCreateResponse> {
+      const body = {
+        kind: input.kind,
+        summary: input.summary,
+        payload: input.payload,
+        idempotency_key: input.idempotencyKey,
+        ...(input.conversationId ? { conversation_id: input.conversationId } : {}),
+        ...withAgent(input.agent),
+        ...(input.identitySession ? { identity_session: input.identitySession } : {}),
+      };
+      const data = await withEdge(ctx, visitorId, sealed, (edge) => client.json<Record<string, unknown>>("work-requests/create", { ...base(ctx), body, session: edge.token, workRequests: true }));
+      const view = workRequestFromCcp(data.work_request);
+      if (!view) throw new CcpError(200, "ccp_bad_response", "CCP work-requests/create: no valid work request");
+      return { workRequest: view, replayed: data.replayed === true };
+    },
+
+    /** `POST work-requests/list`: the visitor's own requests, newest first; views CCP sent malformed are dropped. */
+    async workRequestList(ctx: VisitorContext, visitorId: string, sealed: EdgeSession | undefined, input: { conversationId?: string; idempotencyKey?: string; limit?: number; agent?: string; identitySession?: string }): Promise<WorkRequestView[]> {
+      const body = {
+        ...(input.conversationId ? { conversation_id: input.conversationId } : {}),
+        ...(input.idempotencyKey ? { idempotency_key: input.idempotencyKey } : {}),
+        ...(input.limit ? { limit: input.limit } : {}),
+        ...withAgent(input.agent),
+        ...(input.identitySession ? { identity_session: input.identitySession } : {}),
+      };
+      const data = await withEdge(ctx, visitorId, sealed, (edge) => client.json<Record<string, unknown>>("work-requests/list", { ...base(ctx), body, session: edge.token, workRequests: true }));
+      if (!Array.isArray(data.work_requests)) throw new CcpError(200, "ccp_bad_response", "CCP work-requests/list: no list");
+      return data.work_requests.slice(0, 100).map(workRequestFromCcp).filter((v): v is WorkRequestView => v !== null);
     },
 
     /**

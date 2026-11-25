@@ -56,4 +56,11 @@ export type {
   Remediation,
   RequestHumanResponse,
   SessionResponse,
+  WorkRequestCreateBody,
+  WorkRequestCreateResponse,
+  WorkRequestKind,
+  WorkRequestListBody,
+  WorkRequestListResponse,
+  WorkRequestState,
+  WorkRequestView,
 } from "../protocol";

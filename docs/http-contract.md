@@ -451,12 +451,15 @@ until the pages that embed the widget use it.
 
 An agent may ask a colleague agent of the same integration (its `room_ask` tool). The colleague's
 answer reaches the conversation after the visitor's run has ended, as one more agent reply in
-`/history`; nothing is streamed for it. After a finished run that called `room_ask`, the widget reads
-`/history` every 4 s for up to 6 minutes. When the integration hides tool activity and `/config` lists
-at least two agents, a run with no visible tool call may also have asked, so the widget reads
-`/history` the same way but backs off to 30 s. Reading stops at the first new agent reply, on another
-conversation, agent or visitor, and pauses while the tab is hidden. This works with or without
-`humanHandoff`; an integration with one agent is never read this way.
+`/history`; nothing is streamed for it. After a finished run that called `room_ask` (visible when the
+integration shows tool activity), the widget reads `/history` every 4 s for up to 6 minutes. The
+widget is not told whether tool activity is hidden, so after a run with no visible tool call on an
+integration whose `/config` lists at least two agents, it reads `/history` only 3 times, 30 s apart.
+Reading stops at the first agent reply newer than the run (after the run's own reply, or written
+after it ended), on another conversation, agent or visitor, after a run the visitor stopped, and on a
+`401` or `403`. A failed read backs off, and a `429` waits at least as long as `Retry-After` says. It
+pauses while the tab is hidden. This works with or without `humanHandoff`; an integration with one
+agent is never read this way.
 
 ## Business requests / callback
 

@@ -106,6 +106,12 @@ export interface Strings {
     sending: string;
     checking: string;
     unconfirmed: string;
+    /** The outcome is unknown and checking it failed too: only "check again" is offered. */
+    unchecked: string;
+    /** The visitor must sign in again; the request is kept. */
+    signIn: string;
+    /** The form could not open (no visitor session). */
+    openFailed: string;
     checkAgain: string;
     sendAgain: string;
     failed: string;
@@ -121,7 +127,7 @@ export interface Strings {
     dueLocal: (time: string, zone: string) => string;
     contactHint: string;
     note: string;
-    states: Record<"received" | "in_progress" | "waiting" | "resolved" | "cancelled", string>;
+    states: Record<"received" | "in_progress" | "waiting" | "resolved" | "cancelled" | "updated", string>;
     /** Announced when a receipt's state changed. */
     changed: (code: string, state: string) => string;
   };
@@ -239,6 +245,9 @@ const en: Strings = {
     sending: "Sending your request…",
     checking: "Checking whether your request was received…",
     unconfirmed: "We couldn't confirm that your request was received. Check again, or send it again: it won't be sent twice.",
+    unchecked: "We couldn't confirm yet that your request was received. Check again in a moment.",
+    signIn: "Please sign in again to send this request. What you entered is not sent until then.",
+    openFailed: "The form couldn't open. Please try again.",
     checkAgain: "Check again",
     sendAgain: "Send again",
     failed: "Your request wasn't sent. Please try again.",
@@ -252,7 +261,7 @@ const en: Strings = {
     dueLocal: (time, zone) => `${time} ${zone} time`,
     contactHint: "Contact",
     note: "Note",
-    states: { received: "Received", in_progress: "In progress", waiting: "On hold", resolved: "Resolved", cancelled: "Cancelled" },
+    states: { received: "Received", in_progress: "In progress", waiting: "On hold", resolved: "Resolved", cancelled: "Cancelled", updated: "Updated" },
     changed: (code, state) => `Request ${code}: ${state}`,
   },
 };
@@ -369,6 +378,9 @@ const vi: Strings = {
     sending: "Đang gửi yêu cầu…",
     checking: "Đang kiểm tra yêu cầu đã được nhận chưa…",
     unconfirmed: "Chưa xác nhận được yêu cầu đã tới nơi. Bạn bấm Kiểm tra lại hoặc Gửi lại: yêu cầu sẽ không bị gửi trùng.",
+    unchecked: "Chưa xác nhận được yêu cầu đã tới nơi. Bạn bấm Kiểm tra lại sau giây lát nhé.",
+    signIn: "Bạn đăng nhập lại để gửi yêu cầu này nhé. Thông tin chưa được gửi đi.",
+    openFailed: "Chưa mở được biểu mẫu. Bạn thử lại nhé.",
     checkAgain: "Kiểm tra lại",
     sendAgain: "Gửi lại",
     failed: "Yêu cầu chưa được gửi. Bạn thử lại nhé.",
@@ -382,7 +394,7 @@ const vi: Strings = {
     dueLocal: (time, zone) => `${time} giờ ${zone}`,
     contactHint: "Liên hệ",
     note: "Ghi chú",
-    states: { received: "Đã nhận", in_progress: "Đang xử lý", waiting: "Đang tạm chờ", resolved: "Đã giải quyết", cancelled: "Đã hủy" },
+    states: { received: "Đã nhận", in_progress: "Đang xử lý", waiting: "Đang tạm chờ", resolved: "Đã giải quyết", cancelled: "Đã hủy", updated: "Đã cập nhật" },
     changed: (code, state) => `Yêu cầu ${code}: ${state}`,
   },
 };

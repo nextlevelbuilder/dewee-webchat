@@ -284,6 +284,7 @@ details > summary svg.ic { width: 14px; height: 14px; flex: none; }
 .wr-receipt[data-state="waiting"] .wr-dot { background: var(--dw-muted); }
 .wr-receipt[data-state="resolved"] .wr-dot { background: #13a06f; }
 .wr-receipt[data-state="cancelled"] .wr-dot { background: transparent; border: 1.5px solid var(--dw-muted); }
+.wr-receipt[data-state="updated"] .wr-dot { background: var(--dw-muted); }
 .wr-form fieldset { border: 0; margin: 0; padding: 0; }
 .wr-form legend, .wr-field > span { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
 .wr-intro { margin: 0; font-size: 13px; line-height: 1.5; color: var(--dw-muted); }
@@ -303,7 +304,7 @@ details > summary svg.ic { width: 14px; height: 14px; flex: none; }
 .wr-contact:disabled, .wr-purpose:disabled { opacity: .7; }
 .wr-error { margin: 4px 0 0; font-size: 12.5px; line-height: 1.4; color: #c2334f; }
 .wr-status { min-height: 0; margin: 10px 0 0; font-size: 13px; line-height: 1.45; color: var(--dw-muted); }
-.wr-status[data-phase="failed"], .wr-status[data-phase="unconfirmed"] { color: #b06f00; }
+.wr-status[data-phase="failed"], .wr-status[data-phase="unconfirmed"], .wr-status[data-phase="signin"] { color: #b06f00; }
 .wr-form .confirm-buttons { flex-wrap: wrap; }
 .wr-form .btn[aria-disabled="true"] { opacity: .6; cursor: default; }
 @media (max-width: 400px) {

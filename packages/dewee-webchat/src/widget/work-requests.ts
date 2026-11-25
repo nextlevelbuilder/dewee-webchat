@@ -4,6 +4,7 @@
 // conversation and from any human takeover: ending a takeover, staff going off duty or a new
 // conversation never changes it. Only the server's view sets a code, a state or a due time.
 import { callbackFieldError, type WorkRequestCreateBody, type WorkRequestCreateResponse, type WorkRequestKind, type WorkRequestView } from "../work-request";
+import { isIdentityErrorCode } from "../protocol";
 import { ApiError, WORK_REQUEST_UNKNOWN, type ApiClient } from "./api-client";
 import { claimKey, draftId, draftsFor, dropDraft } from "./work-request-draft";
 import { CallbackForm, type CallbackFormValues } from "./work-request-form";
@@ -46,9 +47,12 @@ export function formatDue(iso: string, zone: string, locale: string | undefined,
   const at = new Date(iso);
   if (!iso || Number.isNaN(at.getTime())) return "";
   try {
-    const local = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(at);
-    const mine = new Intl.DateTimeFormat().resolvedOptions().timeZone;
-    if (!zone || zone === mine) return local;
+    const style = { dateStyle: "medium", timeStyle: "short" } as const;
+    const local = new Intl.DateTimeFormat(locale, style).format(at);
+    if (!zone) return local;
+    // The same wall-clock time in both zones (the same zone, or an alias of it such as Asia/Saigon for
+    // Asia/Ho_Chi_Minh) is shown once.
+    if (new Intl.DateTimeFormat(locale, { ...style, timeZone: zone }).format(at) === local) return local;
     const theirs = new Intl.DateTimeFormat(locale, { timeStyle: "short", timeZone: zone }).format(at);
     return `${local} (${s.dueLocal(theirs, zone)})`;
   } catch {
@@ -56,7 +60,8 @@ export function formatDue(iso: string, zone: string, locale: string | undefined,
   }
 }
 
-type Phase = "idle" | "sending" | "checking" | "unconfirmed" | "failed";
+/** `signin`: refused because the visitor must sign in again; the intent and its key are kept for then. */
+type Phase = "idle" | "sending" | "checking" | "unconfirmed" | "failed" | "signin";
 
 export class WorkRequests {
   private kinds: WorkRequestKind[] = [];
@@ -66,6 +71,12 @@ export class WorkRequests {
   /** What the visitor typed, kept in memory while the form is closed and reopened; never stored. */
   private values: CallbackFormValues | null = null;
   private phase: Phase = "idle";
+  /** What the form last said (shown again when it is reopened). */
+  private message = "";
+  /** A list by the key answered since the outcome became unknown: only then may the same request be sent again. */
+  private reconciled = false;
+  /** The visitor session is being opened before the form is shown. */
+  private opening = false;
   /** The body sent under the current key: sent again unchanged until the outcome is known. */
   private frozen: WorkRequestCreateBody | null = null;
   private lastRead = 0;
@@ -106,6 +117,9 @@ export class WorkRequests {
     this.values = null;
     this.frozen = null;
     this.phase = "idle";
+    this.message = "";
+    this.reconciled = false;
+    this.opening = false;
     this.receipts.clear();
     this.lastRead = 0;
     this.reading = null;
@@ -161,23 +175,49 @@ export class WorkRequests {
 
   // ---------- form ----------
 
-  private openForm(): void {
-    const kind = this.callback;
-    if (!kind) return;
+  /**
+   * Opens the form once the visitor holds a session: a Turnstile challenge that opening it needs shows in
+   * the widget's usual place, never under the dialog.
+   */
+  private async openForm(): Promise<void> {
+    if (!this.callback || this.opening) return;
     if (this.form) { this.form.focusFirst(); return; }
+    const generation = this.generation;
+    this.opening = true;
+    try {
+      await this.host.client().ensureSession();
+    } catch {
+      if (generation === this.generation) this.host.announce(this.host.strings().workRequests.openFailed);
+      return;
+    } finally {
+      if (generation === this.generation) this.opening = false;
+    }
+    const kind = this.callback;
+    if (generation !== this.generation || !kind || this.form) return;
     const s = this.host.strings().workRequests;
     const form = new CallbackForm(s, kind.title, {
       submit: () => void this.submit(),
-      cancel: () => this.closeForm(true),
+      cancel: () => this.cancel(),
       check: () => void this.check(),
       resend: () => void this.send(),
       edit: () => this.edited(),
     });
     this.form = form;
     if (this.values) form.fill(this.values);
-    form.setPhase(this.phase, this.phase === "unconfirmed" ? s.unconfirmed : "");
+    form.setPhase(this.phase, this.message, this.reconciled);
     this.host.panel.appendChild(form.root);
     form.focusFirst();
+  }
+
+  /** The visitor closed the form. A definitely refused request is abandoned: its key is not looked up again. */
+  private cancel(): void {
+    if (this.phase === "failed" && this.frozen) {
+      dropDraft(this.draft(this.frozen.kind), this.frozen.idempotencyKey);
+      this.frozen = null;
+      this.phase = "idle";
+      this.message = "";
+    }
+    this.closeForm(true);
   }
 
   /** Closes the form; what the visitor typed stays in memory for this page view, unless the request was recorded. */
@@ -195,10 +235,12 @@ export class WorkRequests {
 
   /** A definite refusal keeps its key until the visitor changes what they send: then it is a new intent. */
   private edited(): void {
-    if (this.phase !== "failed" || !this.frozen) return;
-    dropDraft(this.draft(this.frozen.kind), this.frozen.idempotencyKey);
+    if ((this.phase !== "failed" && this.phase !== "signin") || !this.frozen) return;
+    // A request refused for a sign-in was never stored: its key stays for the edited request.
+    if (this.phase === "failed") dropDraft(this.draft(this.frozen.kind), this.frozen.idempotencyKey);
     this.frozen = null;
     this.phase = "idle";
+    this.message = "";
     this.form?.setPhase("idle");
   }
 
@@ -215,7 +257,7 @@ export class WorkRequests {
     const field = callbackFieldError(v);
     form.fieldError(field);
     if (field) return;
-    if (!this.frozen) {
+    if (this.phase === "idle" || !this.frozen) {
       const purpose = v.purpose.trim();
       const conversation = this.host.conversation();
       this.frozen = {
@@ -233,6 +275,8 @@ export class WorkRequests {
   private async send(): Promise<void> {
     const body = this.frozen;
     if (!body || this.phase === "sending" || this.phase === "checking") return;
+    // Sent again only once a check by the key answered (and did not find it).
+    if (this.phase === "unconfirmed" && !this.reconciled) return;
     const s = this.host.strings().workRequests;
     const generation = this.generation;
     this.setPhase("sending", s.sending);
@@ -244,16 +288,21 @@ export class WorkRequests {
         // Not one of the visitor's conversations (another visitor's session now): nothing was stored, so
         // the request is sent once more on its own, with the same key.
         if (!(error instanceof ApiError && error.status === 404 && error.code === "not_found" && body.conversationId)) throw error;
+        if (generation !== this.generation) return;
         const { conversationId: _c, agent: _a, ...alone } = body;
         this.frozen = alone;
-        if (generation !== this.generation) return;
         result = await this.host.client().workRequestCreate(alone);
       }
     } catch (error) {
       if (generation !== this.generation) return;
       const code = error instanceof ApiError ? error.code : undefined;
-      if (code === WORK_REQUEST_UNKNOWN) return void (await this.check(true));
+      if (code === WORK_REQUEST_UNKNOWN) {
+        this.reconciled = false;
+        return void (await this.check(true));
+      }
       if (code === "idempotency_conflict") return void (await this.conflict());
+      // A signed-in visitor whose sign-in ended is never sent as anonymous: the intent waits for the sign-in.
+      if (isIdentityErrorCode(code)) return this.setPhase("signin", s.signIn);
       const status = error instanceof ApiError ? error.status : 0;
       this.setPhase("failed", code === "rate_limited" ? s.limited : code === "work_requests_unavailable" ? s.unavailable
         : status === 400 || status === 413 ? s.invalid : s.failed);
@@ -271,12 +320,15 @@ export class WorkRequests {
     const generation = this.generation;
     this.setPhase("checking", s.checking);
     let found: WorkRequestView | undefined;
+    let answered = false;
     try {
       found = (await this.host.client().workRequestList({ idempotencyKey: body.idempotencyKey, limit: 1 }))[0];
+      answered = true;
     } catch { /* still unknown */ }
     if (generation !== this.generation) return;
+    if (answered) this.reconciled = true;
     if (found) this.recorded(found);
-    else this.setPhase("unconfirmed", s.unconfirmed);
+    else this.setPhase("unconfirmed", this.reconciled ? s.unconfirmed : s.unchecked);
   }
 
   /** The key already holds another request (a draft from before a reload): that one is shown, this content was not sent. */
@@ -300,6 +352,7 @@ export class WorkRequests {
     if (body) dropDraft(this.draft(body.kind), body.idempotencyKey);
     this.frozen = null;
     this.phase = "idle";
+    this.message = "";
     this.closeForm(true);
     this.values = null; // the request is recorded: what the visitor typed is not kept
     const fresh = !this.receipts.has(view.code);
@@ -313,7 +366,8 @@ export class WorkRequests {
 
   private setPhase(phase: Phase, message: string): void {
     this.phase = phase;
-    this.form?.setPhase(phase, message);
+    this.message = message;
+    this.form?.setPhase(phase, message, this.reconciled);
     if (!this.form && message) this.host.announce(message);
   }
 

@@ -22,23 +22,28 @@ const json = (v: unknown, status = 200, headers: Record<string, string> = {}) =>
 const sse = (frames: unknown[]) => new Response(frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 
 interface Stored { visitor: string; key: string; content: string; view: Record<string, string> }
-type Fault = "drop" | "unknown" | "limited" | "unavailable" | "invalid" | "expired" | "hang" | "lost" | "not-mine";
+type Fault = "drop" | "unknown" | "unknown-unstored" | "limited" | "unavailable" | "invalid" | "expired" | "hang" | "lost" | "not-mine" | "server-error" | "link-expired";
 
 let codeSeq = 0;
 const nextCode = () => "WR-" + String(++codeSeq).padStart(8, "0").replace(/[ILOU]/g, "0");
 
 /** A backend that keeps work requests per visitor like the hosts and CCP do. */
-function backend(opts: { feature?: boolean; kinds?: typeof KINDS; handoff?: boolean } = {}) {
+function backend(opts: { feature?: boolean; kinds?: typeof KINDS; handoff?: boolean; identity?: boolean } = {}) {
   const state = {
     requests: [] as Stored[],
     /** One fault per create, applied in order. */
     faults: [] as Fault[],
     listFailures: 0,
+    /** The next lists by key fail (a check of an unknown outcome). */
+    keyListFailures: 0,
     calls: [] as Array<{ path: string; body: any; visitor: string | null }>,
     sessions: 0,
     /** Tokens refused once with 401 (an expired session). */
     expired: new Set<string>(),
     gate: undefined as undefined | Promise<void>,
+    /** `/session` answers signed-in sessions while true (an identity backend with a signed-in user). */
+    signedIn: false,
+    turnstile: false,
   };
   const visitorOf = (init?: RequestInit) => {
     const auth = (init?.headers as Record<string, string> | undefined)?.authorization ?? "";
@@ -51,8 +56,10 @@ function backend(opts: { feature?: boolean; kinds?: typeof KINDS; handoff?: bool
     const body = init?.body ? JSON.parse(String(init.body)) : null;
     const visitor = visitorOf(init);
     state.calls.push({ path, body, visitor });
-    if (path === "config") return json({ ...CONFIG, ...(opts.handoff ? { humanHandoff: true } : {}), ...(opts.feature === false ? {} : { workRequests: opts.kinds ?? KINDS }) });
+    if (path === "config") return json({ ...CONFIG, ...(opts.handoff ? { humanHandoff: true } : {}), ...(opts.identity ? { identity: true } : {}), ...(state.turnstile ? { turnstileSiteKey: "site-key" } : {}), ...(opts.feature === false ? {} : { workRequests: opts.kinds ?? KINDS }) });
     if (path === "session") {
+      if (state.turnstile && !body?.turnstileToken) return json({ error: { code: "turnstile_required", message: "Verification required" } }, 403);
+      if (state.signedIn) return json({ visitorId: "u1", token: `tok-${100 + ++state.sessions}`, expiresAt: Date.now() + 3_600_000, expiresIn: 3_600_000, verified: true });
       const reused = typeof body?.token === "string" && /^tok-\d+$/.test(body.token) ? body.token : `tok-${++state.sessions}`;
       return json({ visitorId: `v${reused.slice(4)}`, token: reused, expiresAt: Date.now() + 86_400_000 });
     }
@@ -63,6 +70,10 @@ function backend(opts: { feature?: boolean; kinds?: typeof KINDS; handoff?: bool
     const token = `tok-${visitor.slice(1)}`;
     if (path === "work-requests") {
       const fault = state.faults.shift();
+      if (state.gate) await state.gate;
+      if (fault === "link-expired") return json({ error: { code: "LINK_EXPIRED", message: "Your session expired" } }, 401);
+      if (fault === "server-error") return json({ error: { code: "not_configured", message: "Chat is not configured" } }, 500);
+      if (fault === "unknown-unstored") return json({ error: { code: "work_request_outcome_unknown", message: "The request may have been received." } }, 503, { "retry-after": "5" });
       if (fault === "expired" || state.expired.has(token)) {
         state.expired.delete(token);
         return json({ error: { code: "unauthorized", message: "Missing or expired visitor session" } }, 401);
@@ -71,7 +82,6 @@ function backend(opts: { feature?: boolean; kinds?: typeof KINDS; handoff?: bool
       if (fault === "unavailable") return json({ error: { code: "work_requests_unavailable", message: "This request cannot be sent here" } }, 403);
       if (fault === "not-mine" && body.conversationId) return json({ error: { code: "not_found", message: "Not found" } }, 404);
       if (fault === "invalid") return json({ error: { code: "bad_request", message: "Invalid request" } }, 400);
-      if (state.gate) await state.gate;
       if (fault === "lost") return new Promise<Response>(() => {}); // never reaches the server
       const content = JSON.stringify([body.kind, body.payload, body.summary, body.conversationId ?? ""]);
       const same = state.requests.find((r) => r.visitor === visitor && r.key === body.idempotencyKey);
@@ -91,6 +101,10 @@ function backend(opts: { feature?: boolean; kinds?: typeof KINDS; handoff?: bool
       return json({ workRequest: view, replayed: false }, 201);
     }
     if (path === "work-requests/list") {
+      if (body.idempotencyKey && state.keyListFailures > 0) {
+        state.keyListFailures--;
+        return json({ error: { code: "gateway_error", message: "Dewee is unavailable" } }, 502);
+      }
       if (state.listFailures > 0) {
         state.listFailures--;
         return json({ error: { code: "gateway_error", message: "Dewee is unavailable" } }, 502);
@@ -145,7 +159,10 @@ const receiptText = (r: HTMLElement) => ({
 
 /** Opens the form and fills it like a visitor. */
 async function fill(el: DeweeChatElement, v: { method?: string; contact?: string; purpose?: string; consent?: boolean } = {}) {
-  if (!dialog(el)) entry(el).click();
+  if (!dialog(el)) {
+    entry(el).click();
+    await settle();
+  }
   const d = dialog(el)!;
   const method = v.method ?? "phone";
   const radio = d.querySelector<HTMLInputElement>(`input[type=radio][value="${method}"]`)!;
@@ -174,11 +191,15 @@ beforeEach(() => {
   events.length = 0;
   consoleSpies = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
 });
-afterEach(() => {
-  // Focus leaves the widgets before they are removed, as a browser would move it.
+/** Focus leaves the widgets, as a browser moves it (happy-dom fails to read a focus held in another widget). */
+function blurWidgets() {
   let active = document.activeElement as (HTMLElement & { shadowRoot: ShadowRoot | null }) | null;
   while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement as typeof active;
   active?.blur?.();
+}
+
+afterEach(() => {
+  blurWidgets();
   document.body.innerHTML = "";
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -222,6 +243,7 @@ describe("<dewee-chat> callback request", () => {
     expect($(el, ".wr-hint")!.textContent).toBe("No one is available right now. You can ask us to call you back.");
     expect(b.lists()).toHaveLength(0); // no session yet: nothing to list, none opened for it
     entry(el).click();
+    await settle();
     const d = dialog(el)!;
     const form = d.querySelector("form")!;
     expect(form.getAttribute("role")).toBe("dialog");
@@ -346,32 +368,177 @@ describe("<dewee-chat> callback request", () => {
     expect(dialog(el)).toBeNull();
   });
 
-  it("an outcome it cannot confirm offers check again and send again, both with the same key and content", async () => {
+  it("an outcome it cannot confirm and could not check offers only check again, which finds the stored request", async () => {
     const b = backend();
     const el = await mount();
     b.state.faults.push("unknown");
-    b.state.listFailures = 1; // the automatic check fails too
+    b.state.keyListFailures = 1; // the automatic check fails too
+    await fill(el);
+    submit(el);
+    await settle();
+    const d = dialog(el)!;
+    expect(d.querySelector(".wr-status")!.textContent).toBe("We couldn't confirm yet that your request was received. Check again in a moment.");
+    expect(d.querySelector<HTMLInputElement>(".wr-contact")!.disabled).toBe(true);
+    expect(d.querySelector<HTMLButtonElement>(".wr-check")!.hidden).toBe(false);
+    expect(d.querySelector<HTMLButtonElement>(".wr-submit")!.hidden).toBe(true);
+    submit(el); // Enter in the form: nothing is sent while no check answered
+    await settle();
+    expect(b.creates()).toHaveLength(1);
+    expect(receipts(el)).toHaveLength(0); // no code before the server confirms one
+    // Closed and reopened: still unconfirmed, nothing lost.
+    d.querySelector<HTMLButtonElement>(".wr-cancel")!.click();
+    entry(el).click();
+    await settle();
+    expect(dialog(el)!.querySelector<HTMLButtonElement>(".wr-submit")!.hidden).toBe(true);
+    // The fields are locked: the focus still goes into the dialog, on the first control that can take it.
+    expect(dialog(el)!.contains(el.shadowRoot!.activeElement)).toBe(true);
+    dialog(el)!.querySelector<HTMLButtonElement>(".wr-check")!.click();
+    await settle();
+    expect(b.creates()).toHaveLength(1);
+    expect(b.state.requests).toHaveLength(1);
+    expect(receipts(el)).toHaveLength(1);
+  });
+
+  it("once a check found nothing, send again resends the same key and content", async () => {
+    const b = backend();
+    const el = await mount();
+    b.state.faults.push("unknown-unstored");
     await fill(el);
     submit(el);
     await settle();
     const d = dialog(el)!;
     expect(d.querySelector(".wr-status")!.textContent).toBe("We couldn't confirm that your request was received. Check again, or send it again: it won't be sent twice.");
-    expect(d.querySelector<HTMLInputElement>(".wr-contact")!.disabled).toBe(true);
-    expect(d.querySelector<HTMLButtonElement>(".wr-check")!.hidden).toBe(false);
+    expect(d.querySelector<HTMLButtonElement>(".wr-submit")!.hidden).toBe(false);
     expect(d.querySelector(".wr-submit")!.textContent).toBe("Send again");
-    expect(receipts(el)).toHaveLength(0); // no code before the server confirms one
-    // Closed and reopened: still unconfirmed, nothing lost.
-    d.querySelector<HTMLButtonElement>(".wr-cancel")!.click();
-    entry(el).click();
-    expect(dialog(el)!.querySelector(".wr-submit")!.textContent).toBe("Send again");
-    // The fields are locked: the focus still goes into the dialog, on the first control that can take it.
-    expect(dialog(el)!.contains(el.shadowRoot!.activeElement)).toBe(true);
     submit(el); // send again
     await settle();
     expect(b.creates()).toHaveLength(2);
     expect(b.creates()[1].body).toEqual(b.creates()[0].body);
     expect(b.state.requests).toHaveLength(1);
     expect(receipts(el)).toHaveLength(1);
+  });
+
+  it("treats a server error without the unknown-outcome code as a refusal, not as a request that may be stored", async () => {
+    const b = backend();
+    const el = await mount();
+    b.state.faults.push("server-error");
+    await fill(el);
+    submit(el);
+    await settle();
+    expect(dialog(el)!.querySelector(".wr-status")!.textContent).toBe("Your request wasn't sent. Please try again.");
+    expect(b.lists().filter((c) => c.body.idempotencyKey)).toHaveLength(0);
+  });
+
+  it("drops the key of a refused request the visitor closes, so it is not looked up again", async () => {
+    const b = backend();
+    const el = await mount();
+    b.state.faults.push("limited");
+    await fill(el);
+    submit(el);
+    await settle();
+    expect(Object.keys(sessionStorage).filter((k) => k.startsWith("dewee-webchat:wr-draft:"))).toHaveLength(1);
+    dialog(el)!.querySelector<HTMLButtonElement>(".wr-cancel")!.click();
+    expect(Object.keys(sessionStorage).filter((k) => k.startsWith("dewee-webchat:wr-draft:"))).toHaveLength(0);
+    await fill(el);
+    submit(el);
+    await settle();
+    expect(b.creates()[1].body.idempotencyKey).not.toBe(b.creates()[0].body.idempotencyKey);
+  });
+
+  it("after a sign-in or sign-out during a send, the next visitor's request carries only their own details", async () => {
+    const b = backend();
+    const el = await mount();
+    await el.send("hi");
+    await settle();
+    let open!: () => void;
+    b.state.gate = new Promise<void>((r) => { open = r; });
+    b.state.faults.push("not-mine");
+    await fill(el, { contact: "first.visitor@example.test", method: "email", purpose: "First visitor's question" });
+    submit(el);
+    await settle();
+    localStorage.clear();
+    await el.renewSession(); // another visitor now
+    await settle();
+    b.state.gate = undefined;
+    open(); // the first visitor's request is refused for its conversation, after the change
+    await settle();
+    await fill(el, { purpose: "Second visitor's question" });
+    submit(el);
+    await settle();
+    const last = b.creates().at(-1)!;
+    expect(last.visitor).not.toBe(b.creates()[0].visitor);
+    expect(last.body.payload).toEqual({ contact_method: "phone", contact_value: PHONE, purpose: "Second visitor's question", consent: true });
+    expect(JSON.stringify(b.creates().slice(1))).not.toContain("first.visitor");
+  });
+
+  it("opens the visitor session before the form, so a challenge shows in its usual place and never under the dialog", async () => {
+    const b = backend();
+    b.state.turnstile = true;
+    const el = await mount();
+    let solve!: (token: string) => void;
+    vi.stubGlobal("turnstile", { render: (_holder: HTMLElement, o: { callback: (t: string) => void }) => { solve = o.callback; } });
+    entry(el).click();
+    await settle();
+    expect(el.querySelector('[slot="challenge"]')).not.toBeNull();
+    expect(dialog(el)).toBeNull();
+    solve("token");
+    await settle();
+    expect(el.querySelector('[slot="challenge"]')).toBeNull();
+    expect(dialog(el)).not.toBeNull();
+    expect(b.state.calls.filter((c) => c.path === "session").at(-1)!.body.turnstileToken).toBe("token");
+  });
+
+  it("a signed-in visitor whose sign-in ended is never sent as anonymous: the request waits, with its key, for the sign-in", async () => {
+    const b = backend({ identity: true });
+    b.state.signedIn = true;
+    const el = await mount();
+    b.state.faults.push("link-expired");
+    await fill(el);
+    b.state.signedIn = false; // the sign-in ended: /session now answers an anonymous visitor
+    submit(el);
+    await settle();
+    expect(b.creates()).toHaveLength(1);
+    expect(dialog(el)!.querySelector(".wr-status")!.textContent).toBe("Please sign in again to send this request. What you entered is not sent until then.");
+    expect(dialog(el)!.querySelector<HTMLInputElement>(".wr-contact")!.disabled).toBe(false);
+    const key = b.creates()[0].body.idempotencyKey;
+    expect(Object.values(sessionStorage).some((v) => String(v).includes(key))).toBe(true);
+    // Signed in again: the same intent goes out with the same key, for the signed-in visitor.
+    b.state.signedIn = true;
+    await el.renewSession();
+    await settle();
+    await fill(el);
+    submit(el);
+    await settle();
+    expect(b.creates()).toHaveLength(2);
+    expect(b.creates()[1].body.idempotencyKey).toBe(key);
+    expect(receipts(el)).toHaveLength(1);
+  });
+
+  it("two tabs keep separate keys: the same details sent from each are the visitor's two requests", async () => {
+    const b = backend();
+    const tab = (): Storage => {
+      const m = new Map<string, string>();
+      return {
+        get length() { return m.size; }, clear: () => m.clear(), getItem: (k) => m.get(k) ?? null, key: (i) => [...m.keys()][i] ?? null,
+        removeItem: (k) => { m.delete(k); }, setItem: (k, v) => { m.set(k, String(v)); },
+      };
+    };
+    const first = tab();
+    const second = tab();
+    vi.stubGlobal("sessionStorage", first);
+    const one = await mount();
+    await fill(one);
+    submit(one);
+    await settle();
+    vi.stubGlobal("sessionStorage", second);
+    blurWidgets();
+    const two = await mount();
+    await fill(two);
+    submit(two);
+    await settle();
+    expect(b.creates()).toHaveLength(2);
+    expect(b.creates()[1].body.idempotencyKey).not.toBe(b.creates()[0].body.idempotencyKey);
+    expect(b.state.requests).toHaveLength(2);
   });
 
   it("a reload during the send finds the request by the key kept in the tab, which holds no contact data", async () => {
@@ -474,12 +641,37 @@ describe("<dewee-chat> callback request", () => {
     expect(entry(el).textContent).toBe("Nhờ gọi lại");
     expect($(el, ".wr-hint")!.textContent).toBe("Hiện chưa có ai trực. Bạn có thể nhờ chúng tôi gọi lại.");
     entry(el).click();
+    await settle();
     const d = dialog(el)!;
     expect(d.querySelector("legend")!.textContent).toBe("Liên hệ bạn qua đâu?");
     expect(d.querySelector(".wr-contact-label")!.textContent).toBe("Số điện thoại");
     expect(d.querySelector(".wr-submit")!.textContent).toBe("Gửi yêu cầu");
     for (const key of Object.keys(locales.en.workRequests) as Array<keyof typeof locales.en.workRequests>) expect(locales.vi.workRequests[key], key).toBeTruthy();
-    expect(locales.vi.workRequests.states).toEqual({ received: "Đã nhận", in_progress: "Đang xử lý", waiting: "Đang tạm chờ", resolved: "Đã giải quyết", cancelled: "Đã hủy" });
+    expect(locales.vi.workRequests.states).toEqual({ received: "Đã nhận", in_progress: "Đang xử lý", waiting: "Đang tạm chờ", resolved: "Đã giải quyết", cancelled: "Đã hủy", updated: "Đã cập nhật" });
+  });
+});
+
+describe("due time and future states", () => {
+  it("shows the due time once when the business's zone is the visitor's under another name", () => {
+    const tz = process.env.TZ;
+    process.env.TZ = "Asia/Saigon";
+    try {
+      expect(formatDue(DUE, "Asia/Ho_Chi_Minh", "en", locales.en.workRequests)).not.toContain("(");
+      expect(formatDue(DUE, "Europe/Paris", "en", locales.en.workRequests)).toContain("Europe/Paris");
+    } finally {
+      if (tz === undefined) delete process.env.TZ;
+      else process.env.TZ = tz;
+    }
+  });
+
+  it("shows a state this version does not know as a neutral update instead of dropping the request", async () => {
+    const b = backend();
+    const code = b.seed("v7", "callback", "Call me");
+    b.update(code, { state: "escalated_to_partner" });
+    localStorage.setItem("dewee-webchat:session:/api/dewee", JSON.stringify({ visitorId: "v7", token: "tok-7", expiresAt: Date.now() + 86_400_000, obtainedAt: Date.now() }));
+    const el = await mount();
+    expect(receipts(el).map(receiptText)).toEqual([expect.objectContaining({ code, state: "Updated" })]);
+    expect(receipts(el)[0].dataset.state).toBe("updated");
   });
 });
 
@@ -516,7 +708,7 @@ describe("<dewee-chat> receipts", () => {
 
   it("never words a request that is not finished as done", () => {
     for (const s of [locales.en.workRequests, locales.vi.workRequests]) {
-      for (const state of ["received", "in_progress", "waiting"] as const) expect(s.states[state]).not.toMatch(/done|complete|resolved|xong|hoàn tất|giải quyết/i);
+      for (const state of ["received", "in_progress", "waiting", "updated"] as const) expect(s.states[state]).not.toMatch(/done|complete|resolved|xong|hoàn tất|giải quyết/i);
     }
   });
 

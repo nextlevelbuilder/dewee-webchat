@@ -444,27 +444,28 @@ export class ApiClient {
   /**
    * Sends one confirmed work request. The same body with the same key may be sent again: the backend
    * answers the stored request. Rejects with an {@link ApiError}: code {@link WORK_REQUEST_UNKNOWN}
-   * (status 0 or 5xx) when the request may have been stored (network failure, timeout, server error, an
-   * answer that cannot be read), else the backend's definite refusal. An expired session is renewed and
-   * the request sent once more, with the same key.
+   * when the request may have been stored (network failure, timeout, the backend's own
+   * `work_request_outcome_unknown`, a 2xx that cannot be read), else the backend's definite refusal. An
+   * expired session is renewed and the request sent once more with the same key, but a signed-in visitor
+   * whose sign-in ended is refused with `IDENTITY_REQUIRED` instead of being sent as anonymous.
    */
   async workRequestCreate(body: WorkRequestCreateBody): Promise<WorkRequestCreateResponse> {
     // A session that cannot be opened sent nothing; a request that went out and failed may have been stored.
     const send = () => this.workRequestPost("work-requests", body).catch(() => {
       throw new ApiError("The request may have been received", 0, WORK_REQUEST_UNKNOWN);
     });
-    await this.ensureSession();
+    const signedIn = (await this.ensureSession()).verified === true;
     let res = await send();
     if (res.status === 401) {
-      // Refused before it reached the control plane: nothing was stored, so a new session may send it.
+      // Refused before it reached the control plane: nothing was stored, so a new session may send it, but
+      // a signed-in visitor's request is never sent as anonymous: it waits until they sign in again.
       this.forgetSession();
-      await this.ensureSession();
+      const renewed = await this.ensureSession();
+      if (signedIn && !renewed.verified) throw new ApiError("Sign in again to send this request", 401, "IDENTITY_REQUIRED");
       res = await send();
     }
-    if (res.status >= 500 || (res.status >= 300 && res.status < 400)) {
-      await res.body?.cancel().catch(() => {});
-      throw new ApiError("The request may have been received", res.status, WORK_REQUEST_UNKNOWN, undefined, retryAfterOf(undefined, res));
-    }
+    // Only the backend's own "may have been stored" answer is an unknown outcome; any other refusal is final.
+    // Throws: `work_request_outcome_unknown` when the backend says so, else the backend's final refusal.
     if (!res.ok) await this.parse(res);
     const data = await res.json().catch(() => null) as { workRequest?: unknown; replayed?: unknown } | null;
     const view = parseWorkRequestView(data?.workRequest);

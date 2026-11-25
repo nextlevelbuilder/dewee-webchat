@@ -5,7 +5,7 @@
 import { CALLBACK_CONTACT_METHODS, WORK_REQUEST_LIMITS, type CallbackContactMethod } from "../work-request";
 import type { Strings } from "./i18n";
 
-export type CallbackFormPhase = "idle" | "sending" | "checking" | "unconfirmed" | "failed";
+export type CallbackFormPhase = "idle" | "sending" | "checking" | "unconfirmed" | "failed" | "signin";
 export type CallbackField = "contact_method" | "contact_value" | "purpose" | "consent";
 
 export interface CallbackFormValues {
@@ -29,6 +29,7 @@ let seq = 0;
 export class CallbackForm {
   readonly root: HTMLElement;
   private phase: CallbackFormPhase = "idle";
+  private canResend = true;
   private readonly q: <T extends Element>(sel: string) => T;
 
   constructor(private s: Strings["workRequests"], title: string, private h: CallbackFormHandlers) {
@@ -66,7 +67,7 @@ export class CallbackForm {
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       if (this.phase === "sending" || this.phase === "checking") return;
-      if (this.phase === "unconfirmed") this.h.resend();
+      if (this.phase === "unconfirmed") { if (this.canResend) this.h.resend(); }
       else this.h.submit();
     });
     this.q<HTMLButtonElement>(".wr-cancel").addEventListener("click", () => { if (this.phase !== "sending" && this.phase !== "checking") this.h.cancel(); });
@@ -134,9 +135,10 @@ export class CallbackForm {
    * The form's state: fields are locked while a send is in flight and while its outcome is unknown (the
    * same request is sent again, never other content under its key).
    */
-  setPhase(phase: CallbackFormPhase, message = ""): void {
+  setPhase(phase: CallbackFormPhase, message = "", canResend = true): void {
     this.phase = phase;
-    const locked = phase !== "idle" && phase !== "failed";
+    this.canResend = canResend;
+    const locked = phase !== "idle" && phase !== "failed" && phase !== "signin";
     // A field about to be disabled drops the focus: it moves to the submit button, which stays focusable.
     const root = this.root.getRootNode();
     const active = root instanceof ShadowRoot && document.activeElement === root.host ? root.activeElement : null;
@@ -152,6 +154,8 @@ export class CallbackForm {
     submit.textContent = phase === "unconfirmed" ? this.s.sendAgain : this.s.submit;
     cancel.textContent = phase === "unconfirmed" ? this.s.close : this.s.cancel;
     check.hidden = phase !== "unconfirmed";
+    // While the outcome is unknown and no check has answered yet, only "check again" is offered.
+    submit.hidden = phase === "unconfirmed" && !canResend;
     this.root.querySelector("form")!.setAttribute("aria-busy", String(busy));
     const status = this.q<HTMLElement>(".wr-status");
     status.textContent = message;

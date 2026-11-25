@@ -40,6 +40,21 @@ const POLL_MAX_MS = 30_000;
 const POLL_IDLE_LIMIT_MS = 60 * 60_000;
 /** A request nobody on duty took is still watched this long, in case someone comes on duty and accepts it. */
 const UNATTENDED_WATCH_MS = 10 * 60_000;
+/**
+ * A colleague agent asked in a Team Room answers after the visitor's run has ended: the gateway puts
+ * the answer into the conversation once that run is over (it waits up to 30 s for it), through one
+ * more agent turn, and the colleague's own turn may take up to 5 minutes. History is read this long
+ * after a run seen calling `room_ask`, every 4 s, and stops at the first agent reply newer than the run.
+ */
+const COLLEAGUE_WATCH_MS = 6 * 60_000;
+/**
+ * A run with no visible tool call on an integration with several agents may have asked a colleague
+ * (tool activity can be hidden, and the widget is not told): history is read only 3 times, every 30 s.
+ */
+const COLLEAGUE_MAYBE_MS = 95_000;
+const COLLEAGUE_MAYBE_STEP_MS = 30_000;
+/** The tool a run calls to ask a colleague agent. */
+const ROOM_ASK_TOOL = "room_ask";
 /** While the install check waits for a turn, a page capture or a cooldown to end, it looks again this often. */
 const INSTALL_CHECK_WAIT_MS = 250;
 
@@ -252,6 +267,12 @@ export class DeweeChatElement extends ElementBase {
   private unattendedTimer: ReturnType<typeof setTimeout> | undefined;
   /** Until when history is polled although the server last said the agent answers (its answer was not read). */
   private followUntil = 0;
+  /** Until when history is read for a colleague agent's answer (Team Room); 0 = none. */
+  private colleagueUntil = 0;
+  /** The run was seen asking a colleague: history is read at the fastest pace, not backed off. */
+  private colleagueAsked = false;
+  /** The watched run: its reply text and when it ended, to tell a newer agent reply from it. */
+  private colleagueRun: { content: string; endedAt: number } | undefined;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   /** The polling generation whose history read is in flight; a stopped generation's read never blocks a new one. */
   private pollInFlight: number | undefined;
@@ -556,6 +577,8 @@ export class DeweeChatElement extends ElementBase {
       if (reply.yielded && !check && generation === this.credentialGeneration) void this.followYield(reply.yielded);
       if (reply.status === "done" && !reply.dropped) {
         if (reply.actionsHash && reply.ackVisitor && !reply.stopped) this.setAck(reply.actionsHash, reply.ackVisitor);
+        // Before the event: a listener that switches the conversation must find the watch to clear.
+        if (!check && !reply.stopped && generation === this.credentialGeneration && conversationId === this.conversationId) this.watchColleague(reply);
         this.emit("dewee:reply", { content: reply.content, agent: this.agentId, conversationId });
         if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
       }
@@ -735,12 +758,59 @@ export class DeweeChatElement extends ElementBase {
     this.unattendedUntil = 0;
   }
 
+  /**
+   * After a finished run that asked a colleague agent, or may have (tool activity hidden on an
+   * integration with several agents), history is read until the colleague's answer shows up.
+   */
+  private watchColleague(reply: ViewMessage) {
+    const asked = reply.toolCalls?.some((t) => t.name === ROOM_ASK_TOOL) === true;
+    const maybe = !reply.toolCalls?.length && (this.server?.agents.length ?? 0) >= 2;
+    if (!asked && !maybe) return;
+    const now = Date.now();
+    const fast = this.colleagueAsked && now < this.colleagueUntil;
+    this.colleagueAsked = fast || asked;
+    this.colleagueUntil = Math.max(fast ? this.colleagueUntil : 0, now + (asked ? COLLEAGUE_WATCH_MS : COLLEAGUE_MAYBE_MS));
+    this.colleagueRun = { content: reply.content, endedAt: now };
+    this.pollChangedAt = now;
+    this.pollDelay = this.colleagueDelay() ?? POLL_MIN_MS;
+    this.updatePolling();
+  }
+
+  private clearColleague() {
+    this.colleagueUntil = 0;
+    this.colleagueAsked = false;
+    this.colleagueRun = undefined;
+  }
+
+  /** The pace of a colleague watch when only it keeps polling, or undefined when a takeover polls too. */
+  private colleagueDelay(): number | undefined {
+    const now = Date.now();
+    if (now >= this.colleagueUntil) return undefined;
+    if (this.server?.humanHandoff === true && (this.control !== "agent" || now < this.unattendedUntil || now < this.followUntil)) return undefined;
+    return this.colleagueAsked ? POLL_MIN_MS : COLLEAGUE_MAYBE_STEP_MS;
+  }
+
+  /**
+   * Whether history holds an agent reply newer than the watched run: one after the run's own reply,
+   * or, when that reply is not found (the stored text differs), one written after the run ended.
+   */
+  private colleagueAnswered(messages: ViewMessage[]): boolean {
+    const run = this.colleagueRun;
+    if (!run) return false;
+    const agentReply = (m: ViewMessage) => m.role === "assistant" && !m.hidden && !m.authorKind;
+    let own = -1;
+    for (let i = messages.length - 1; i >= 0; i--) if (agentReply(messages[i]) && messages[i].content === run.content) { own = i; break; }
+    if (own >= 0) return messages.slice(own + 1).some(agentReply);
+    return messages.some((m) => agentReply(m) && m.createdAt !== undefined && Date.parse(m.createdAt) > run.endedAt);
+  }
+
   /** Forgets the takeover state of the previous conversation (another conversation, agent or visitor). */
   private resetHandoff() {
     this.stopPolling();
     this.control = "agent";
     this.clearUnattended();
     this.followUntil = 0;
+    this.clearColleague();
     this.handoffBusy = false;
     if (this.els) this.renderHandoff();
   }
@@ -831,11 +901,15 @@ export class DeweeChatElement extends ElementBase {
     }
   }
 
-  /** History is polled while staff are asked or hold the conversation, never on a backend without takeovers. */
+  /**
+   * History is polled while staff are asked or hold the conversation (only on a backend with
+   * takeovers), and while a colleague agent's answer is awaited.
+   */
   private shouldPoll(): boolean {
     const now = Date.now();
-    return this.isConnected && this.server?.humanHandoff === true && document.visibilityState !== "hidden"
-      && (this.control !== "agent" || now < this.unattendedUntil || now < this.followUntil) && now - this.pollChangedAt < POLL_IDLE_LIMIT_MS;
+    const takeover = this.server?.humanHandoff === true && (this.control !== "agent" || now < this.unattendedUntil || now < this.followUntil);
+    return this.isConnected && document.visibilityState !== "hidden"
+      && (takeover || now < this.colleagueUntil) && now - this.pollChangedAt < POLL_IDLE_LIMIT_MS;
   }
 
   private updatePolling(restart = false) {
@@ -858,16 +932,24 @@ export class DeweeChatElement extends ElementBase {
     if (!this.shouldPoll()) return this.stopPolling();
     const generation = this.pollGeneration;
     let changed = false;
+    let failure: ApiError | undefined;
     if (!this.running) {
       this.pollInFlight = generation;
       try {
         changed = (await this.refreshFromHistory()) === true;
-      } catch { /* a failed read backs off like an unchanged one */ }
+      } catch (e) { failure = e instanceof ApiError ? e : new ApiError("history read failed", 0); }
       finally { if (this.pollInFlight === generation) this.pollInFlight = undefined; }
     }
     if (generation !== this.pollGeneration) return;
+    // A refused read ends a colleague watch: reading again would only spend the visitor's budget.
+    if (failure && (failure.status === 401 || failure.status === 403)) this.clearColleague();
     if (changed) this.pollChangedAt = Date.now();
-    this.pollDelay = changed ? POLL_MIN_MS : Math.min(Math.round(this.pollDelay * 1.5), POLL_MAX_MS);
+    const backedOff = Math.min(Math.round(this.pollDelay * 1.5), POLL_MAX_MS);
+    const colleague = this.colleagueDelay();
+    // A failed read backs off; a rate-limited one also waits as long as the server asks.
+    if (failure) this.pollDelay = Math.max(backedOff, failure.status === 429 ? failure.retryAfterMs ?? POLL_MAX_MS : 0);
+    else if (colleague !== undefined) this.pollDelay = changed ? POLL_MIN_MS : colleague;
+    else this.pollDelay = changed ? POLL_MIN_MS : backedOff;
     this.updatePolling();
   }
 
@@ -900,6 +982,7 @@ export class DeweeChatElement extends ElementBase {
       this.renderLog();
       changed = true;
     }
+    if (this.colleagueAnswered(next)) this.clearColleague(); // the awaited answer arrived
     if (history.control) this.setControl(history.control);
     else this.renderHandoff();
     return changed;

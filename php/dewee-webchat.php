@@ -1149,6 +1149,7 @@ final class DeweeWebchat
         $conversation = $fields['conversationId'] ?? null;
         $key = $fields['idempotencyKey'] ?? null;
         $limit = $fields['limit'] ?? null;
+        if (is_float($limit) && is_finite($limit) && floor($limit) === $limit && abs($limit) <= 1000) $limit = (int) $limit;
         if (array_diff(array_keys($fields), ['conversationId', 'idempotencyKey', 'limit', 'agent'])
             || (array_key_exists('conversationId', $fields) && (!is_string($conversation) || !preg_match('/^[A-Za-z0-9_-]{8,64}$/D', $conversation)))
             || (array_key_exists('idempotencyKey', $fields) && (!is_string($key) || !preg_match(self::WORK_REQUEST_KEY_RE, $key)))
@@ -1199,7 +1200,9 @@ final class DeweeWebchat
         if (!is_array($raw) || ($raw !== [] && array_is_list($raw))) return null;
         $code = $raw['code'] ?? null;
         $state = $raw['state'] ?? null;
-        if (!is_string($code) || !preg_match('/^WR-[0-9A-HJKMNP-TV-Z]{8}$/D', $code) || !in_array($state, ['received', 'in_progress', 'waiting', 'resolved', 'cancelled'], true)) return null;
+        if (!is_string($code) || !preg_match('/^WR-[0-9A-HJKMNP-TV-Z]{8}$/D', $code) || !is_string($state) || !preg_match('/^[a-z][a-z_]{0,31}$/D', $state)) return null;
+        // A state added after this version is shown, neutrally, as `updated`, never dropped.
+        if (!in_array($state, ['received', 'in_progress', 'waiting', 'resolved', 'cancelled', 'updated'], true)) $state = 'updated';
         $field = static fn (mixed $v, int $max): string => is_string($v) && self::utf16Length($v) <= $max ? $v : '';
         $pick = static fn (string $camel, string $under): mixed => $raw[$snake ? $under : $camel] ?? null;
         $kind = $field($raw['kind'] ?? null, 64);
@@ -2237,6 +2240,15 @@ final class DeweeWebchat
      * @return array{status: int, code: string, message: string, identity?: bool, remediation?: array{action: string, audience: string}, retryAfterSeconds?: int, admission?: string, retryAfterMs?: int|null}
      */
     public static function ccpBrowserError(Throwable $e, string $route): array
+    {
+        $b = self::ccpBrowserErrorOf($e, $route);
+        // A definite refusal of a work request (a CCP 4xx such as integration_unauthorized) is never
+        // answered with a 5xx: the widget reads that as "the request may have been stored".
+        if (str_starts_with($route, 'work-requests/') && $e instanceof DeweeCcpError && $e->status >= 400 && $e->status < 500 && $b['status'] >= 500) $b['status'] = 403;
+        return $b;
+    }
+
+    private static function ccpBrowserErrorOf(Throwable $e, string $route): array
     {
         $generic = ['status' => 502, 'code' => 'gateway_error', 'message' => 'Dewee is unavailable, try again later'];
         if (!$e instanceof DeweeCcpError) {

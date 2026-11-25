@@ -3,8 +3,9 @@
 // idempotency end to end, the unknown outcome, refusals, and that a host without the option is unchanged.
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { featuresHeader } from "../src/server/ccp-client";
-import { createDeweeHandler, optionsFromEnv, type DeweeHandlerOptions } from "../src/server";
-import { INTEGRATION_ID, INTEGRATION_SECRET, startFakeCcp, type FakeCcp } from "./helpers/fake-ccp-ingress";
+import { createDeweeHandler, optionsFromEnv, verifyVisitorToken, type DeweeHandlerOptions } from "../src/server";
+import { deweeIdentitySdk } from "../src/server/identity";
+import { APP_ID, ASSERTION_SECRET, INTEGRATION_ID, INTEGRATION_SECRET, ISSUER, startFakeCcp, type FakeCcp } from "./helpers/fake-ccp-ingress";
 
 const VISITOR_SECRET = "visitor-secret-NEVER-IN-BROWSER-00000000001";
 const BASE = "https://shop.example/api/dewee";
@@ -215,7 +216,7 @@ describe("work requests: opted-in host", () => {
     const good = makeHandler({ workRequests: true });
     const s = await session(good);
     const r = await h(new Request(`${BASE}/work-requests`, { method: "POST", headers: { authorization: `Bearer ${s.token}` }, body: JSON.stringify(callback()) }));
-    expect([r.status, (await r.json()).error.code]).toEqual([500, "not_configured"]);
+    expect([r.status, (await r.json()).error.code]).toEqual([403, "not_configured"]);
     expect(ccp.state.workRequests.size).toBe(0);
   });
 
@@ -234,5 +235,51 @@ describe("work requests: opted-in host", () => {
     const after = (await list(h, s.token, { conversationId: CONVERSATION })).json().workRequests;
     expect(after.find((v: { code: string }) => v.code === call.code)).toMatchObject({ state: "in_progress", publicNote: "We will call you today." });
     expect(after.find((v: { code: string }) => v.code === quote.code)).toEqual(before.find((v: { code: string }) => v.code === quote.code));
+  });
+});
+
+describe("work requests: signed-in visitors", () => {
+  const signedIn = (extra: { required?: boolean; rebindEachRequest?: boolean } = {}) => {
+    ccp.state.config = { ...ccp.state.config, mode: "signed_in_optional", identity_enabled: true };
+    return makeHandler({
+      workRequests: true,
+      identity: { sdk: deweeIdentitySdk, appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, authenticate: async (req: Request) => (/uid=([^;]+)/.exec(req.headers.get("cookie") ?? "")?.[1] ? { subject: /uid=([^;]+)/.exec(req.headers.get("cookie")!)![1] } : null), ...extra },
+    });
+  };
+  const as = (h: H, path: string, token: string, body: unknown, uid = "alice") =>
+    h(new Request(`${BASE}/${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, cookie: `uid=${uid}` }, body: JSON.stringify(body) }));
+
+  it("forwards the identity session and the bound agent, and keeps the request the signed-in user's", async () => {
+    const h = signedIn();
+    const s = (await h(new Request(`${BASE}/session`, { method: "POST", headers: { cookie: "uid=alice" }, body: "{}" }))).json();
+    expect(s.verified).toBe(true);
+    const ids = (await verifyVisitorToken(VISITOR_SECRET, s.token))?.ids;
+    const { agent: _a, ...noAgent } = callback();
+    const created = await as(h, "work-requests", s.token, noAgent);
+    expect(created.status).toBe(201);
+    expect(ccp.routes("work-requests/create")[0].body).toMatchObject({ idempotency_key: "wr_key_0001abcd", agent: "shop", identity_session: ids });
+    expect([...ccp.state.workRequests.keys()]).toEqual([expect.stringMatching(/^tuc:/)]);
+    const listed = await as(h, "work-requests/list", s.token, {});
+    expect(listed.json().workRequests.map((v: { code: string }) => v.code)).toEqual([created.json().workRequest.code]);
+    expect(ccp.routes("work-requests/list")[0].body).toMatchObject({ agent: "shop", identity_session: ids });
+    // Another agent than the one the sign-in is bound to is refused before CCP.
+    const other = await as(h, "work-requests", s.token, callback({ agent: "support", idempotencyKey: "wr_key_" + "0002abcd" }));
+    expect([other.status, other.json().error.code]).toEqual([403, "agent_not_allowed"]);
+    expect(ccp.routes("work-requests/create")).toHaveLength(1);
+  });
+
+  it("refuses an anonymous visitor where sign-in is required, and a signed-out user's token, with IDENTITY_REQUIRED", async () => {
+    const anonymous = await session(makeHandler({ workRequests: true }));
+    const h = signedIn({ required: true });
+    for (const path of ["work-requests", "work-requests/list"]) {
+      const r = await h(new Request(`${BASE}/${path}`, { method: "POST", headers: { authorization: `Bearer ${anonymous.token}` }, body: JSON.stringify(path === "work-requests" ? callback() : {}) }));
+      expect([r.status, r.json().error.code]).toEqual([401, "IDENTITY_REQUIRED"]);
+    }
+    // A host that checks the login on every request: the user signed out since the session was issued.
+    const rebinding = signedIn({ rebindEachRequest: true });
+    const s = (await rebinding(new Request(`${BASE}/session`, { method: "POST", headers: { cookie: "uid=alice" }, body: "{}" }))).json();
+    const signedOut = await rebinding(new Request(`${BASE}/work-requests`, { method: "POST", headers: { authorization: `Bearer ${s.token}` }, body: JSON.stringify(callback()) }));
+    expect([signedOut.status, signedOut.json().error.code]).toEqual([401, "IDENTITY_REQUIRED"]);
+    expect(ccp.routes("work-requests/create")).toHaveLength(0);
   });
 });

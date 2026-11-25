@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createDeweeHandler } from "../src/server";
+import { workRequestFromCcp } from "../src/work-request";
 import { INTEGRATION_ID, INTEGRATION_SECRET, startFakeCcp, type FakeCcp } from "./helpers/fake-ccp-ingress";
 
 const PHP = process.env.PHP_BIN || "php";
@@ -37,6 +38,9 @@ const freePort = () =>
       s.close(() => r(port));
     });
   });
+
+/** The TS parser's browser view of a CCP view, for comparison. */
+const normalView = (raw: Record<string, string>) => workRequestFromCcp(raw);
 
 interface Answer { status: number; retryAfter: string | null; body: any; text: string }
 /** JSON answers parse; a chat stream (SSE) has no JSON body to compare. */
@@ -150,6 +154,12 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env, 'features
     expect(ccp.seen.filter((r) => r.route.startsWith("work-requests"))).toHaveLength(0);
   });
 
+  it("shows a state added after this version as `updated`, like the TS parser", () => {
+    const raw = { code: "WR-7K3M9P2Q", kind: "callback", summary: "s", state: "escalated_to_partner", received_at: "", respond_due_at: "", due_timezone: "", public_note: "", contact_hint: "", updated_at: "" };
+    const out = php(`echo json_encode([DeweeWebchat::parseWorkRequestView($in['raw'], true), DeweeWebchat::parseWorkRequestView(['state' => 'Bad State!'] + $in['raw'], true)]);`, { raw });
+    expect(out).toEqual([{ ...normalView(raw), state: "updated" }, null]);
+  });
+
   it("matches the TS handler's /config", async () => {
     setOptions({ workRequests: true });
     const ts = createDeweeHandler({ ccp: ccpOptions(), secret: VISITOR_SECRET, rateLimit: false, workRequests: true });
@@ -174,7 +184,7 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env, 'features
       kind: "callback", summary: "  Call me after 5pm  ", agent: "shop", idempotencyKey: "wr_key_" + "0001abcd",
       payload: { contact_method: "phone", contact_value: PHONE, purpose: "Call me after 5pm", consent: true }, ...over,
     });
-    type Step = { path: string; body: unknown; before?: () => void };
+    type Step = { path: string; body: unknown; raw?: string; before?: () => void };
     const steps: Step[] = [
       { path: "/work-requests", body: callback({ conversationId: "conv_wr_php_0001" }) },
       { path: "/work-requests", body: callback({ conversationId: "conv_wr_php_0001" }) },
@@ -205,6 +215,10 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env, 'features
       { path: "/work-requests/list", body: { limit: 0 } },
       { path: "/work-requests/list", body: { limit: 1.5 } },
       { path: "/work-requests/list", body: { other: 1 } },
+      // JSON 2.0 is the number 2 for both hosts.
+      { path: "/work-requests/list", body: null, raw: '{"limit":2.0}' },
+      // A definite CCP refusal is never a 5xx (the widget would read it as "may have been stored").
+      { path: "/work-requests", body: callback({ idempotencyKey: "wr_key_" + "0011abcd" }), before: () => { ccp.state.failNext.set("work-requests/create", { status: 403, code: "integration_disabled" }); } },
     ];
     /** One host's run: its answers and the upstream calls each step made (config reads aside). */
     const run = async (call: (path: string, init?: RequestInit) => Promise<Answer>) => {
@@ -215,7 +229,7 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env, 'features
       for (const step of steps) {
         step.before?.();
         const from = ccp.seen.length;
-        const answer = await call(step.path, { method: "POST", headers: auth, body: JSON.stringify(step.body) });
+        const answer = await call(step.path, { method: "POST", headers: auth, body: step.raw ?? JSON.stringify(step.body) });
         expect(answer.text).not.toMatch(/staff_0193|VIP|leaked-contact|postgres|912 345/);
         const upstream = ccp.seen.slice(from).filter((r) => r.route !== "config" && r.route !== "session")
           .map((r) => ({ route: r.route, features: r.headers["x-dewee-webchat-features"], session: typeof r.headers["x-dewee-webchat-session"] === "string", body: r.body }));
@@ -227,7 +241,7 @@ echo json_encode(['cases' => $r, 'fromEnv' => $fromEnv, 'env' => $env, 'features
     const phpRun = await run(phpCall);
     for (let i = 0; i < steps.length; i++) expect(phpRun[i], `step ${i}: ${JSON.stringify(steps[i].body).slice(0, 80)}`).toEqual(tsRun[i]);
     // A spot check of what the TS run itself answered, so parity is not parity of two wrong answers.
-    expect(tsRun.map((s) => (s.answer as { status: number }).status)).toEqual([201, 200, 409, 201, 503, 503, 200, 200, 200, 403, 404, 400, 429, 503, 201, 502, 400, 413, 400, 400, 413, 400, 400, 400, 400, 400, 400, 400]);
+    expect(tsRun.map((s) => (s.answer as { status: number }).status)).toEqual([201, 200, 409, 201, 503, 503, 200, 200, 200, 403, 404, 400, 429, 503, 201, 502, 400, 413, 400, 400, 413, 400, 400, 400, 400, 400, 400, 400, 200, 403]);
     expect(tsRun[3].upstream).toEqual([{ route: "work-requests/create", features: "work-requests", session: true, body: { kind: "quote", summary: "Quote", payload: {}, idempotency_key: "wr_key_0002abcd" } }]);
   }, 30_000);
 });

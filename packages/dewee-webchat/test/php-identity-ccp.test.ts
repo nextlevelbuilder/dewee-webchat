@@ -23,7 +23,7 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     temp = join(dir, "tmp"); mkdirSync(temp);
     const options = { ccp: { chatUrl: ccp.url, integrationId: INTEGRATION_ID, integrationSecret: INTEGRATION_SECRET }, secret, rateLimit: false, allowedOrigins: '*', identity: { appId: APP_ID, issuer: ISSUER, assertionSecret: ASSERTION_SECRET, rebindEachRequest: true } };
     writeFileSync(join(dir, "options.json"), JSON.stringify(options));
-    writeFileSync(join(dir, "router.php"), `<?php\nrequire ${JSON.stringify(source)};\n$o=json_decode(file_get_contents(__DIR__.'/options.json'),true);\nif (in_array(($_SERVER['HTTP_X_TEST_FEATURE'] ?? ''), ['on','support'], true)) $o['credentialRequests']=['formOrigin'=>'https://app.example'];\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'support') $o['identity']['agent']='support';\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'unicode') $o['credentialRequests']=['formOrigin'=>'https://bücher.example'];\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'punycode') $o['credentialRequests']=['formOrigin'=>'https://xn--bcher-kva.example'];\n$o['identity']['authenticate']=static function(){ $u=$_COOKIE['uid'] ?? null; if ($u === 'boom') throw new RuntimeException('private login error'); return $u ? ['subject'=>$u] : null; };\nif (str_ends_with($_SERVER['REQUEST_URI'], '/logout')) { $body=json_decode(file_get_contents('php://input'),true); DeweeWebchat::revoke($_COOKIE['uid'] ?? '', $body['token'] ?? '', $o); echo '{}'; return; }\nDeweeWebchat::handle($o);\n`);
+    writeFileSync(join(dir, "router.php"), `<?php\nrequire ${JSON.stringify(source)};\n$o=json_decode(file_get_contents(__DIR__.'/options.json'),true);\nif (in_array(($_SERVER['HTTP_X_TEST_FEATURE'] ?? ''), ['on','support'], true)) $o['credentialRequests']=['formOrigin'=>'https://app.example'];\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'support') $o['identity']['agent']='support';\nif (in_array(($_SERVER['HTTP_X_TEST_FEATURE'] ?? ''), ['wr','wr-required'], true)) $o['workRequests']=true;\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'wr-required') $o['identity']['required']=true;\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'unicode') $o['credentialRequests']=['formOrigin'=>'https://bücher.example'];\nif (($_SERVER['HTTP_X_TEST_FEATURE'] ?? '') === 'punycode') $o['credentialRequests']=['formOrigin'=>'https://xn--bcher-kva.example'];\n$o['identity']['authenticate']=static function(){ $u=$_COOKIE['uid'] ?? null; if ($u === 'boom') throw new RuntimeException('private login error'); return $u ? ['subject'=>$u] : null; };\nif (str_ends_with($_SERVER['REQUEST_URI'], '/logout')) { $body=json_decode(file_get_contents('php://input'),true); DeweeWebchat::revoke($_COOKIE['uid'] ?? '', $body['token'] ?? '', $o); echo '{}'; return; }\nDeweeWebchat::handle($o);\n`);
     const port = await new Promise<number>((done) => { const s = createServer().listen(0, "127.0.0.1", () => { const p = (s.address() as { port: number }).port; s.close(() => done(p)); }); });
     base = `http://127.0.0.1:${port}/api/dewee`;
     server = spawn(php, ["-d", `sys_temp_dir=${temp}`, "-S", `127.0.0.1:${port}`, join(dir, "router.php")], { stdio: "ignore" });
@@ -120,6 +120,34 @@ describe.skipIf(!available)("PHP signed-in CCP sessions", () => {
     ccp.state.credentialHandoffUrl = "https://evil.example/credential-requests/open?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     expect((await fetch(`${base}/credential-request-handoff`, { method: "POST", headers, body })).status).toBe(502);
     expect((await fetch(`${base}/credential-request`, { method: "POST", headers: { ...headers, cookie: "uid=user-b" }, body })).status).toBe(401);
+  });
+
+  it("sends work requests for the signed-in user: identity session and bound agent forwarded, another agent or a signed-out user refused", async () => {
+    ccp.state.workRequestKinds = [{ kind: "callback", title: "Call me back", schema: "callback", staffed_now: true }];
+    const issued = await (await session("user-a")).json();
+    const claims = await verifyVisitorToken(secret, issued.token);
+    const headers = { cookie: "uid=user-a", authorization: `Bearer ${issued.token}`, "x-test-feature": "wr" };
+    const body = (over: Record<string, unknown> = {}) => JSON.stringify({ kind: "callback", summary: "Call me", payload: { contact_method: "email", contact_value: "user-a@example.test", purpose: "Call me", consent: true }, idempotencyKey: "wr_key_" + "php0001", ...over });
+    const created = await fetch(`${base}/work-requests`, { method: "POST", headers, body: body() });
+    expect(created.status).toBe(201);
+    expect(ccp.routes("work-requests/create").at(-1)?.body).toMatchObject({ idempotency_key: "wr_key_php0001", agent: "shop", identity_session: claims?.ids });
+    expect(ccp.routes("work-requests/create").at(-1)?.headers["x-dewee-webchat-features"]).toBe("work-requests");
+    const code = (await created.json()).workRequest.code;
+    const listed = await fetch(`${base}/work-requests/list`, { method: "POST", headers, body: "{}" });
+    expect((await listed.json()).workRequests.map((v: { code: string }) => v.code)).toEqual([code]);
+    expect(ccp.routes("work-requests/list").at(-1)?.body).toMatchObject({ agent: "shop", identity_session: claims?.ids });
+    const other = await fetch(`${base}/work-requests`, { method: "POST", headers, body: body({ agent: "support", idempotencyKey: "wr_key_" + "php0002" }) });
+    expect([other.status, (await other.json()).error.code]).toEqual([403, "agent_not_allowed"]);
+    // This host checks the login on every request: a user who signed out is refused, never sent as anonymous.
+    const signedOut = await fetch(`${base}/work-requests`, { method: "POST", headers: { authorization: `Bearer ${issued.token}`, "x-test-feature": "wr" }, body: body({ idempotencyKey: "wr_key_" + "php0003" }) });
+    expect([signedOut.status, (await signedOut.json()).error.code]).toEqual([401, "IDENTITY_REQUIRED"]);
+    // Where sign-in is required, an anonymous visitor is refused on both routes.
+    const anonymous = await (await session()).json();
+    for (const path of ["work-requests", "work-requests/list"]) {
+      const r = await fetch(`${base}/${path}`, { method: "POST", headers: { authorization: `Bearer ${anonymous.token}`, "x-test-feature": "wr-required" }, body: path === "work-requests" ? body({ idempotencyKey: "wr_key_" + "php0004" }) : "{}" });
+      expect([r.status, (await r.json()).error.code]).toEqual([401, "IDENTITY_REQUIRED"]);
+    }
+    expect(ccp.routes("work-requests/create")).toHaveLength(1);
   });
 
   it("requires the current identity for member proof and keeps the code out of chat", async () => {

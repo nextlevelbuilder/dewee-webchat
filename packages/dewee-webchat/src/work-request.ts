@@ -15,10 +15,15 @@ export interface WorkRequestKind {
   staffedNow: boolean;
 }
 
-/** A request's state as the visitor sees it. Only `resolved` and `cancelled` are final. */
-export type WorkRequestState = "received" | "in_progress" | "waiting" | "resolved" | "cancelled";
+/**
+ * A request's state as the visitor sees it. Only `resolved` and `cancelled` are final. `updated` stands
+ * for a state the control plane added after this version: the request is shown, neutrally, never dropped.
+ */
+export type WorkRequestState = "received" | "in_progress" | "waiting" | "resolved" | "cancelled" | "updated";
 
-export const WORK_REQUEST_STATES: readonly WorkRequestState[] = ["received", "in_progress", "waiting", "resolved", "cancelled"];
+export const WORK_REQUEST_STATES: readonly WorkRequestState[] = ["received", "in_progress", "waiting", "resolved", "cancelled", "updated"];
+/** What a state this version does not know looks like (it is shown as `updated`). */
+const FUTURE_STATE_RE = /^[a-z][a-z_]{0,31}$/;
 
 /**
  * A receipt: what the visitor may see of one of their requests. Never the assignee, an internal note,
@@ -111,13 +116,13 @@ function view(raw: unknown, snake: boolean): WorkRequestView | null {
   const pick = (camel: string, under: string) => r[snake ? under : camel];
   const code = r.code;
   const state = r.state;
-  if (typeof code !== "string" || !WORK_REQUEST_CODE_RE.test(code) || typeof state !== "string" || !(WORK_REQUEST_STATES as readonly string[]).includes(state)) return null;
+  if (typeof code !== "string" || !WORK_REQUEST_CODE_RE.test(code) || typeof state !== "string" || !FUTURE_STATE_RE.test(state)) return null;
   const kind = field(r.kind, 64);
   return {
     code,
     kind: WORK_REQUEST_KIND_RE.test(kind) ? kind : "",
     summary: field(r.summary, 2000),
-    state: state as WorkRequestState,
+    state: (WORK_REQUEST_STATES as readonly string[]).includes(state) ? (state as WorkRequestState) : "updated",
     receivedAt: field(pick("receivedAt", "received_at"), 64),
     respondDueAt: field(pick("respondDueAt", "respond_due_at"), 64),
     dueTimezone: field(pick("dueTimezone", "due_timezone"), 64),

@@ -106,6 +106,14 @@ const GENERIC_UNAVAILABLE: BrowserError = { status: 502, code: "gateway_error", 
  * generically.
  */
 export function browserErrorFor(e: unknown, route: CcpRoute): BrowserError {
+  const b = mapCcpError(e, route);
+  // A definite refusal of a work request (a CCP 4xx such as integration_unauthorized) is never answered
+  // with a 5xx: the widget reads that as "the request may have been stored".
+  if ((route === "work-requests/create" || route === "work-requests/list") && e instanceof CcpError && e.status >= 400 && e.status < 500 && b.status >= 500) return { ...b, status: 403 };
+  return b;
+}
+
+function mapCcpError(e: unknown, route: CcpRoute): BrowserError {
   if (!(e instanceof CcpError)) {
     console.error(`[dewee-webchat] ccp ${route} failed:`, (e as Error)?.name ?? "error");
     return GENERIC_UNAVAILABLE;

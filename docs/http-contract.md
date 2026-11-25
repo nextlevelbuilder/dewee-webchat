@@ -447,6 +447,17 @@ person with its tool) or ends `cancelled` makes the widget read the history and 
 widget does not understand the `202` held answer. Pin at least that version, or keep the option off
 until the pages that embed the widget use it.
 
+## Colleague agent answers (Team Room)
+
+An agent may ask a colleague agent of the same integration (its `room_ask` tool). The colleague's
+answer reaches the conversation after the visitor's run has ended, as one more agent reply in
+`/history`; nothing is streamed for it. After a finished run that called `room_ask`, the widget reads
+`/history` every 4 s for up to 6 minutes. When the integration hides tool activity and `/config` lists
+at least two agents, a run with no visible tool call may also have asked, so the widget reads
+`/history` the same way but backs off to 30 s. Reading stops at the first new agent reply, on another
+conversation, agent or visitor, and pauses while the tab is hidden. This works with or without
+`humanHandoff`; an integration with one agent is never read this way.
+
 ## Business requests / callback
 
 A visitor can leave a business request, such as "call me back", that the control plane stores as its

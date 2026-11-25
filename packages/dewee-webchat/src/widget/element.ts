@@ -40,6 +40,15 @@ const POLL_MAX_MS = 30_000;
 const POLL_IDLE_LIMIT_MS = 60 * 60_000;
 /** A request nobody on duty took is still watched this long, in case someone comes on duty and accepts it. */
 const UNATTENDED_WATCH_MS = 10 * 60_000;
+/**
+ * A colleague agent asked in a Team Room answers after the visitor's run has ended: the gateway puts
+ * the answer into the conversation once that run is over (it waits up to 30 s for it), through one
+ * more agent turn, and the colleague's own turn may take up to 5 minutes. History is read this long
+ * after such a run, and stops at the first new agent reply.
+ */
+const COLLEAGUE_WATCH_MS = 6 * 60_000;
+/** The tool a run calls to ask a colleague agent. */
+const ROOM_ASK_TOOL = "room_ask";
 /** While the install check waits for a turn, a page capture or a cooldown to end, it looks again this often. */
 const INSTALL_CHECK_WAIT_MS = 250;
 
@@ -252,6 +261,10 @@ export class DeweeChatElement extends ElementBase {
   private unattendedTimer: ReturnType<typeof setTimeout> | undefined;
   /** Until when history is polled although the server last said the agent answers (its answer was not read). */
   private followUntil = 0;
+  /** Until when history is read for a colleague agent's answer (Team Room); 0 = none. */
+  private colleagueUntil = 0;
+  /** The run was seen asking a colleague: history is read at the fastest pace, not backed off. */
+  private colleagueAsked = false;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   /** The polling generation whose history read is in flight; a stopped generation's read never blocks a new one. */
   private pollInFlight: number | undefined;
@@ -557,6 +570,7 @@ export class DeweeChatElement extends ElementBase {
       if (reply.status === "done" && !reply.dropped) {
         if (reply.actionsHash && reply.ackVisitor && !reply.stopped) this.setAck(reply.actionsHash, reply.ackVisitor);
         this.emit("dewee:reply", { content: reply.content, agent: this.agentId, conversationId });
+        if (!check && generation === this.credentialGeneration) this.watchColleague(reply);
         if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
       }
     }
@@ -735,12 +749,31 @@ export class DeweeChatElement extends ElementBase {
     this.unattendedUntil = 0;
   }
 
+  /**
+   * After a finished run that asked a colleague agent, or may have (tool activity hidden on an
+   * integration with several agents), history is read until the colleague's answer shows up.
+   */
+  private watchColleague(reply: ViewMessage) {
+    const asked = reply.toolCalls?.some((t) => t.name === ROOM_ASK_TOOL) === true;
+    const maybe = !reply.toolCalls?.length && (this.server?.agents.length ?? 0) >= 2;
+    if (!asked && !maybe) return;
+    this.colleagueUntil = Date.now() + COLLEAGUE_WATCH_MS;
+    this.colleagueAsked = this.colleagueAsked || asked;
+    this.updatePolling(true);
+  }
+
+  private clearColleague() {
+    this.colleagueUntil = 0;
+    this.colleagueAsked = false;
+  }
+
   /** Forgets the takeover state of the previous conversation (another conversation, agent or visitor). */
   private resetHandoff() {
     this.stopPolling();
     this.control = "agent";
     this.clearUnattended();
     this.followUntil = 0;
+    this.clearColleague();
     this.handoffBusy = false;
     if (this.els) this.renderHandoff();
   }
@@ -831,11 +864,15 @@ export class DeweeChatElement extends ElementBase {
     }
   }
 
-  /** History is polled while staff are asked or hold the conversation, never on a backend without takeovers. */
+  /**
+   * History is polled while staff are asked or hold the conversation (only on a backend with
+   * takeovers), and while a colleague agent's answer is awaited.
+   */
   private shouldPoll(): boolean {
     const now = Date.now();
-    return this.isConnected && this.server?.humanHandoff === true && document.visibilityState !== "hidden"
-      && (this.control !== "agent" || now < this.unattendedUntil || now < this.followUntil) && now - this.pollChangedAt < POLL_IDLE_LIMIT_MS;
+    const takeover = this.server?.humanHandoff === true && (this.control !== "agent" || now < this.unattendedUntil || now < this.followUntil);
+    return this.isConnected && document.visibilityState !== "hidden"
+      && (takeover || now < this.colleagueUntil) && now - this.pollChangedAt < POLL_IDLE_LIMIT_MS;
   }
 
   private updatePolling(restart = false) {
@@ -867,7 +904,8 @@ export class DeweeChatElement extends ElementBase {
     }
     if (generation !== this.pollGeneration) return;
     if (changed) this.pollChangedAt = Date.now();
-    this.pollDelay = changed ? POLL_MIN_MS : Math.min(Math.round(this.pollDelay * 1.5), POLL_MAX_MS);
+    const fast = changed || (this.colleagueAsked && Date.now() < this.colleagueUntil);
+    this.pollDelay = fast ? POLL_MIN_MS : Math.min(Math.round(this.pollDelay * 1.5), POLL_MAX_MS);
     this.updatePolling();
   }
 
@@ -894,8 +932,12 @@ export class DeweeChatElement extends ElementBase {
       for (const m of added) this.pushMessage(m, false);
       if (added.length && stick) this.scrollToBottom(true);
       changed = added.length > 0;
-      if (added.some((m) => m.role === "assistant" && !m.hidden) && this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
+      if (added.some((m) => m.role === "assistant" && !m.hidden)) {
+        this.clearColleague(); // the awaited answer arrived
+        if (this.config.mode !== "inline" && !this.hasAttribute("data-open")) this.setAttribute("data-unread", "");
+      }
     } else {
+      if (lastAgentReply(next) !== lastAgentReply(this.messages)) this.clearColleague();
       this.messages = next;
       this.renderLog();
       changed = true;
@@ -2212,6 +2254,12 @@ export class DeweeChatElement extends ElementBase {
       holder.remove();
     }
   }
+}
+
+/** The text of the last visible agent reply, to tell whether a redrawn log holds a new one. */
+function lastAgentReply(messages: ViewMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === "assistant" && !messages[i].hidden) return messages[i].content;
+  return undefined;
 }
 
 /**
